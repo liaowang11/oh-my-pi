@@ -1,22 +1,15 @@
 {
   addDriverRunpath,
   autoPatchelfHook,
-  alsa-lib,
   bun,
   bun2nix,
-  cmake,
   config,
   cudaPackages_13 ? null,
   darwin,
   lib,
-  libpulseaudio,
   makeBinaryWrapper,
-  ninja,
-  pipewire,
-  pkg-config,
+  piNatives,
   removeReferencesTo,
-  rustPlatform,
-  rustToolchain,
   source,
   stdenv,
   stdenvNoCC,
@@ -37,28 +30,11 @@
 let
   packageJson = lib.importJSON ../packages/coding-agent/package.json;
   rootPackageJson = lib.importJSON ../package.json;
-  platform =
-    {
-      aarch64-darwin = {
-        addon = "pi_natives.darwin-arm64.node";
-        nativeLibrary = "libpi_natives.dylib";
-      };
-      aarch64-linux = {
-        addon = "pi_natives.linux-arm64.node";
-        nativeLibrary = "libpi_natives.so";
-      };
-      x86_64-darwin = {
-        addon = "pi_natives.darwin-x64-baseline.node";
-        nativeLibrary = "libpi_natives.dylib";
-        rustFlags = "-C target-cpu=x86-64-v2";
-      };
-      x86_64-linux = {
-        addon = "pi_natives.linux-x64-baseline.node";
-        nativeLibrary = "libpi_natives.so";
-        rustFlags = "-C target-cpu=x86-64-v2";
-      };
-    }
-    .${stdenv.hostPlatform.system} or (throw "Unsupported OMP platform: ${stdenv.hostPlatform.system}");
+  platform = import ./platform.nix { inherit stdenv; };
+  # Re-override in case the caller overrides `withWaylandScreencast` on the
+  # `omp` derivation itself rather than on `piNatives` directly, so the one
+  # flag still controls both derivations like it did when they were one.
+  piNativesResolved = piNatives.override { inherit withWaylandScreencast; };
   patchedDependencies = lib.mapAttrs (
     _: patch: source + "/${patch}"
   ) rootPackageJson.patchedDependencies;
@@ -116,7 +92,6 @@ stdenv.mkDerivation {
   inherit (packageJson) version;
   src = source;
 
-  cargoDeps = rustPlatform.importCargoLock { lockFile = ../Cargo.lock; };
   bunDeps = bun2nix.fetchBunDeps {
     bunNix = ./bun.nix;
     overrides = patchOverrides;
@@ -125,13 +100,7 @@ stdenv.mkDerivation {
   nativeBuildInputs = [
     bun
     bun2nix.hook
-    cmake
-    ninja
-    pkg-config
     removeReferencesTo
-    rustPlatform.bindgenHook
-    rustPlatform.cargoSetupHook
-    rustToolchain
   ]
   ++ lib.optionals stdenv.hostPlatform.isLinux [
     autoPatchelfHook
@@ -140,9 +109,7 @@ stdenv.mkDerivation {
   ++ lib.optionals stdenv.hostPlatform.isDarwin [ darwin.autoSignDarwinBinariesHook ];
 
   # libgcc_s is resolved from the compiler's lib output during autoPatchelf.
-  buildInputs =
-    lib.optionals stdenv.hostPlatform.isLinux [ stdenv.cc.cc.lib ]
-    ++ lib.optionals withWaylandScreencast [ pipewire ];
+  buildInputs = lib.optionals stdenv.hostPlatform.isLinux [ stdenv.cc.cc.lib ];
 
   strictDeps = true;
   # Nix builders cannot reliably hardlink cache files into node_modules
@@ -159,41 +126,20 @@ stdenv.mkDerivation {
   dontStrip = true;
 
   env = {
-    CMAKE_POLICY_VERSION_MINIMUM = "3.5";
-    PCRE2_SYS_STATIC = "1";
     SOURCE_DATE_EPOCH = "1";
   }
-  // lib.optionalAttrs (platform ? rustFlags) { RUSTFLAGS = platform.rustFlags; }
   // lib.optionalAttrs stdenv.hostPlatform.isDarwin { BUN_NO_CODESIGN_MACHO_BINARY = "1"; };
 
   buildPhase = ''
     runHook preBuild
 
-    echo "Building pi-natives"
-    cargo build --release -p pi-natives ${lib.optionalString withWaylandScreencast "--features wayland-pipewire"}
-    install -Dm755 "target/release/${platform.nativeLibrary}" \
+    echo "Installing pi-natives"
+    # Built by the separate piNatives derivation, already RPATH-fixed/signed:
+    # keeping that derivation's inputs disjoint from packages/ means a
+    # TS-only change here leaves it substitutable from a binary cache instead
+    # of forcing a Cargo rebuild.
+    install -Dm755 "${piNativesResolved}/lib/${platform.addon}" \
       "packages/natives/native/${platform.addon}"
-    ${lib.optionalString stdenv.hostPlatform.isLinux ''
-      # The loader extracts this archived addon at runtime, so fix its
-      # interpreter-independent Nix RPATH before Bun embeds it.
-      autoPatchelf -- "packages/natives/native/${platform.addon}"
-      # pi-voice dlopens libpulse-simple.so.0 / libpulse.so.0 / libasound.so.2
-      # by bare name; glibc resolves those through the calling object's
-      # RUNPATH, so append the client libraries here. Nothing links them, so
-      # autoPatchelf cannot discover them on its own.
-      patchelf --add-rpath "${
-        lib.makeLibraryPath [
-          libpulseaudio
-          alsa-lib
-        ]
-      }" \
-        "packages/natives/native/${platform.addon}"
-    ''}
-    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
-      # arm64 Darwin requires even locally-built Mach-O addons to carry an
-      # ad-hoc signature. Sign before Bun archives the file.
-      signIfRequired "packages/natives/native/${platform.addon}"
-    ''}
 
     echo "Compiling OMP"
     BUN_COMPILE_EXECUTABLE_PATH="${bunRuntimeTemplate}/libexec/bun" \

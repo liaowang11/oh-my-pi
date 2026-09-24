@@ -87,18 +87,26 @@
           rustToolchain = rustToolchainFor system;
         };
 
+      piNativesFor =
+        system:
+        let
+          pkgs = pkgsFor system;
+        in
+        pkgs.callPackage ./nix/pi-natives.nix {
+          inherit (localPackagesFor system) rustToolchain;
+        };
+
       packageFor =
         system:
         let
           pkgs = pkgsFor system;
           localPkgs = localPackagesFor system;
         in
-        pkgs.callPackage ./nix/package.nix (
-          {
-            source = self.outPath;
-          }
-          // localPkgs
-        );
+        pkgs.callPackage ./nix/package.nix {
+          source = self.outPath;
+          piNatives = piNativesFor system;
+          inherit (localPkgs) bun bun2nix;
+        };
     in
     {
       packages = forAllSystems (
@@ -109,6 +117,7 @@
         {
           inherit omp;
           default = omp;
+          pi-natives = piNativesFor system;
         }
       );
 
