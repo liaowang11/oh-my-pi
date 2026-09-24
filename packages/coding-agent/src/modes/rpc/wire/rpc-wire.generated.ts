@@ -1124,6 +1124,7 @@ export interface SubagentLifecyclePayload {
 	agentSource: AgentSource;
 	status: SubagentLifecycleStatus;
 	index: number;
+	assignment?: string;
 	description?: string;
 	sessionFile?: string;
 	parentToolCallId?: string;
