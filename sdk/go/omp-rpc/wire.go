@@ -4893,6 +4893,7 @@ type SubagentLifecyclePayload struct {
 	AgentSource      AgentSource             `json:"agentSource"`
 	Status           SubagentLifecycleStatus `json:"status"`
 	Index            int64                   `json:"index"`
+	Assignment       *string                 `json:"assignment,omitempty"`
 	Description      *string                 `json:"description,omitempty"`
 	SessionFile      *string                 `json:"sessionFile,omitempty"`
 	ParentToolCallID *string                 `json:"parentToolCallId,omitempty"`
@@ -4912,6 +4913,7 @@ func (v *SubagentLifecyclePayload) decodeFrom(raw map[string]json.RawMessage) er
 	d.required("agentSource", &out.AgentSource)
 	d.required("status", &out.Status)
 	d.required("index", &out.Index)
+	d.optional("assignment", &out.Assignment)
 	d.optional("description", &out.Description)
 	d.optional("sessionFile", &out.SessionFile)
 	d.optional("parentToolCallId", &out.ParentToolCallID)

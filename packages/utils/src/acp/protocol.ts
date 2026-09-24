@@ -149,6 +149,8 @@ export interface ClientCapabilities {
 	terminal?: boolean;
 	auth?: { terminal?: boolean };
 	elicitation?: { form?: Record<string, unknown>; url?: Record<string, unknown> };
+	/** ACP subagents RFD: present (as an object) when the client renders child sessions. */
+	subagents?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
 }
 /** Implementation identity sent during initialization. */
@@ -336,7 +338,36 @@ export type SessionUpdate =
 			size: number;
 			used: number;
 			cost?: { amount: number; currency: string } | null;
+	  } & Meta)
+	| ({ sessionUpdate: "subagent_update" } & SubagentUpdate)
+	| ({ sessionUpdate: "session_message" } & SessionMessage);
+/** Current-work snapshot of a subagent session (ACP subagents RFD). */
+export type SubagentWorkState =
+	| ({ state: "running" } & Meta)
+	| ({ state: "requires_action" } & Meta)
+	| ({ state: "unknown" } & Meta)
+	| ({
+			state: "idle";
+			stopReason?: StopReason | "error" | null;
+			error?: { code: number; message: string } | null;
 	  } & Meta);
+/**
+ * Announces a child session on its parent (the first update for a child id),
+ * then patches its labels and work state. Omitted fields are unchanged.
+ */
+export interface SubagentUpdate extends Meta {
+	sessionId: SessionId;
+	title?: string | null;
+	description?: string | null;
+	state?: SubagentWorkState | null;
+}
+/** A message in a session's transcript from another participant, e.g. a subagent's prompt. */
+export interface SessionMessage extends Meta {
+	messageId: string;
+	senderSessionId?: SessionId | null;
+	recipientSessionId?: SessionId | null;
+	content?: ContentBlock[] | null;
+}
 /** Notification containing a session update. */
 export interface SessionNotification extends Meta {
 	sessionId: SessionId;

@@ -72,6 +72,20 @@ const SessionUpdate = type({
 })
 	.or({ sessionUpdate: "'tool_call'", toolCallId: "string", title: "string" })
 	.or({ sessionUpdate: "'tool_call_update'", toolCallId: "string" })
+	.or({
+		sessionUpdate: "'subagent_update'",
+		sessionId: "string",
+		"title?": "string | null | undefined",
+		"description?": "string | null | undefined",
+		"state?": type({ state: "string", "stopReason?": "string | null | undefined" }).narrow(notArray).or("null | undefined"),
+	})
+	.or({
+		sessionUpdate: "'session_message'",
+		messageId: "string",
+		"senderSessionId?": "string | null | undefined",
+		"recipientSessionId?": "string | null | undefined",
+		"content?": ContentBlock.array().or("null | undefined"),
+	})
 	.or({ sessionUpdate: "'plan'", entries: "unknown[]" })
 	.or({ sessionUpdate: "'current_mode_update'", currentModeId: "string" })
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
