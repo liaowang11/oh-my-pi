@@ -66,12 +66,32 @@ const ContentBlock = type({ type: "'text'", text: "string" })
 	.or({ type: "'resource_link'", uri: "string", name: "string" })
 	.or({ type: "'resource'", resource: "object" });
 
+const OptionalString = "string | null | undefined";
+const OptionalObject = type("object").narrow(notArray).or("null | undefined");
+const OptionalContentBlocks = ContentBlock.array().or("null | undefined");
+const SubagentWorkState = type({ state: "string", "stopReason?": OptionalString }).narrow(notArray);
+
 const SessionUpdate = type({
 	sessionUpdate: "'agent_message_chunk' | 'agent_thought_chunk' | 'user_message_chunk'",
 	content: ContentBlock,
 })
 	.or({ sessionUpdate: "'tool_call'", toolCallId: "string", title: "string" })
 	.or({ sessionUpdate: "'tool_call_update'", toolCallId: "string" })
+	.or({
+		sessionUpdate: "'subagent_update'",
+		sessionId: "string",
+		"title?": OptionalString,
+		"description?": OptionalString,
+		"state?": SubagentWorkState.or("null | undefined"),
+		"capabilities?": OptionalObject,
+	})
+	.or({
+		sessionUpdate: "'session_message'",
+		messageId: "string",
+		"senderSessionId?": OptionalString,
+		"recipientSessionId?": OptionalString,
+		"content?": OptionalContentBlocks,
+	})
 	.or({ sessionUpdate: "'plan'", entries: "unknown[]" })
 	.or({ sessionUpdate: "'current_mode_update'", currentModeId: "string" })
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
