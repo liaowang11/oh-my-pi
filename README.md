@@ -642,6 +642,8 @@ bun run gen:nix
 
 The command uses `bun2nix` from `nix develop` when available, otherwise enters the development shell through Nix, then falls back to the pinned `bunx bun2nix@2.1.2`. Do not edit `nix/bun.nix` manually.
 
+On Darwin, the native addon can link only to system libraries, so its Nix-library dependency manifest may be empty. CI still validates any recorded store dependencies against the package closure and smoke-tests the packaged CLI.
+
 For a non-interactive smoke check:
 
 ```sh
