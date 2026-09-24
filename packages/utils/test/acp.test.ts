@@ -381,6 +381,42 @@ describe("ACP JSON-RPC transport", () => {
 });
 
 describe("ACP runtime schemas", () => {
+	it("accepts RFD subagent updates and session messages and rejects malformed fields", () => {
+		const update = {
+			sessionId: "parent",
+			update: {
+				sessionUpdate: "subagent_update",
+				sessionId: "child",
+				title: "Inspect",
+				description: "Trace labels",
+				state: { state: "idle", stopReason: "end_turn" },
+			},
+		};
+		const message = {
+			sessionId: "child",
+			update: {
+				sessionUpdate: "session_message",
+				messageId: "child:prompt:1",
+				senderSessionId: "parent",
+				recipientSessionId: "child",
+				content: [{ type: "text", text: "Trace labels" }],
+			},
+		};
+		expect(schema.zSessionNotification.safeParse(update).success).toBe(true);
+		expect(schema.zSessionNotification.safeParse(message).success).toBe(true);
+		const malformed = [
+			{ ...update.update, sessionId: 42 },
+			{ ...update.update, title: 42 },
+			{ ...update.update, state: "completed" },
+			{ ...update.update, state: { state: "idle", stopReason: 1 } },
+			{ ...message.update, messageId: undefined },
+			{ ...message.update, content: [{ type: "text" }] },
+		];
+		for (const bad of malformed) {
+			expect(schema.zSessionNotification.safeParse({ sessionId: "parent", update: bad }).success).toBe(false);
+		}
+	});
+
 	it("accepts valid protocol vectors", () => {
 		expect(schema.zNewSessionResponse.safeParse({ sessionId: "s" }).success).toBe(true);
 		expect(schema.zPromptResponse.safeParse({ stopReason: "end_turn" }).success).toBe(true);
