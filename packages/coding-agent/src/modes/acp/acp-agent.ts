@@ -1018,6 +1018,9 @@ export class AcpAgent implements Agent {
 				// path below.
 				await this.#waitForPromptEventHandlers(record);
 			},
+			setAcpMode: async modeId => {
+				await this.setSessionMode({ sessionId: record.session.sessionId, modeId });
+			},
 			notifyTitleChanged: async () => {
 				await this.#pushSessionInfoUpdate(record);
 			},
@@ -1029,7 +1032,10 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images });
+				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, {
+					images,
+					synthetic: builtinResult.synthetic,
+				});
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1626,7 +1632,8 @@ export class AcpAgent implements Agent {
 	async #finishGoalModeAfterTurn(record: ManagedSessionRecord): Promise<void> {
 		const { session } = record;
 		const state = session.getGoalModeState();
-		if (state?.mode === "exiting") {
+		const exiting = state?.mode === "exiting";
+		if (exiting) {
 			session.setGoalModeState(undefined);
 			session.sessionManager.appendModeChange("none");
 			session.sessionManager.appendCustomEntry("goal-completed", {
@@ -1636,7 +1643,9 @@ export class AcpAgent implements Agent {
 				timeUsedSeconds: state.goal.timeUsedSeconds,
 			});
 		}
-		if ((!state || !state.enabled) && session.getEnabledToolNames().includes("goal")) {
+		// /guided-goal exposes the tool before a goal exists so the interview
+		// can continue across turns and eventually call `goal create`.
+		if ((exiting || (state && !state.enabled)) && session.getEnabledToolNames().includes("goal")) {
 			await session.setActiveToolsByName(session.getEnabledToolNames().filter(name => name !== "goal"));
 		}
 	}
@@ -2015,7 +2024,7 @@ export class AcpAgent implements Agent {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
-			if (session.getGoalModeState()) {
+			if (session.getGoalModeState() || session.getEnabledToolNames().includes("goal")) {
 				throw new Error("Exit goal mode before entering plan mode.");
 			}
 			const previous = session.getPlanModeState();

@@ -47,8 +47,12 @@ export interface ParsedSlashCommand {
  * - `{ consumed: true }` — explicit equivalent of the above (ACP shape).
  * - `{ prompt: string }` — command handled, pass `prompt` through as the new
  *   user input (e.g. `/force <tool> <prompt>` keeps `<prompt>` as the message).
+ *   `synthetic` sends it as a hidden developer message, as `/guided-goal` does.
  */
-export type SlashCommandResult = undefined | { consumed: true; agentInvoked?: boolean } | { prompt: string };
+export type SlashCommandResult =
+	| undefined
+	| { consumed: true; agentInvoked?: boolean }
+	| { prompt: string; synthetic?: boolean };
 
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
@@ -58,6 +62,8 @@ export type SlashCommandResult = undefined | { consumed: true; agentInvoked?: bo
  * state (editor, selectors, status line).
  */
 export interface SlashCommandRuntime {
+	/** Text-command host; omitted for ACP-compatible callers. */
+	host?: "acp" | "rpc";
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -97,6 +103,8 @@ export interface SlashCommandRuntime {
 	 * return immediately and leave the serialized queue free for `abort`.
 	 */
 	runCommandInBackground?: (task: () => Promise<void>) => void;
+	/** ACP host mode switch; absent from the RPC text-command host. */
+	setAcpMode?: (modeId: "default" | "plan") => Promise<void>;
 	notifyTitleChanged?: () => Promise<void> | void;
 	notifyConfigChanged?: () => Promise<void> | void;
 }
@@ -152,6 +160,13 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 				runtime: SlashCommandRuntime,
 		  ) => SlashCommandResult | Promise<SlashCommandResult>)
 		| ((command: ParsedSlashCommand, runtime: SlashCommandRuntime) => void | Promise<void>);
+	/** ACP-only handler. RPC dispatch uses `handle` and does not advertise this command. */
+	handleAcp?:
+		| ((
+				command: ParsedSlashCommand,
+				runtime: SlashCommandRuntime,
+		  ) => SlashCommandResult | Promise<SlashCommandResult>)
+		| ((command: ParsedSlashCommand, runtime: SlashCommandRuntime) => void | Promise<void>);
 	/**
 	 * TUI-only handler that supersedes `handle` when both are present. Use for
 	 * selectors, wizards, dashboards, and anything else that requires
@@ -167,4 +182,7 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 }
 
 /** Result returned by `executeAcpBuiltinSlashCommand`. */
-export type AcpBuiltinSlashCommandResult = false | { consumed: true; agentInvoked?: boolean } | { prompt: string };
+export type AcpBuiltinSlashCommandResult =
+	| false
+	| { consumed: true; agentInvoked?: boolean }
+	| { prompt: string; synthetic?: boolean };
