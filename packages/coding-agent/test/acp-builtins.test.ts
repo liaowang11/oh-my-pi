@@ -678,7 +678,6 @@ describe("ACP builtin slash commands", () => {
 			"/loop",
 			"/hotkeys",
 			"/extensions",
-			"/agents",
 			"/copy",
 			"/btw hi",
 			"/new",
@@ -1587,5 +1586,52 @@ describe("/move preflight flush", () => {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("/agents", () => {
+	it("disables an agent in the live session even when the host pinned the default", async () => {
+		const { output, runtime } = createRuntime();
+		// ACP/RPC pin unconfigured task.* keys to their defaults as runtime overrides.
+		runtime.settings.override("task.disabledAgents", []);
+
+		expect(await executeAcpBuiltinSlashCommand("/agents disable scout", runtime)).toEqual({ consumed: true });
+
+		expect(runtime.settings.get("task.disabledAgents")).toEqual(["scout"]);
+		expect(output).toEqual(["scout disabled"]);
+	});
+
+	it("sets and clears a per-agent model override", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.override("task.agentModelOverrides", {});
+
+		await executeAcpBuiltinSlashCommand("/agents model scout anthropic/claude-haiku", runtime);
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({ scout: "anthropic/claude-haiku" });
+		expect(output.at(-1)).toBe("scout model: anthropic/claude-haiku");
+
+		await executeAcpBuiltinSlashCommand("/agents model scout default", runtime);
+		expect(runtime.settings.get("task.agentModelOverrides")).toEqual({});
+		expect(output.at(-1)).toBe("scout model: @smol");
+	});
+
+	it("lists agents with their overrides applied", async () => {
+		const { output, runtime } = createRuntime();
+		runtime.settings.set("task.agentPrewalk", { scout: "on" });
+		runtime.settings.set("task.disabledAgents", ["reviewer"]);
+
+		await executeAcpBuiltinSlashCommand("/agents", runtime);
+
+		const lines = output[0]?.split("\n") ?? [];
+		expect(lines).toContain("scout [bundled] enabled · model: @smol · prewalk: on (@smol) · advisor: off");
+		expect(lines.find(line => line.startsWith("reviewer "))).toStartWith("reviewer [bundled] disabled");
+	});
+
+	it("rejects an unknown agent without writing settings", async () => {
+		const { output, runtime } = createRuntime();
+
+		await executeAcpBuiltinSlashCommand("/agents disable no-such-agent", runtime);
+
+		expect(runtime.settings.get("task.disabledAgents")).toEqual([]);
+		expect(output[0]).toStartWith("Unknown agent: no-such-agent.");
 	});
 });

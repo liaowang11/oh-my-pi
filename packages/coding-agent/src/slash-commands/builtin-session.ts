@@ -13,6 +13,7 @@ import { buildContextReportText } from "./helpers/context-report";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { handleMcpAcp } from "./helpers/mcp";
+import { handleAcpAgentsCommand } from "./helpers/agents";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import { describeRedeemOutcome, toResetUsageAccounts } from "./helpers/reset-usage";
 import type { ResetUsageAccount } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
@@ -501,6 +502,9 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "agents",
 		icon: "agents",
 		description: "Open the agents hub (per-agent model, prewalk, and advisor)",
+		acpDescription: "List agents and set their per-agent model, prewalk, and advisor",
+		acpInputHint: "[list|enable|disable|model|prewalk|advisor] <name> [value]",
+		handleAcp: handleAcpAgentsCommand,
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showAgentsDashboard();
 			runtime.ctx.editor.setText("");

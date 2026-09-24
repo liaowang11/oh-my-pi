@@ -1972,7 +1972,7 @@ describe("ACP agent", () => {
 		expect(names).not.toContain("btw");
 		expect(names).not.toContain("delete");
 		expect(names).not.toContain("resume");
-		expect(names).not.toContain("agents");
+		expect(names).toContain("agents");
 		expect(names).not.toContain("extensions");
 		expect(names).not.toContain("hotkeys");
 
