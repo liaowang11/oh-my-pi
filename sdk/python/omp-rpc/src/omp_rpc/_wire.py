@@ -1301,6 +1301,7 @@ class SubagentLifecyclePayload:
     agent_source: AgentSource
     status: SubagentLifecycleStatus
     index: int
+    assignment: str | None = None
     description: str | None = None
     session_file: str | None = None
     parent_tool_call_id: str | None = None
@@ -2731,6 +2732,7 @@ def parse_subagent_lifecycle_payload(value: object, path: str = "SubagentLifecyc
         agent_source=required(payload, "agentSource", _decode_agent_source, path),
         status=required(payload, "status", _decode_subagent_lifecycle_status, path),
         index=required(payload, "index", decode_int, path),
+        assignment=optional(payload, "assignment", decode_str, path),
         description=optional(payload, "description", decode_str, path),
         session_file=optional(payload, "sessionFile", decode_str, path),
         parent_tool_call_id=optional(payload, "parentToolCallId", decode_str, path),

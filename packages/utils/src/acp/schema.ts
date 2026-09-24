@@ -83,6 +83,16 @@ function contentBlock(value: unknown): boolean {
 	}
 }
 
+function optionalString(value: unknown): boolean {
+	return value === undefined || value === null || typeof value === "string";
+}
+
+function subagentWorkState(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const state = value as Record<string, unknown>;
+	return typeof state.state === "string" && optionalString(state.stopReason);
+}
+
 function sessionNotification(value: unknown): boolean {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const notification = value as Record<string, unknown>;
@@ -103,6 +113,22 @@ function sessionNotification(value: unknown): boolean {
 			return typeof update.toolCallId === "string" && typeof update.title === "string";
 		case "tool_call_update":
 			return typeof update.toolCallId === "string";
+		case "subagent_update":
+			return (
+				typeof update.sessionId === "string" &&
+				optionalString(update.title) &&
+				optionalString(update.description) &&
+				(update.state === undefined || update.state === null || subagentWorkState(update.state))
+			);
+		case "session_message":
+			return (
+				typeof update.messageId === "string" &&
+				optionalString(update.senderSessionId) &&
+				optionalString(update.recipientSessionId) &&
+				(update.content === undefined ||
+					update.content === null ||
+					(Array.isArray(update.content) && update.content.every(contentBlock)))
+			);
 		case "plan":
 			return Array.isArray(update.entries);
 		case "current_mode_update":
