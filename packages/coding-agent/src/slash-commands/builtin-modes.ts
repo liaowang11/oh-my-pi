@@ -28,6 +28,7 @@ import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "t
 import type { AgentSession } from "../session/agent-session";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
+import { handleAcpGoalCommand } from "./helpers/goal";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSecurityCommand } from "./helpers/security";
 import type { ParsedSlashCommand, SlashCommandSpec, TuiSlashCommandRuntime } from "./types";
@@ -376,6 +377,8 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "goal",
 		icon: "goal",
 		description: "Toggle goal mode (persistent autonomous objective for this session)",
+		acpDescription: "Set and manage a persistent goal for this session",
+		acpInputHint: "[objective|set|show|pause|resume|drop|budget]",
 		subcommands: [
 			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
 			{ name: "show", description: "Show current goal details" },
@@ -386,6 +389,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		],
 		inlineHint: "[objective]",
 		allowArgs: true,
+		handle: handleAcpGoalCommand,
 		getTuiAutocompleteDescription: runtime => {
 			if (!cfgGoalEnabled.get(runtime.ctx.settings)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
