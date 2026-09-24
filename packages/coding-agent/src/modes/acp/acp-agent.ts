@@ -85,6 +85,7 @@ import { OTHER_OPTION } from "../../tools/ask";
 import { resolvePlanFilePath } from "../../plan-mode/plan-files";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import { DEFAULT_TTS_VOICE, TTS_LOCAL_MODELS, TTS_LOCAL_VOICE_OPTIONS } from "../../tts/models";
+import type { EventBus } from "../../utils/event-bus";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
@@ -99,6 +100,7 @@ import {
 	type SteerResponse,
 	steeringCapabilityMeta,
 } from "./acp-steering";
+import { AcpSubagentRelay, clientSupportsSubagents } from "./acp-subagents";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
@@ -208,6 +210,9 @@ type ManagedSessionRecord = {
 	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
 	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
 	lifetimeUnsubscribe: (() => void) | undefined;
+	// Relays task-tool subagents as draft ACP child sessions; set only when the
+	// client advertises `subagents`. Released in `#disposeSessionRecord`.
+	subagentRelay: AcpSubagentRelay | undefined;
 	// Pushes `session_info_update` as soon as a title resolves, instead of only
 	// at bootstrap/end-of-turn: auto title generation runs async and can settle
 	// after `agent_end` already fired, or after a turn with no `agent_end` at
@@ -259,6 +264,8 @@ type MCPSourceMap = {
 type AcpSessionHandle = {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	// The bus the session's task tool publishes subagent frames on.
+	eventBus?: EventBus;
 };
 
 type CreateAcpSession = (
@@ -269,8 +276,11 @@ type CreateAcpSession = (
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
+	eventBus: EventBus | undefined;
 } {
-	return "session" in created ? created : { session: created, setToolUIContext: undefined };
+	return "session" in created
+		? { session: created.session, setToolUIContext: created.setToolUIContext, eventBus: created.eventBus }
+		: { session: created, setToolUIContext: undefined, eventBus: undefined };
 }
 
 type AcpSpeechOption = {
@@ -1354,7 +1364,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1365,7 +1375,7 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
@@ -1400,7 +1410,7 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1418,7 +1428,7 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext, eventBus);
 	}
 
 	async #openStoredSession(
@@ -1427,7 +1437,7 @@ export class AcpAgent implements Agent {
 		mcpServers: McpServer[],
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1441,16 +1451,26 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
 	}
 
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		eventBus: EventBus | undefined,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
+		if (eventBus && clientSupportsSubagents(this.#clientCapabilities)) {
+			record.subagentRelay = new AcpSubagentRelay({
+				sessionId: session.sessionId,
+				eventBus,
+				send: notification => this.#connection.sessionUpdate(notification),
+				getCwd: () => session.sessionManager.getCwd(),
+				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
+			});
+		}
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
@@ -1493,6 +1513,7 @@ export class AcpAgent implements Agent {
 			promptEventHandlers: new Set(),
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
+			subagentRelay: undefined,
 			titleUnsubscribe: undefined,
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 		};
@@ -3055,6 +3076,7 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.titleUnsubscribe?.();
+		record.subagentRelay?.dispose();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

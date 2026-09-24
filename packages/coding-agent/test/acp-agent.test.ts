@@ -23,8 +23,14 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import { SILENT_ABORT_MARKER } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import {
+	type SubagentLifecyclePayload,
+	TASK_SUBAGENT_EVENT_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TaskTool,
+} from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
@@ -495,6 +501,8 @@ interface AgentHarness {
 	abortController: AbortController;
 	sessions: FakeAgentSession[];
 	setToolUIContextSpies: SetToolUIContextSpy[];
+	// One per factory-created session, in creation order.
+	eventBuses: EventBus[];
 	sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined>;
 	cwdA: string;
 	cwdB: string;
@@ -554,6 +562,7 @@ async function createHarness(
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
+	const eventBuses: EventBus[] = [];
 	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
 	const connection = {
 		sessionUpdate: async (notification: SessionNotification) => {
@@ -577,7 +586,9 @@ async function createHarness(
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
 		sessionFactoryOptions.push(factoryOptions);
-		return { session: session as unknown as AgentSession, setToolUIContext };
+		const eventBus = new EventBus();
+		eventBuses.push(eventBus);
+		return { session: session as unknown as AgentSession, setToolUIContext, eventBus };
 	};
 
 	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
@@ -596,6 +607,7 @@ async function createHarness(
 		abortController,
 		sessions,
 		setToolUIContextSpies,
+		eventBuses,
 		sessionFactoryOptions,
 		cwdA,
 		cwdB,
@@ -4091,4 +4103,140 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 			refreshSpy.mockRestore();
 		}
 	}, 15_000);
+});
+
+describe("ACP subagent sessions", () => {
+	function lifecycle(
+		bus: EventBus,
+		id: string,
+		status: SubagentLifecyclePayload["status"],
+		extra: Partial<SubagentLifecyclePayload> = {},
+	): void {
+		const payload: SubagentLifecyclePayload = {
+			id,
+			agent: "explore",
+			agentSource: "bundled",
+			status,
+			index: 0,
+			...extra,
+		};
+		bus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload);
+	}
+
+	function childEvent(bus: EventBus, id: string, event: AgentSessionEvent): void {
+		bus.emit(TASK_SUBAGENT_EVENT_CHANNEL, { id, event });
+	}
+
+	function subagentUpdates(harness: AgentHarness): SessionNotification["update"][] {
+		return harness.updates
+			.map(notification => notification.update)
+			.filter(
+				update => update.sessionUpdate === "subagent_spawned" || update.sessionUpdate === "subagent_state_update",
+			);
+	}
+
+	it("relays a subagent tree as child sessions when the client advertises subagents", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const child = `${created.sessionId}:subagent:0-Explore`;
+		const nested = `${created.sessionId}:subagent:0-Explore.0-Scan`;
+
+		lifecycle(bus, "0-Explore", "started", { description: "map the repo", parentToolCallId: "root-task" });
+		const message = makeAssistantMessage("found it");
+		childEvent(bus, "0-Explore", { type: "message_start", message } as AgentSessionEvent);
+		childEvent(bus, "0-Explore", {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: "found it" },
+		} as AgentSessionEvent);
+		childEvent(bus, "0-Explore", {
+			type: "tool_execution_start",
+			toolCallId: "child-task",
+			toolName: "task",
+			args: {},
+		} as AgentSessionEvent);
+		lifecycle(bus, "0-Explore.0-Scan", "started", { agent: "scan", parentToolCallId: "child-task" });
+		lifecycle(bus, "0-Explore.0-Scan", "failed");
+		lifecycle(bus, "0-Explore", "aborted");
+		// Frames for a finished child are dropped rather than reopening it.
+		childEvent(bus, "0-Explore", {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: "late" },
+		} as AgentSessionEvent);
+		await Bun.sleep(0);
+
+		expect(
+			harness.updates
+				.filter(n => n.update.sessionUpdate !== "available_commands_update")
+				.filter(n => n.sessionId !== created.sessionId || n.update.sessionUpdate.startsWith("subagent_"))
+				.map(n => [n.sessionId, n.update.sessionUpdate]),
+		).toEqual([
+			[created.sessionId, "subagent_spawned"],
+			[child, "agent_message_chunk"],
+			[child, "tool_call"],
+			[child, "subagent_spawned"],
+			[child, "subagent_state_update"],
+			[created.sessionId, "subagent_state_update"],
+		]);
+		expect(subagentUpdates(harness)).toEqual([
+			{
+				sessionUpdate: "subagent_spawned",
+				subagentSessionId: child,
+				name: "explore",
+				task: "map the repo",
+				capabilities: {},
+			},
+			{ sessionUpdate: "subagent_spawned", subagentSessionId: nested, name: "scan", task: "", capabilities: {} },
+			{ sessionUpdate: "subagent_state_update", subagentSessionId: nested, state: "failed" },
+			{ sessionUpdate: "subagent_state_update", subagentSessionId: child, state: "cancelled" },
+		]);
+		harness.abortController.abort();
+	});
+
+	it("opens a fresh child session when a finished subagent id runs again", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const base = `${created.sessionId}:subagent:0-Explore`;
+
+		lifecycle(bus, "0-Explore", "started");
+		lifecycle(bus, "0-Explore", "started");
+		lifecycle(bus, "0-Explore", "completed");
+		lifecycle(bus, "0-Explore", "started");
+		await Bun.sleep(0);
+
+		expect(
+			subagentUpdates(harness).map(update => [
+				update.sessionUpdate,
+				"subagentSessionId" in update && update.subagentSessionId,
+			]),
+		).toEqual([
+			["subagent_spawned", base],
+			["subagent_state_update", base],
+			["subagent_spawned", `${base}:generation:2`],
+		]);
+		harness.abortController.abort();
+	});
+
+	it("keeps subagent frames off the wire for clients without the capability", async () => {
+		const harness = await createHarness({ clientCapabilities: {} });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const before = harness.updates.length;
+
+		lifecycle(bus, "0-Explore", "started");
+		childEvent(bus, "0-Explore", {
+			type: "tool_execution_start",
+			toolCallId: "child-tool",
+			toolName: "read",
+			args: {},
+		} as AgentSessionEvent);
+		lifecycle(bus, "0-Explore", "completed");
+		await Bun.sleep(0);
+
+		expect(harness.updates.slice(before)).toEqual([]);
+		harness.abortController.abort();
+	});
 });

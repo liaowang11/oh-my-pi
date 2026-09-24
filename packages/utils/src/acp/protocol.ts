@@ -148,6 +148,8 @@ export interface ClientCapabilities {
 	terminal?: boolean;
 	auth?: { terminal?: boolean };
 	elicitation?: { form?: Record<string, unknown>; url?: Record<string, unknown> };
+	/** Draft subagent sessions: present (as an object) when the client renders child sessions. */
+	subagents?: Record<string, unknown>;
 	_meta?: Record<string, unknown>;
 }
 /** Implementation identity sent during initialization. */
@@ -335,7 +337,23 @@ export type SessionUpdate =
 			size: number;
 			used: number;
 			cost?: { amount: number; currency: string } | null;
-	  } & Meta);
+	  } & Meta)
+	| ({ sessionUpdate: "subagent_spawned" } & SubagentSpawned)
+	| ({ sessionUpdate: "subagent_state_update" } & SubagentStateUpdate);
+/** Terminal or transitional state of a subagent session (draft ACP subagent sessions). */
+export type SubagentState = "completed" | "failed" | "cancelled" | "disconnected";
+/** Announces a child session on its parent; the child's updates then carry `subagentSessionId`. */
+export interface SubagentSpawned extends Meta {
+	subagentSessionId: SessionId;
+	name: string;
+	task: string;
+	capabilities: Record<string, unknown>;
+}
+/** Reports a subagent session's state change on its parent. */
+export interface SubagentStateUpdate extends Meta {
+	subagentSessionId: SessionId;
+	state: SubagentState;
+}
 /** Notification containing a session update. */
 export interface SessionNotification extends Meta {
 	sessionId: SessionId;
