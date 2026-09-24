@@ -24,7 +24,7 @@ export const cfgGoalStatusInFooter = register({
 	},
 });
 
-const GOAL_CONTINUATION_MODES_DEFAULT: string[] = ["interactive"];
+const GOAL_CONTINUATION_MODES_DEFAULT: string[] = ["interactive", "acp"];
 
 export const cfgGoalContinuationModes = register({
 	id: "goal.continuationModes",
