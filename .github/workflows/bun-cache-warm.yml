@@ -8,12 +8,6 @@ name: Warm bun store cache
 # that can change the entry.
 
 on:
-   push:
-      branches: [main]
-      paths:
-         - "bun.lock"
-         - ".github/actions/bun-install/**"
-         - ".github/workflows/bun-cache-warm.yml"
    workflow_dispatch:
 
 permissions:

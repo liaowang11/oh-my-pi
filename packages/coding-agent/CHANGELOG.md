@@ -432,6 +432,9 @@
 - Relay mode: when Chrome detaches omp from a tab it drives (a password manager's inline menu loading in the page), the call fails at once saying why and omp reattaches to the same tab, instead of every later call timing out and reopening failing with `No page targets available` ([#15920](https://github.com/can1357/oh-my-pi/pull/15920) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed the macOS `computer` tool letting the display sleep and lock in a turn that went 5 minutes without a desktop action; it now keeps the display awake until the turn ends or asks for your answer, then lets it sleep ([#15762](https://github.com/can1357/oh-my-pi/pull/15762) by [@will-bogusz](https://github.com/will-bogusz))
 - ACP subagents now follow the ACP subagents RFD: each keeps one child session across follow-ups, shows its assignment as the first message, reports running and idle states with stop reasons, and is restored from its own transcript when a session is loaded.
+- Fixed macOS Nix build verification rejecting native addons that link only to system libraries.
+- Improved responsiveness when placing assistant text after tool calls in long transcripts ([#12178](https://github.com/can1357/oh-my-pi/issues/12178), [#14344](https://github.com/can1357/oh-my-pi/pull/14344) by [@F0Rextasy](https://github.com/F0Rextasy), [#15353](https://github.com/can1357/oh-my-pi/pull/15353) by [@iliaal](https://github.com/iliaal)).
+- Fixed `apply_patch` rejecting a hunk without context lines when its text occurs more than once ("Found 2 occurrences"); like Codex, each hunk now takes the first exact or whitespace-insensitive match at or after the previous hunk, while fuzzy matches must still be unique ([#15340](https://github.com/can1357/oh-my-pi/pull/15340) by [@Ikaleio](https://github.com/Ikaleio))
 
 ## [18.11.1] - 2026-10-15
 
