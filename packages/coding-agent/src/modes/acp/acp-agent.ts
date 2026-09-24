@@ -55,6 +55,7 @@ import {
 import { runExtensionCompact } from "../../extensibility/extensions/compact-handler";
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { buildSkillPromptMessage, parseSkillInvocation } from "../../extensibility/skills";
+import { goalFromModeData } from "../../goals/state";
 import { MCPManager } from "../../mcp/manager";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
@@ -1415,6 +1416,7 @@ export class AcpAgent implements Agent {
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
+			await this.#restoreStoredGoal(session);
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
 			this.#sessions.set(session.sessionId, record);
@@ -1422,6 +1424,22 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			await this.#disposeSessionRecord(record);
 			throw error;
+		}
+	}
+
+	async #restoreStoredGoal(session: AgentSession): Promise<void> {
+		const context = session.sessionManager.buildSessionContext();
+		if (context.mode !== "goal" && context.mode !== "goal_paused") return;
+		const goal = session.settings.get("goal.enabled") ? goalFromModeData(context.modeData) : undefined;
+		if (!goal || goal.status === "complete" || goal.status === "dropped") {
+			session.sessionManager.appendModeChange("none");
+			return;
+		}
+		session.setGoalModeState({ enabled: context.mode === "goal", mode: "active", goal });
+		// Cold resume pauses an active goal, matching the interactive session path.
+		const restored = await session.goalRuntime.onThreadResumed();
+		if (restored?.enabled) {
+			await session.setActiveToolsByName([...new Set([...session.getEnabledToolNames(), "goal"])]);
 		}
 	}
 
@@ -1531,6 +1549,11 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			try {
+				await this.#finishGoalModeAfterTurn(record);
+			} catch (error) {
+				logger.warn("Failed to finish ACP goal mode after turn", { sessionId: record.session.sessionId, error });
+			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
 			this.#finishPrompt(record, {
@@ -1555,6 +1578,7 @@ export class AcpAgent implements Agent {
 			if (event.type === "agent_end") {
 				await this.#flushMissedFinalAssistantText(record, event);
 				await this.#flushUnreportedTurnError(record, event);
+				await this.#finishGoalModeAfterTurn(record);
 				record.liveMessageId = undefined;
 				record.liveMessageProgress = undefined;
 			}
@@ -1597,6 +1621,24 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	async #finishGoalModeAfterTurn(record: ManagedSessionRecord): Promise<void> {
+		const { session } = record;
+		const state = session.getGoalModeState();
+		if (state?.mode === "exiting") {
+			session.setGoalModeState(undefined);
+			session.sessionManager.appendModeChange("none");
+			session.sessionManager.appendCustomEntry("goal-completed", {
+				objective: state.goal.objective,
+				tokensUsed: state.goal.tokensUsed,
+				tokenBudget: state.goal.tokenBudget,
+				timeUsedSeconds: state.goal.timeUsedSeconds,
+			});
+		}
+		if ((!state || !state.enabled) && session.getEnabledToolNames().includes("goal")) {
+			await session.setActiveToolsByName(session.getEnabledToolNames().filter(name => name !== "goal"));
+		}
 	}
 
 	/**
@@ -1973,6 +2015,9 @@ export class AcpAgent implements Agent {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
+			if (session.getGoalModeState()) {
+				throw new Error("Exit goal mode before entering plan mode.");
+			}
 			const previous = session.getPlanModeState();
 			session.setPlanModeState({
 				enabled: true,

@@ -7,6 +7,8 @@ import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
+import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import {
 	ACP_BOOTSTRAP_RACE_GUARD_MS,
@@ -132,6 +134,7 @@ class FakeAgentSession {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	promptImages: unknown[][] = [];
 	steerCalls: Array<{ text: string; images: unknown[] | undefined }> = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
@@ -148,6 +151,10 @@ class FakeAgentSession {
 	usageFallbackConfirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined;
 	retryResult = false;
 	retryCalls = 0;
+	goalRuntime: GoalRuntime;
+	goalModeState: GoalModeState | undefined;
+	activeToolNames: string[] = [];
+	promptHook: (() => Promise<void>) | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -163,6 +170,22 @@ class FakeAgentSession {
 			},
 		};
 		this.model = models[0];
+		this.goalRuntime = new GoalRuntime({
+			getState: () => this.goalModeState,
+			setState: state => {
+				this.goalModeState = state;
+			},
+			getCurrentUsage: () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+			emit: event => {
+				if (event.type === "goal_updated") {
+					for (const listener of this.#listeners) listener(event);
+				}
+			},
+			persist: (mode, state) => {
+				this.sessionManager.appendModeChange(mode, state ? { goal: state.goal } : undefined);
+			},
+			sendHiddenMessage: async () => {},
+		});
 	}
 
 	get sessionName(): string {
@@ -229,8 +252,9 @@ class FakeAgentSession {
 		return [...this.#listeners];
 	}
 
-	async prompt(text: string): Promise<boolean> {
+	async prompt(text: string, options?: { images?: unknown[] }): Promise<boolean> {
 		this.promptCalls.push(text);
+		this.promptImages.push(options?.images ?? []);
 		this.isStreaming = true;
 		this.sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
 		const assistantMessage = makeAssistantMessage("pong");
@@ -242,6 +266,7 @@ class FakeAgentSession {
 			} as AgentSessionEvent);
 		}
 		this.sessionManager.appendMessage(assistantMessage);
+		await this.promptHook?.();
 		for (const listener of this.#listeners) {
 			listener({
 				type: "agent_end",
@@ -335,14 +360,32 @@ class FakeAgentSession {
 	}
 
 	getActiveToolNames(): string[] {
-		return [];
+		return this.activeToolNames;
+	}
+
+	getEnabledToolNames(): string[] {
+		return this.activeToolNames;
 	}
 
 	getAllToolNames(): string[] {
 		return [];
 	}
 
-	setActiveToolsByName(_toolNames: string[]): void {}
+	setActiveToolsByName(toolNames: string[]): void {
+		this.activeToolNames = [...toolNames];
+	}
+
+	getGoalModeState(): GoalModeState | undefined {
+		return this.goalModeState;
+	}
+
+	setGoalModeState(state: GoalModeState | undefined): void {
+		this.goalModeState = state;
+	}
+
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -1910,6 +1953,7 @@ describe("ACP agent", () => {
 		expect(names).toContain("fast");
 		expect(names).toContain("retry");
 		expect(names).toContain("force");
+		expect(names).toContain("goal");
 		expect(names).toContain("skill:sample");
 		expect(names).not.toContain("settings");
 		expect(names).not.toContain("copy");
@@ -1928,6 +1972,115 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("runs /goal commands through ACP and submits the objective with attachments", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const send = async (text: string, image = false) =>
+			await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: image
+					? [
+							{ type: "text", text },
+							{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+						]
+					: [{ type: "text", text }],
+			} as PromptRequest);
+
+		await send("/goal");
+		expect(session.promptCalls).toEqual([]);
+		await send("/goal Ship the release", true);
+		expect(session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(session.getGoalModeState()?.enabled).toBe(true);
+		expect(session.getEnabledToolNames()).toContain("goal");
+		expect(session.promptCalls).toEqual(["Ship the release"]);
+		expect(session.promptImages[0]).toEqual([{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]);
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toThrow(
+			"Exit goal mode before entering plan mode.",
+		);
+
+		await send("/goal budget 500");
+		expect(session.getGoalModeState()?.goal.tokenBudget).toBe(500);
+		await send("/goal budget 500oops");
+		expect(session.getGoalModeState()?.goal.tokenBudget).toBe(500);
+		await send("/goal pause");
+		expect(session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(session.getEnabledToolNames()).not.toContain("goal");
+		await send("/goal set Do not replace while paused");
+		expect(session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		await send("/goal resume");
+		expect(session.getGoalModeState()?.enabled).toBe(true);
+		expect(session.getEnabledToolNames()).toContain("goal");
+		await send("/goal set Replace the objective");
+		expect(session.getGoalModeState()?.goal.objective).toBe("Replace the objective");
+		expect(session.promptCalls).toEqual(["Ship the release", "Replace the objective"]);
+		await send("/goal show");
+		const output = harness.updates.flatMap(update =>
+			update.update.sessionUpdate === "agent_message_chunk" && update.update.content.type === "text"
+				? [update.update.content.text]
+				: [],
+		);
+		expect(output.some(text => text.includes("Objective: Replace the objective"))).toBe(true);
+		await send("/goal drop");
+		expect(session.getGoalModeState()).toBeUndefined();
+		expect(session.getEnabledToolNames()).not.toContain("goal");
+		expect(session.promptCalls).toEqual(["Ship the release", "Replace the objective"]);
+		expectAcpNotifications(harness.updates);
+		harness.abortController.abort();
+	});
+
+	it("pauses a stored ACP goal on load and cleans up a completed goal after a turn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const restored = harness.sessions.at(-1)!;
+		expect(restored.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(restored.getGoalModeState()?.goal.status).toBe("paused");
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal resume" }],
+		} as PromptRequest);
+		expect(restored.getEnabledToolNames()).toContain("goal");
+		restored.promptHook = async () => {
+			await restored.goalRuntime.completeGoalFromTool();
+		};
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Finish" }],
+		} as PromptRequest);
+		expect(restored.getGoalModeState()).toBeUndefined();
+		expect(restored.getEnabledToolNames()).not.toContain("goal");
+		expect(restored.sessionManager.buildSessionContext().mode).toBe("none");
+		harness.abortController.abort();
+	});
+
+	it("restores the goal tool for a stored budget-limited ACP goal", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+		const session = harness.findSession(created.sessionId)!;
+		const state = session.getGoalModeState();
+		if (!state) throw new Error("expected a goal");
+		state.goal.tokensUsed = 500;
+		await session.goalRuntime.onBudgetMutated(500);
+		expect(session.getGoalModeState()?.goal.status).toBe("budget-limited");
+
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const restored = harness.sessions.at(-1)!;
+		expect(restored.getGoalModeState()?.goal.status).toBe("budget-limited");
+		expect(restored.getEnabledToolNames()).toContain("goal");
+		harness.abortController.abort();
 	});
 
 	it("includes extension-registered commands in available_commands_update and excludes ACP-builtin collisions", async () => {
