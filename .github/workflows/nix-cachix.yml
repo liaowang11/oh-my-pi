@@ -1,0 +1,61 @@
+name: Nix build (cachix)
+
+on:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package:
+    name: ${{ matrix.system }}
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-15
+            system: aarch64-darwin
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    steps:
+      - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+      - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe
+        with:
+          github_access_token: ${{ secrets.GITHUB_TOKEN }}
+          extra_nix_config: |
+            accept-flake-config = true
+      - uses: cachix/cachix-action@97e5ff84d02b3b4f9936339f767e17f03c9252ed
+        with:
+          name: iosevka-wliao
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+      - run: nix flake check --print-build-logs --system ${{ matrix.system }}
+      - run: nix build --print-build-logs .#packages.${{ matrix.system }}.default
+      - name: Verify Darwin native addon dependencies and startup
+        if: matrix.system == 'aarch64-darwin'
+        shell: bash
+        run: |
+          closure="$(nix path-info --recursive ./result)"
+          linked_roots="$(awk -F/ '$1 == "" && $2 == "nix" && $3 == "store" && $4 != "" { print "/" $2 "/" $3 "/" $4 }' \
+            ./result/nix-support/embedded-addon-linked-libraries | sort -u)"
+          if [[ -z "$linked_roots" ]]; then
+            echo "The Darwin addon has no recorded Nix library dependencies" >&2
+            exit 1
+          fi
+          while IFS= read -r required; do
+            [[ -z "$required" ]] && continue
+            if ! grep -Fqx "$required" <<<"$closure"; then
+              echo "Embedded addon dependency is outside the omp runtime closure: $required" >&2
+              exit 1
+            fi
+          done <<<"$linked_roots"
+
+          runtime_dir="$(mktemp -d)"
+          mkdir -p "$runtime_dir/home" "$runtime_dir/xdg/omp"
+          HOME="$runtime_dir/home" XDG_DATA_HOME="$runtime_dir/xdg" \
+            ./result/bin/omp --smoke-test
