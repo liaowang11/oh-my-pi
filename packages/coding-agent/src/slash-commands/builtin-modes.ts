@@ -21,6 +21,7 @@ import {
 	type ModelPresetSession,
 	saveModelPreset,
 } from "../config/model-presets";
+import { isGoalInterviewActive } from "../goals/mode";
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
@@ -28,6 +29,7 @@ import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "t
 import type { AgentSession } from "../session/agent-session";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
+import { handleAcpGoalCommand, handleAcpGuidedGoalCommand } from "./helpers/goal";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSecurityCommand } from "./helpers/security";
 import type { ParsedSlashCommand, SlashCommandSpec, TuiSlashCommandRuntime } from "./types";
@@ -328,8 +330,37 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "plan",
 		icon: "plan",
 		description: "Toggle plan mode (agent plans before executing)",
+		acpDescription: "Toggle read-only planning mode",
 		inlineHint: "[prompt]",
 		allowArgs: true,
+		handleAcp: async (command, runtime) => {
+			const setMode = runtime.setAcpMode;
+			if (!setMode) {
+				await runtime.output("Plan mode is unavailable in this host.");
+				return;
+			}
+			if (runtime.session.getPlanModeState()?.enabled) {
+				await setMode("default");
+				await runtime.output("Plan mode disabled.");
+				return;
+			}
+			if (!cfgPlanEnabled.get(runtime.settings)) {
+				await runtime.output("Plan mode is disabled. Enable it in settings (plan.enabled).");
+				return;
+			}
+			if (runtime.session.getGoalModeState() || isGoalInterviewActive(runtime.session)) {
+				await runtime.output("Exit goal mode first.");
+				return;
+			}
+			if (runtime.session.getVibeModeState()?.enabled) {
+				await runtime.output("Exit vibe mode first.");
+				return;
+			}
+			await setMode("plan");
+			const initialPrompt = command.args.trim();
+			if (initialPrompt) return { prompt: initialPrompt };
+			await runtime.output("Plan mode enabled.");
+		},
 		getTuiAutocompleteDescription: runtime => {
 			if (!cfgPlanEnabled.get(runtime.ctx.settings)) return "Plan: disabled in settings";
 			if (runtime.ctx.planModeEnabled) {
@@ -378,6 +409,8 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "goal",
 		icon: "goal",
 		description: "Toggle goal mode (persistent autonomous objective for this session)",
+		acpDescription: "Set and manage a persistent goal for this session",
+		acpInputHint: "[objective|set|show|pause|resume|drop|budget]",
 		subcommands: [
 			{ name: "set", description: "Set or replace the goal", usage: "<objective>" },
 			{ name: "show", description: "Show current goal details" },
@@ -388,6 +421,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		],
 		inlineHint: "[objective]",
 		allowArgs: true,
+		handleAcp: handleAcpGoalCommand,
 		getTuiAutocompleteDescription: runtime => {
 			if (!cfgGoalEnabled.get(runtime.ctx.settings)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
@@ -404,8 +438,10 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "guided-goal",
 		icon: "compass",
 		description: "Have the agent interview you in chat, then set up goal mode",
+		acpDescription: "Interview for a goal, then set it up in chat",
 		inlineHint: "[rough objective]",
 		allowArgs: true,
+		handleAcp: handleAcpGuidedGoalCommand,
 		handleTui: async (command, runtime) => {
 			await runWithDetachedModeDraft(command, runtime, () =>
 				runtime.ctx.handleGuidedGoalCommand(command.args || undefined, runtime.input),

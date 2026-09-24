@@ -106,6 +106,12 @@ import type {
 import type { Skill } from "../extensibility/skills";
 import type { FileSlashCommand } from "../extensibility/slash-commands";
 import { loadSlashCommands } from "../extensibility/slash-commands";
+import {
+	completeExitingGoal,
+	GOAL_CONTINUATION_MESSAGE_TYPE,
+	isStalledGoalContinuation,
+	restoreGoalMode,
+} from "../goals/mode";
 import type { GoalModeState } from "../goals/state";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
 import { copyLocalArtifacts, resolveLocalRoot } from "../internal-urls";
@@ -166,6 +172,7 @@ import {
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
+import { parseGoalSubcommand, type GoalSubcommand } from "../slash-commands/helpers/goal";
 import { formatCoarseDuration } from "@oh-my-pi/pi-tui/chrome/format";
 import { type DictationTarget, MicCursor, type SttCallbacks, STTController, type SttState } from "../stt";
 import type { SpaceHoldHandler } from "@oh-my-pi/pi-tui/space-hold";
@@ -412,7 +419,7 @@ import { cfgExpandThinkingBlocks, cfgProseOnlyThinking } from "../session/settin
 import { cfgHideThinkingBlock } from "../session/settings";
 import { cfgCycleOrder, cfgModelRoles } from "../config/model-settings";
 import { cfgGoalContinuationModes, cfgGoalEnabled } from "../goals/settings";
-import { goalContinuationActivity, goalFromModeData } from "../goals/state";
+import { goalContinuationActivity } from "../goals/state";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "../plan-mode/settings";
 import { cfgStreamRedactPatterns } from "../stream/settings";
 import { cfgSttEnabled } from "../stt/settings";
@@ -573,9 +580,6 @@ function formatHudNoteMarker(count: number): string {
 	return theme.fg("dim", chalk.italic(` \u207a${sub}`));
 }
 
-type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
-
-const GOAL_SUBCOMMANDS = new Set<GoalSubcommand>(["set", "show", "pause", "resume", "drop", "budget"]);
 const PLAN_KEEP_CONTEXT_OPTION_INDEX = 2;
 const PLAN_KEEP_CONTEXT_DISABLE_THRESHOLD_PERCENT = 95;
 const PLAN_SAVE_AND_QUIT_OPTION = "Save and quit";
@@ -594,21 +598,6 @@ function planSaveTitleExcerpt(planContent: string): string {
 		.filter(Boolean)
 		.slice(0, PLAN_SAVE_TITLE_LINE_LIMIT)
 		.join("\n");
-}
-
-function parseGoalSubcommand(args: string): {
-	sub: GoalSubcommand | undefined;
-	rest: string;
-} {
-	const trimmed = args.trim();
-	if (!trimmed) return { sub: undefined, rest: "" };
-	const match = /^(\S+)(?:\s+([\s\S]*))?$/.exec(trimmed);
-	if (!match) return { sub: undefined, rest: trimmed };
-	const first = match[1].toLowerCase();
-	if (GOAL_SUBCOMMANDS.has(first as GoalSubcommand)) {
-		return { sub: first as GoalSubcommand, rest: match[2]?.trim() ?? "" };
-	}
-	return { sub: undefined, rest: trimmed };
 }
 
 function formatContextTokenCount(value: number): string {
@@ -3076,7 +3065,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			this.onInputCallback(
 				this.startPendingSubmission({
 					text: prompt,
-					customType: "goal-continuation",
+					customType: GOAL_CONTINUATION_MESSAGE_TYPE,
 					display: false,
 				}),
 			);
@@ -3470,7 +3459,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			cancelled: false,
 			started: false,
 		};
-		if (submission.customType !== "goal-continuation") {
+		if (submission.customType !== GOAL_CONTINUATION_MESSAGE_TYPE) {
 			this.#pendingGoalContinuationTurns = 0;
 		}
 		this.#pendingSubmittedInput = submission;
@@ -3520,7 +3509,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.#pendingSubmissionPreservesDraft = false;
 		this.clearOptimisticUserMessage();
 		this.#pendingWorkingMessage = undefined;
-		if (submission.customType === "goal-continuation") {
+		if (submission.customType === GOAL_CONTINUATION_MESSAGE_TYPE) {
 			this.#pendingGoalContinuationTurns = Math.max(0, this.#pendingGoalContinuationTurns - 1);
 		}
 		if (this.loadingAnimation) {
@@ -4865,8 +4854,10 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.#pendingGoalContinuationTurns > 0) {
 			this.#pendingGoalContinuationTurns--;
 			const activity = goalContinuationActivity(event.messages);
-			this.#goalSuppressNextContinuation =
-				activity.length === 0 || activity === this.#previousGoalContinuationActivity;
+			this.#goalSuppressNextContinuation = isStalledGoalContinuation(
+				activity,
+				this.#previousGoalContinuationActivity,
+			);
 			this.#previousGoalContinuationActivity = activity;
 		} else {
 			this.#resetGoalContinuationSuppression();
@@ -5071,35 +5062,18 @@ export class InteractiveMode implements InteractiveModeContext {
 			restorePlanModel: Object.keys(sessionContext.models).length === 0,
 		});
 		await VibeSessionRegistry.global().rehydrate(vibeSession);
-		const goalEnabled = cfgGoalEnabled.get(this.session.settings);
-		if (!goalEnabled && (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused")) {
-			this.session.goalRuntime.clearAccounting();
-			this.sessionManager.appendModeChange("none");
-			return;
-		}
-		if (sessionContext.mode === "goal" || sessionContext.mode === "goal_paused") {
-			const goal = goalFromModeData(sessionContext.modeData);
-			if (!goal) {
-				this.sessionManager.appendModeChange("none");
-				return;
-			}
-			this.session.setGoalModeState({
-				enabled: sessionContext.mode === "goal",
-				mode: "active",
-				goal,
-			});
-			const restored = await this.session.goalRuntime.onThreadResumed({
-				preserveActiveGoal: options?.preserveActiveGoal,
-			});
-			this.goalModeEnabled = restored?.enabled === true;
-			this.goalModePaused = restored?.enabled !== true && restored?.goal.status === "paused";
+		const restored = await restoreGoalMode(this.session, sessionContext, {
+			preserveActiveGoal: options?.preserveActiveGoal,
+		});
+		if (restored === null) return;
+		if (restored) {
+			this.goalModeEnabled = restored.enabled;
+			this.goalModePaused = !restored.enabled && restored.goal.status === "paused";
 			// sdk.ts excludes "goal" from the initial active tool set unconditionally.
 			// Re-add it now so the agent can call resume, complete, or drop on this goal.
-			if (restored?.goal) {
-				const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
-				this.#goalModePreviousTools = previousTools;
-				await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
-			}
+			const previousTools = this.session.getEnabledToolNames().filter(name => name !== "goal");
+			this.#goalModePreviousTools = previousTools;
+			await this.session.setActiveToolsByName([...new Set([...previousTools, "goal"])]);
 			this.#updateGoalModeStatus();
 			return;
 		}
@@ -5434,16 +5408,8 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (this.goalModeEnabled && previousTools) {
 			await this.session.setActiveToolsByName(previousTools);
 		}
-		const currentState = this.session.getGoalModeState();
 		if (options?.reason === "completed") {
-			this.session.setGoalModeState(undefined);
-			this.sessionManager.appendModeChange("none");
-			this.sessionManager.appendCustomEntry("goal-completed", {
-				objective: currentState?.goal?.objective,
-				tokensUsed: currentState?.goal?.tokensUsed,
-				tokenBudget: currentState?.goal?.tokenBudget,
-				timeUsedSeconds: currentState?.goal?.timeUsedSeconds,
-			});
+			completeExitingGoal(this.session);
 		}
 		this.goalModeEnabled = false;
 		this.goalModePaused = options?.paused ?? false;

@@ -12,6 +12,8 @@ import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-regis
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { ExtensionRuntime } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/loader";
 import { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
+import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
+import type { GoalModeState } from "@oh-my-pi/pi-coding-agent/goals/state";
 import { resolveLocalUrlToPath } from "@oh-my-pi/pi-coding-agent/internal-urls";
 import * as oauthFlowModule from "@oh-my-pi/pi-coding-agent/mcp/oauth-flow";
 import {
@@ -50,6 +52,7 @@ import {
 } from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
 
+import { cfgGoalContinuationModes } from "@oh-my-pi/pi-coding-agent/goals/settings";
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 
 /** Validates an ACP wire payload against the in-house protocol schemas. */
@@ -139,6 +142,7 @@ class FakeAgentSession {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	promptImages: unknown[][] = [];
 	steerCalls: Array<{ text: string; images: unknown[] }> = [];
 	followUpCalls: Array<{ text: string; images: unknown[] }> = [];
 	joinActiveTurnCalls: Array<{ text: string; images: unknown[]; queue: "steering" | "followUp" }> = [];
@@ -185,6 +189,10 @@ class FakeAgentSession {
 	retryCalls = 0;
 	/** Backs `modelRegistry.authStorage` for `/mcp reauth` credential round-trips. */
 	authStorage?: AuthStorage;
+	goalRuntime: GoalRuntime;
+	goalModeState: GoalModeState | undefined;
+	activeToolNames: string[] = [];
+	promptHook: (() => Promise<void>) | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
 
 	constructor(
@@ -200,6 +208,22 @@ class FakeAgentSession {
 			},
 		};
 		this.model = models[0];
+		this.goalRuntime = new GoalRuntime({
+			getState: () => this.goalModeState,
+			setState: state => {
+				this.goalModeState = state;
+			},
+			getCurrentUsage: () => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }),
+			emit: event => {
+				if (event.type === "goal_updated") {
+					for (const listener of this.#listeners) listener(event);
+				}
+			},
+			persist: (mode, state) => {
+				this.sessionManager.appendModeChange(mode, state ? { goal: state.goal } : undefined);
+			},
+			sendHiddenMessage: async () => {},
+		});
 	}
 
 	get sessionName(): string {
@@ -268,8 +292,9 @@ class FakeAgentSession {
 		return [...this.#listeners];
 	}
 
-	async prompt(text: string): Promise<boolean> {
+	async prompt(text: string, options?: { images?: unknown[] }): Promise<boolean> {
 		this.promptCalls.push(text);
+		this.promptImages.push(options?.images ?? []);
 		this.isStreaming = true;
 		this.sessionManager.appendMessage({ role: "user", content: text, timestamp: Date.now() });
 		const assistantMessage = makeAssistantMessage("pong");
@@ -281,6 +306,7 @@ class FakeAgentSession {
 			} as AgentSessionEvent);
 		}
 		this.sessionManager.appendMessage(assistantMessage);
+		await this.promptHook?.();
 		for (const listener of this.#listeners) {
 			listener({
 				type: "agent_end",
@@ -309,10 +335,12 @@ class FakeAgentSession {
 		this.isStreaming = false;
 	}
 
+	/** Messages the next custom-message turn reports on `agent_end`, after its reply. */
+	customTurnMessages: (() => unknown[]) | undefined;
 	async promptCustomMessage(
 		message: { customType: string; content: string; details?: unknown },
 		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string },
-	): Promise<void> {
+	): Promise<boolean> {
 		this.customMessages.push(message);
 		this.customMessageOptions.push(options);
 		this.isStreaming = true;
@@ -325,13 +353,15 @@ class FakeAgentSession {
 			} as AgentSessionEvent);
 		}
 		this.sessionManager.appendMessage(assistantMessage);
+		const turnMessages = [...(this.customTurnMessages?.() ?? []), assistantMessage];
 		for (const listener of this.#listeners) {
 			listener({
 				type: "agent_end",
-				messages: [assistantMessage],
+				messages: turnMessages,
 			} as AgentSessionEvent);
 		}
 		this.isStreaming = false;
+		return true;
 	}
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
@@ -370,14 +400,32 @@ class FakeAgentSession {
 	}
 
 	getActiveToolNames(): string[] {
-		return [];
+		return this.activeToolNames;
+	}
+
+	getEnabledToolNames(): string[] {
+		return this.activeToolNames;
 	}
 
 	getAllToolNames(): string[] {
 		return [];
 	}
 
-	setActiveToolsByName(_toolNames: string[]): void {}
+	setActiveToolsByName(toolNames: string[]): void {
+		this.activeToolNames = [...toolNames];
+	}
+
+	getGoalModeState(): GoalModeState | undefined {
+		return this.goalModeState;
+	}
+
+	setGoalModeState(state: GoalModeState | undefined): void {
+		this.goalModeState = state;
+	}
+
+	getVibeModeState(): undefined {
+		return undefined;
+	}
 
 	setClientBridge(_bridge: unknown): void {}
 
@@ -2412,10 +2460,12 @@ describe("ACP agent", () => {
 		expect(names).toContain("fast");
 		expect(names).toContain("retry");
 		expect(names).toContain("force");
+		expect(names).toContain("goal");
 		expect(names).toContain("skill:sample");
 		expect(names).not.toContain("settings");
 		expect(names).not.toContain("copy");
-		expect(names).not.toContain("plan");
+		expect(names).toContain("plan");
+		expect(names).toContain("guided-goal");
 		expect(names).not.toContain("loop");
 		expect(names).not.toContain("login");
 		expect(names).not.toContain("new");
@@ -2430,6 +2480,255 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("runs /goal commands through ACP and submits the objective with attachments", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const send = async (text: string, image = false) =>
+			await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: image
+					? [
+							{ type: "text", text },
+							{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" },
+						]
+					: [{ type: "text", text }],
+			} as PromptRequest);
+
+		await send("/goal");
+		expect(session.promptCalls).toEqual([]);
+		await send("/goal Ship the release", true);
+		expect(session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(session.getGoalModeState()?.enabled).toBe(true);
+		expect(session.getEnabledToolNames()).toContain("goal");
+		expect(session.promptCalls).toEqual(["Ship the release"]);
+		expect(session.promptImages[0]).toEqual([{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }]);
+		await expect(harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" })).rejects.toThrow(
+			"Exit goal mode before entering plan mode.",
+		);
+
+		await send("/goal budget 500");
+		expect(session.getGoalModeState()?.goal.tokenBudget).toBe(500);
+		await send("/goal budget 500oops");
+		expect(session.getGoalModeState()?.goal.tokenBudget).toBe(500);
+		await send("/goal pause");
+		expect(session.getGoalModeState()?.goal.status).toBe("paused");
+		expect(session.getEnabledToolNames()).not.toContain("goal");
+		await send("/goal set Do not replace while paused");
+		expect(session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		await send("/goal resume");
+		expect(session.getGoalModeState()?.enabled).toBe(true);
+		expect(session.getEnabledToolNames()).toContain("goal");
+		await send("/goal set Replace the objective");
+		expect(session.getGoalModeState()?.goal.objective).toBe("Replace the objective");
+		expect(session.promptCalls).toEqual(["Ship the release", "Replace the objective"]);
+		await send("/goal show");
+		const output = harness.updates.flatMap(update =>
+			update.update.sessionUpdate === "agent_message_chunk" && update.update.content.type === "text"
+				? [update.update.content.text]
+				: [],
+		);
+		expect(output.some(text => text.includes("Objective: Replace the objective"))).toBe(true);
+		await send("/goal drop");
+		expect(session.getGoalModeState()).toBeUndefined();
+		expect(session.getEnabledToolNames()).not.toContain("goal");
+		expect(session.promptCalls).toEqual(["Ship the release", "Replace the objective"]);
+		expectAcpNotifications(harness.updates);
+		harness.abortController.abort();
+	});
+
+	it("pauses a stored ACP goal on load and cleans up a completed goal after a turn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const restored = harness.sessions.at(-1)!;
+		expect(restored.getGoalModeState()?.goal.objective).toBe("Ship the release");
+		expect(restored.getGoalModeState()?.goal.status).toBe("paused");
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal resume" }],
+		} as PromptRequest);
+		expect(restored.getEnabledToolNames()).toContain("goal");
+		restored.promptHook = async () => {
+			await restored.goalRuntime.completeGoalFromTool();
+		};
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Finish" }],
+		} as PromptRequest);
+		expect(restored.getGoalModeState()).toBeUndefined();
+		expect(restored.getEnabledToolNames()).not.toContain("goal");
+		expect(restored.sessionManager.buildSessionContext().mode).toBe("none");
+		harness.abortController.abort();
+	});
+
+	it("continues an active goal inside the owning prompt turn until a continuation stalls", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		let settled = false;
+		let settledBeforeContinuation = false;
+		// Each continuation reads the same file: the first makes progress over the
+		// user's turn, the second repeats it exactly and must stop the chain.
+		session.customTurnMessages = () => {
+			if (settled) settledBeforeContinuation = true;
+			return [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: crypto.randomUUID(), name: "read", arguments: { path: "a.ts" } }],
+				},
+				{
+					role: "toolResult",
+					toolCallId: crypto.randomUUID(),
+					toolName: "read",
+					content: [{ type: "text", text: "same" }],
+					isError: false,
+				},
+			];
+		};
+
+		const response = await harness.agent
+			.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/goal Ship the release" }],
+			} as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+
+		expect(response.stopReason).toBe("end_turn");
+		const continuations = session.customMessages.filter(message => message.customType === "goal-continuation");
+		expect(continuations).toHaveLength(2);
+		expect(continuations[0]?.content).toContain("Ship the release");
+		expect(settledBeforeContinuation).toBe(false);
+		harness.abortController.abort();
+	});
+
+	it("does not auto-continue a goal when goal.continuationModes excludes acp", async () => {
+		const harness = await createHarness();
+		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+
+		expect(response.stopReason).toBe("end_turn");
+		expect(session.promptCalls).toEqual(["Ship the release"]);
+		expect(session.customMessages).toEqual([]);
+		harness.abortController.abort();
+	});
+
+	it("keeps a background turn's agent_end from settling a prompt that reserved the slot mid-turn", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const finishPrompt = holdPromptStreaming(session);
+
+		// A background-job turn no session/prompt owns is streaming when the client prompts.
+		session.isStreaming = true;
+		let settled = false;
+		const prompt = harness.agent
+			.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "next task" }] } as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+
+		const background = makeAssistantMessage("Background job finished");
+		for (const listener of session.listeners()) {
+			listener({
+				type: "message_update",
+				message: background,
+				assistantMessageEvent: { type: "text_delta", delta: "Background job finished" },
+			} as AgentSessionEvent);
+			listener({ type: "agent_end", messages: [background] } as AgentSessionEvent);
+		}
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		finishPrompt();
+		const response = await prompt;
+		expect(response.stopReason).toBe("end_turn");
+		const texts = harness.updates.flatMap(update =>
+			update.sessionId === created.sessionId &&
+			update.update.sessionUpdate === "agent_message_chunk" &&
+			update.update.content.type === "text"
+				? [update.update.content.text]
+				: [],
+		);
+		expect(texts).toEqual(["Background job finished", "pong"]);
+		harness.abortController.abort();
+	});
+
+	it("settles on its own agent_end when the background turn ended before the prompt subscribed", async () => {
+		const harness = await createHarness();
+		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// The background turn's agent_end already fired; isStreaming is still unwinding.
+		session.isStreaming = true;
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			const reply = makeAssistantMessage("own reply");
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_start" } as AgentSessionEvent);
+				listener({
+					type: "message_update",
+					message: reply,
+					assistantMessageEvent: { type: "text_delta", delta: "own reply" },
+				} as AgentSessionEvent);
+				listener({ type: "agent_end", messages: [reply] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const response = await Promise.race([
+			harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "next task" }],
+			} as PromptRequest),
+			Bun.sleep(500).then(() => "timed out" as const),
+		]);
+		expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+		harness.abortController.abort();
+	});
+
+	it("restores the goal tool for a stored budget-limited ACP goal", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+		const session = harness.findSession(created.sessionId)!;
+		const state = session.getGoalModeState();
+		if (!state) throw new Error("expected a goal");
+		state.goal.tokensUsed = 500;
+		await session.goalRuntime.onBudgetMutated(500);
+		expect(session.getGoalModeState()?.goal.status).toBe("budget-limited");
+
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const restored = harness.sessions.at(-1)!;
+		expect(restored.getGoalModeState()?.goal.status).toBe("budget-limited");
+		expect(restored.getEnabledToolNames()).toContain("goal");
+		harness.abortController.abort();
 	});
 
 	it("includes extension-registered commands in available_commands_update and excludes ACP-builtin collisions", async () => {
