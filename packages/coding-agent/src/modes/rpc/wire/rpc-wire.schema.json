@@ -4458,6 +4458,9 @@
 				"index": {
 					"type": "integer"
 				},
+				"assignment": {
+					"type": "string"
+				},
 				"description": {
 					"type": "string"
 				},
