@@ -83,6 +83,13 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import {
+	parseSteerRequest,
+	SESSION_STEERING_METHOD,
+	type SteerRequest,
+	type SteerResponse,
+	steeringCapabilityMeta,
+} from "./acp-steering";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
@@ -171,6 +178,11 @@ type ManagedSessionRecord = {
 	mcpRefreshChain: Promise<void> | undefined;
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
+	// Serializes `_session/steering` deliveries for this session. `steer()` awaits
+	// image normalization (and a vision description on a text-only model), so two
+	// steers arriving close together could otherwise reach the agent's steering
+	// queue out of submission order.
+	steerChain: Promise<void> | undefined;
 	liveMessageId: string | undefined;
 	liveMessageProgress: { textEmitted: boolean; thoughtEmitted: boolean } | undefined;
 	toolArgsById: Map<string, unknown>;
@@ -675,6 +687,10 @@ export class AcpAgent implements Agent {
 					close: {},
 				},
 			},
+			// Top-level `_meta`, sibling of `agentCapabilities`: the shared ACP
+			// steering extension advertises itself here, so a client learns it may
+			// send `_session/steering` without probing the method first.
+			_meta: steeringCapabilityMeta(),
 		};
 	}
 
@@ -1072,6 +1088,64 @@ export class AcpAgent implements Agent {
 		return true;
 	}
 
+	/**
+	 * `_session/steering`: deliver a message into the turn that is currently
+	 * running, rather than behind it.
+	 *
+	 * This never creates a `promptTurn`. The running turn's `session/prompt` keeps
+	 * ownership of its `PromptResponse` and still settles on its own `agent_end`,
+	 * which is what lets a steer join a turn the client did not start — an
+	 * autonomous turn included. A second `session/prompt` cannot do that: it
+	 * either implicitly cancels the running turn or, with no owning prompt turn to
+	 * cancel, is refused with `-32003 session_busy`.
+	 *
+	 * The steered message's own output streams through the normal `session/update`
+	 * feed; this response only reports where the message landed.
+	 */
+	async #steerSession(params: SteerRequest): Promise<SteerResponse> {
+		const record = this.#getSessionRecord(params.sessionId);
+		this.#throwIfRecordClosed(record);
+		const converted = this.#convertPromptBlocks(params.prompt);
+		if (converted.text.length === 0 && converted.images.length === 0) {
+			throw RequestError.invalidParams(undefined, "`prompt` carried no steerable content");
+		}
+
+		// Read synchronously, with no await between this check and the enqueue
+		// below, so the turn cannot settle in the gap between "a turn is running"
+		// and the message joining it. `isStreaming` also covers a prompt that has
+		// been dispatched but has not begun streaming yet, which is exactly the
+		// other window where steering is the right answer.
+		if (!record.session.isStreaming) {
+			if (params._meta?.steering?.idleBehavior === "promptRequired") {
+				// Nothing started, nothing queued: the content stays client-owned so it
+				// can be resent as a `session/prompt` that owns the resulting turn.
+				return { outcome: "promptRequired", reason: "noRunningTurn" };
+			}
+			// Established contract default, kept for clients that predate
+			// `promptRequired`. The turn is deliberately detached: no client request
+			// owns its `PromptResponse`, which is why `promptRequired` is preferred.
+			this.prompt({ sessionId: params.sessionId, prompt: params.prompt } as PromptRequest).catch(
+				(error: unknown) => {
+					logger.warn("ACP steer-started turn failed", { sessionId: params.sessionId, error });
+				},
+			);
+			return { outcome: "startedNewTurn" };
+		}
+
+		// Chained per session so concurrent steers reach the agent's steering queue
+		// in arrival order despite the awaits inside `steer()`.
+		const previous = record.steerChain ?? Promise.resolve();
+		const delivery = previous.then(() =>
+			record.session.steer(converted.text, converted.images.length > 0 ? converted.images : undefined),
+		);
+		record.steerChain = delivery.then(
+			() => undefined,
+			() => undefined,
+		);
+		await delivery;
+		return { outcome: "injected" };
+	}
+
 	async cancel(params: { sessionId: string }): Promise<void> {
 		const record = this.#getSessionRecord(params.sessionId);
 		const promptTurn = record.promptTurn;
@@ -1130,6 +1204,10 @@ export class AcpAgent implements Agent {
 
 	async extMethod(method: string, params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
 		switch (method) {
+			case SESSION_STEERING_METHOD: {
+				const outcome = await this.#steerSession(parseSteerRequest(params));
+				return { ...outcome } as { [key: string]: unknown };
+			}
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
@@ -1354,6 +1432,7 @@ export class AcpAgent implements Agent {
 			mcpRefreshChain: undefined,
 			promptTurn: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
+			steerChain: undefined,
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
 			toolArgsById: new Map(),

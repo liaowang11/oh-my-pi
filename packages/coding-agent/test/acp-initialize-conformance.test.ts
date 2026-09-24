@@ -240,6 +240,15 @@ describe("ACP initialize conformance", () => {
 		expect(response.agentInfo!.version).toBe(pkg.version);
 	});
 
+	it("advertises the steering extension in the top-level _meta", async () => {
+		const agent = await createAgent();
+		const response = await agent.initialize(buildInitializeRequest());
+		expectAcpStructure(arkInitializeResponse, response);
+		// Sibling of agentCapabilities, per the shared ACP steering contract: this
+		// is how a client learns it may send `_session/steering`.
+		expect(response._meta).toEqual(expect.objectContaining({ steering: { supported: true } }));
+	});
+
 	it("preserves the agentCapabilities contract clients depend on", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());

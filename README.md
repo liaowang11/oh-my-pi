@@ -558,6 +558,18 @@ The [Agent Client Protocol](https://github.com/zed-industries/agent-client-proto
 | `write`      | `fs/write_text_file`                |
 | `edit, bash` | `session/request_permission`        |
 
+Mid-turn steering is available as the `_session/steering` extension, advertised in
+`InitializeResponse._meta.steering.supported`. Send `{ sessionId, prompt }` while a turn is running and
+the message joins that turn instead of cancelling it; the running `session/prompt` keeps ownership of its
+response and the steered output arrives on the usual `session/update` feed. The outcome is `injected`.
+Steering also works on a turn no client started, which `session/prompt` can only answer with
+`-32003 session_busy`.
+
+With no turn running, the default outcome is `startedNewTurn` — a detached turn whose response no request
+owns. Prefer opting into `_meta.steering.idleBehavior: "promptRequired"`: the agent then changes nothing
+and answers `promptRequired`, so you can resend the same content as a normal `session/prompt` that owns
+the turn it starts.
+
 Full reference: [omp.sh/docs/sdk](https://omp.sh/docs/sdk).
 
 ## A harness worth keeping is one you _don't_ outgrow.

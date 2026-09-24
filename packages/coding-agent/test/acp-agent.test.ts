@@ -132,6 +132,7 @@ class FakeAgentSession {
 		return Settings.instance;
 	}
 	promptCalls: string[] = [];
+	steerCalls: Array<{ text: string; images: unknown[] | undefined }> = [];
 	customMessages: Array<{ customType: string; content: string; details?: unknown }> = [];
 	customMessageOptions: Array<{ streamingBehavior?: "steer" | "followUp"; queueChipText?: string } | undefined> = [];
 	skillsSettings = { enableSkillCommands: true };
@@ -246,6 +247,10 @@ class FakeAgentSession {
 		}
 		this.isStreaming = false;
 		return true;
+	}
+
+	async steer(text: string, images?: unknown[]): Promise<void> {
+		this.steerCalls.push({ text, images });
 	}
 
 	async retry(): Promise<boolean> {
@@ -3432,6 +3437,196 @@ describe("ACP agent", () => {
 			expect(second.sessionId).toBe("session-after-switch");
 			expect(third.sessionId).toBe("session-after-switch");
 		});
+	});
+});
+
+describe("ACP session steering (_session/steering)", () => {
+	const STEER_METHOD = "_session/steering";
+
+	async function steer(
+		harness: AgentHarness,
+		params: { [key: string]: unknown },
+	): Promise<{ [key: string]: unknown }> {
+		return await harness.agent.extMethod(STEER_METHOD, params);
+	}
+
+	it("injects into the running turn without taking over the prompt response", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const finishPrompt = holdPromptStreaming(session);
+
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "long running turn" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+		expect(session.isStreaming).toBe(true);
+
+		const outcome = await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "actually, stop after this file" }],
+		});
+
+		expect(outcome).toEqual({ outcome: "injected" });
+		expect(session.steerCalls).toEqual([{ text: "actually, stop after this file", images: undefined }]);
+		// Steering must not start a turn of its own; the in-flight prompt still
+		// owns the response and settles on its own agent_end.
+		expect(session.promptCalls).toEqual(["long running turn"]);
+
+		finishPrompt();
+		const response = await prompt;
+		expectAcpStructure(zPromptResponse, response);
+		expect(response.stopReason).toBe("end_turn");
+	});
+
+	it("carries image blocks into the running turn", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const finishPrompt = holdPromptStreaming(session);
+
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "look at this" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+
+		await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [
+				{ type: "text", text: "this screenshot instead" },
+				{ type: "image", data: "aGVsbG8=", mimeType: "image/png" },
+			],
+		});
+
+		expect(session.steerCalls).toEqual([
+			{
+				text: "this screenshot instead",
+				images: [{ type: "image", data: "aGVsbG8=", mimeType: "image/png" }],
+			},
+		]);
+
+		finishPrompt();
+		await prompt;
+	});
+
+	it("steers an autonomous turn that no ACP prompt owns", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// Autonomous turns stream with no owning promptTurn: a second
+		// session/prompt is refused with -32003, but a steer still lands.
+		session.isStreaming = true;
+
+		const outcome = await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "join the autonomous turn" }],
+		});
+
+		expect(outcome).toEqual({ outcome: "injected" });
+		expect(session.steerCalls).toHaveLength(1);
+		expect(session.promptCalls).toEqual([]);
+	});
+
+	it("preserves arrival order when a slow steer is followed by a fast one", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.isStreaming = true;
+
+		// Mirrors steer()'s internal awaits: the first delivery (an image steer
+		// paying for a vision description) resolves after the second is issued.
+		const firstDeliveryBlocked = Promise.withResolvers<void>();
+		let seen = 0;
+		session.steer = async (text: string): Promise<void> => {
+			if (seen++ === 0) await firstDeliveryBlocked.promise;
+			session.steerCalls.push({ text, images: undefined });
+		};
+
+		const first = steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "first" }],
+		});
+		const second = steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "second" }],
+		});
+		await Bun.sleep(0);
+		expect(session.steerCalls).toEqual([]);
+
+		firstDeliveryBlocked.resolve();
+		expect(await first).toEqual({ outcome: "injected" });
+		expect(await second).toEqual({ outcome: "injected" });
+		expect(session.steerCalls.map(call => call.text)).toEqual(["first", "second"]);
+	});
+
+	it("keeps the content client-owned when the client opts into promptRequired", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		const outcome = await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "nothing is running" }],
+			_meta: { steering: { idleBehavior: "promptRequired" } },
+		});
+
+		expect(outcome).toEqual({ outcome: "promptRequired", reason: "noRunningTurn" });
+		expect(session.steerCalls).toEqual([]);
+		expect(session.promptCalls).toEqual([]);
+	});
+
+	it("starts a detached turn when idle and the client did not opt in", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		const outcome = await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "nothing is running" }],
+		});
+
+		expect(outcome).toEqual({ outcome: "startedNewTurn" });
+		await Bun.sleep(0);
+		expect(session.promptCalls).toEqual(["nothing is running"]);
+		expect(session.steerCalls).toEqual([]);
+	});
+
+	it("rejects malformed steer params with invalidParams", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.isStreaming = true;
+
+		const cases: Array<{ [key: string]: unknown }> = [
+			{ prompt: [{ type: "text", text: "no session" }] },
+			{ sessionId: "", prompt: [{ type: "text", text: "empty session" }] },
+			{ sessionId: created.sessionId },
+			{ sessionId: created.sessionId, prompt: [] },
+			{ sessionId: created.sessionId, prompt: [{ type: "text", text: "   " }] },
+			{
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "bad idle behavior" }],
+				_meta: { steering: { idleBehavior: "holdTurn" } },
+			},
+		];
+
+		for (const params of cases) {
+			const error = await steer(harness, params).catch((reason: unknown) => reason);
+			expect(error).toBeInstanceOf(RequestError);
+			expect((error as RequestError).code).toBe(-32602);
+		}
+		expect(session.steerCalls).toEqual([]);
+	});
+
+	it("rejects a steer for an unknown session", async () => {
+		const harness = await createHarness();
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		await expect(
+			steer(harness, { sessionId: "not-a-session", prompt: [{ type: "text", text: "hello" }] }),
+		).rejects.toThrow("Unsupported ACP session: not-a-session");
 	});
 });
 
