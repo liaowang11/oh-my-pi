@@ -30,8 +30,15 @@ import type {
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
-import { TaskTool } from "@oh-my-pi/pi-coding-agent/task";
+import {
+	type SubagentLifecyclePayload,
+	TASK_SUBAGENT_EVENT_CHANNEL,
+	TASK_SUBAGENT_LIFECYCLE_CHANNEL,
+	TASK_SUBAGENT_PROGRESS_CHANNEL,
+	TaskTool,
+} from "@oh-my-pi/pi-coding-agent/task";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
+import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
@@ -534,6 +541,8 @@ interface AgentHarness {
 	abortController: AbortController;
 	sessions: FakeAgentSession[];
 	setToolUIContextSpies: SetToolUIContextSpy[];
+	// One per factory-created session, in creation order.
+	eventBuses: EventBus[];
 	sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined>;
 	cwdA: string;
 	cwdB: string;
@@ -599,6 +608,7 @@ async function createHarness(
 	const abortController = new AbortController();
 	const sessions: FakeAgentSession[] = [];
 	const setToolUIContextSpies: SetToolUIContextSpy[] = [];
+	const eventBuses: EventBus[] = [];
 	const sessionFactoryOptions: Array<{ interactivePrompts?: boolean } | undefined> = [];
 	const connection = {
 		sessionUpdate: async (notification: SessionNotification) => {
@@ -632,7 +642,9 @@ async function createHarness(
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
 		sessionFactoryOptions.push(factoryOptions);
-		return { session: session as unknown as AgentSession, setToolUIContext };
+		const eventBus = new EventBus();
+		eventBuses.push(eventBus);
+		return { session: session as unknown as AgentSession, setToolUIContext, eventBus };
 	};
 
 	const agent = new AcpAgent(connection, factory, initialSession as unknown as AgentSession);
@@ -651,6 +663,7 @@ async function createHarness(
 		abortController,
 		sessions,
 		setToolUIContextSpies,
+		eventBuses,
 		sessionFactoryOptions,
 		cwdA,
 		cwdB,
@@ -4712,4 +4725,441 @@ describe("ACP agent MCP server configuration (late-connecting servers)", () => {
 			database.close();
 		}
 	}, 20_000);
+});
+
+describe("ACP subagent sessions", () => {
+	function lifecycle(
+		bus: EventBus,
+		id: string,
+		status: SubagentLifecyclePayload["status"],
+		extra: Partial<SubagentLifecyclePayload> = {},
+	): void {
+		const payload: SubagentLifecyclePayload = {
+			id,
+			agent: "explore",
+			agentSource: "bundled",
+			status,
+			index: 0,
+			...extra,
+		};
+		bus.emit(TASK_SUBAGENT_LIFECYCLE_CHANNEL, payload);
+	}
+
+	function childEvent(bus: EventBus, id: string, event: AgentSessionEvent): void {
+		bus.emit(TASK_SUBAGENT_EVENT_CHANNEL, { id, event });
+	}
+
+	function subagentUpdates(harness: AgentHarness): SessionNotification[] {
+		return harness.updates.filter(
+			n => n.update.sessionUpdate === "subagent_update" || n.update.sessionUpdate === "session_message",
+		);
+	}
+
+	function prompt(child: string, parent: string, n: number, text: string): SessionNotification {
+		return {
+			sessionId: child,
+			update: {
+				sessionUpdate: "session_message",
+				messageId: `${child}:prompt:${n}`,
+				senderSessionId: parent,
+				recipientSessionId: child,
+				content: [{ type: "text", text }],
+			},
+		};
+	}
+
+	it("announces a child as running, sends its prompt, patches its label, and reports idle", async () => {
+		const settled = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			clientCapabilities: { subagents: {} },
+			sessionUpdateHook: notification => {
+				const { update } = notification;
+				if (update.sessionUpdate === "subagent_update" && update.state?.state === "idle") settled.resolve();
+			},
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const parent = created.sessionId;
+		const child = `${parent}:subagent:InspectLabels`;
+		const progress = (description?: string) =>
+			bus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+				assignment: "Trace missing subagent labels",
+				progress: { id: "InspectLabels", description },
+			});
+		lifecycle(bus, "InspectLabels", "started", { assignment: "Trace missing subagent labels" });
+		progress("Find description loss");
+		progress("Find description loss");
+		progress("   ");
+		progress();
+		lifecycle(bus, "InspectLabels", "completed", { description: "Final label" });
+		progress("Late label");
+		await settled.promise;
+		await Bun.sleep(0);
+		const notifications = subagentUpdates(harness);
+		expect(notifications).toEqual([
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					title: "InspectLabels",
+					state: { state: "running" },
+				},
+			},
+			prompt(child, parent, 1, "Trace missing subagent labels"),
+			{
+				sessionId: parent,
+				update: { sessionUpdate: "subagent_update", sessionId: child, description: "Find description loss" },
+			},
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					description: "Final label",
+					state: { state: "idle", stopReason: "end_turn" },
+				},
+			},
+		]);
+		expectAcpNotifications(notifications);
+		harness.abortController.abort();
+	});
+
+	it("relays a subagent tree as child sessions announced before their traffic", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const parent = created.sessionId;
+		const child = `${parent}:subagent:0-Explore`;
+		const nested = `${parent}:subagent:0-Explore.0-Scan`;
+
+		lifecycle(bus, "0-Explore", "started", {
+			description: "map the repo",
+			assignment: "Map the repository layout",
+			parentToolCallId: "root-task",
+		});
+		const message = makeAssistantMessage("found it");
+		childEvent(bus, "0-Explore", { type: "message_start", message } as AgentSessionEvent);
+		childEvent(bus, "0-Explore", {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: "found it" },
+		} as AgentSessionEvent);
+		childEvent(bus, "0-Explore", {
+			type: "tool_execution_start",
+			toolCallId: "child-task",
+			toolName: "task",
+			args: {},
+		} as AgentSessionEvent);
+		lifecycle(bus, "0-Explore.0-Scan", "started", { agent: "scan", parentToolCallId: "child-task" });
+		lifecycle(bus, "0-Explore.0-Scan", "failed", { description: "Scan dependencies" });
+		lifecycle(bus, "0-Explore", "aborted");
+		// An idle child keeps its session: late frames still land in it.
+		childEvent(bus, "0-Explore", {
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: " late" },
+		} as AgentSessionEvent);
+		await Bun.sleep(0);
+
+		expect(
+			harness.updates
+				.filter(n => n.update.sessionUpdate !== "available_commands_update")
+				.filter(n => n.sessionId !== parent || n.update.sessionUpdate === "subagent_update")
+				.map(n => [n.sessionId, n.update.sessionUpdate]),
+		).toEqual([
+			[parent, "subagent_update"],
+			[child, "session_message"],
+			[child, "agent_message_chunk"],
+			[child, "tool_call"],
+			[child, "subagent_update"],
+			[child, "subagent_update"],
+			[parent, "subagent_update"],
+			[child, "agent_message_chunk"],
+		]);
+		expect(subagentUpdates(harness)).toEqual([
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					title: "0-Explore",
+					description: "map the repo",
+					state: { state: "running" },
+				},
+			},
+			prompt(child, parent, 1, "Map the repository layout"),
+			{
+				sessionId: child,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: nested,
+					title: "0-Explore.0-Scan",
+					state: { state: "running" },
+				},
+			},
+			{
+				sessionId: child,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: nested,
+					description: "Scan dependencies",
+					state: { state: "idle", stopReason: "error" },
+				},
+			},
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					state: { state: "idle", stopReason: "cancelled" },
+				},
+			},
+		]);
+		expectAcpNotifications(harness.updates);
+		harness.abortController.abort();
+	});
+
+	it("keeps one child session when an idle subagent runs again", async () => {
+		const refined = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			clientCapabilities: { subagents: {} },
+			sessionUpdateHook: notification => {
+				const { update } = notification;
+				if (update.sessionUpdate === "subagent_update" && update.description === "New purpose") refined.resolve();
+			},
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const parent = created.sessionId;
+		const child = `${parent}:subagent:0-Explore`;
+
+		lifecycle(bus, "0-Explore", "started", { description: "Old purpose", assignment: "First assignment" });
+		lifecycle(bus, "0-Explore", "started", { assignment: "First assignment" });
+		lifecycle(bus, "0-Explore", "completed");
+		lifecycle(bus, "0-Explore", "started", { assignment: "Follow-up assignment" });
+		bus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+			assignment: "Follow-up assignment",
+			progress: { id: "0-Explore", description: "New purpose" },
+		});
+		await refined.promise;
+		await Bun.sleep(0);
+
+		expect(subagentUpdates(harness)).toEqual([
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					title: "0-Explore",
+					description: "Old purpose",
+					state: { state: "running" },
+				},
+			},
+			prompt(child, parent, 1, "First assignment"),
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					state: { state: "idle", stopReason: "end_turn" },
+				},
+			},
+			{
+				sessionId: parent,
+				update: { sessionUpdate: "subagent_update", sessionId: child, state: { state: "running" } },
+			},
+			prompt(child, parent, 2, "Follow-up assignment"),
+			{
+				sessionId: parent,
+				update: { sessionUpdate: "subagent_update", sessionId: child, description: "New purpose" },
+			},
+		]);
+		harness.abortController.abort();
+	});
+
+	// A parent that delegated to 0-Explore (which ran 0-Explore.0-Scan) and to 1-Ghost, which has no transcript.
+	async function storeDelegatedSession(harness: AgentHarness): Promise<FakeAgentSession> {
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		const toolCall = (id: string) => ({
+			...makeAssistantMessage(""),
+			content: [{ type: "toolCall" as const, id, name: "task", arguments: {} }],
+			stopReason: "toolUse" as const,
+		});
+		const taskResult = (toolCallId: string, details: unknown) => ({
+			role: "toolResult" as const,
+			toolCallId,
+			toolName: "task",
+			content: [{ type: "text" as const, text: "spawned" }],
+			details,
+			isError: false,
+			timestamp: Date.now(),
+		});
+		// A transcript at `<caller session file minus .jsonl>/<id>.jsonl`, where the task tool writes it.
+		async function writeTranscript(callerFile: string, id: string, messages: unknown[]): Promise<string> {
+			const manager = SessionManager.create(harness.cwdA);
+			for (const message of messages) manager.appendMessage(message as never);
+			await manager.ensureOnDisk();
+			await manager.flush();
+			const target = path.join(callerFile.slice(0, -".jsonl".length), `${id}.jsonl`);
+			await Bun.write(target, Bun.file(manager.getSessionFile()!));
+			return target;
+		}
+
+		stored.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "delegate" }],
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendMessage(toolCall("toolu_task"));
+		stored.sessionManager.appendMessage(
+			taskResult("toolu_task", {
+				results: [
+					{ id: "0-Explore", description: "map the repo" },
+					{ id: "1-Ghost", description: "no transcript" },
+				],
+			}),
+		);
+		stored.sessionManager.appendMessage(makeAssistantMessage("done"));
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+		const childFile = await writeTranscript(stored.sessionManager.getSessionFile()!, "0-Explore", [
+			{ role: "user", content: [{ type: "text", text: "Map the repository" }], timestamp: Date.now() },
+			toolCall("toolu_nested"),
+			taskResult("toolu_nested", { results: [], progress: [{ id: "0-Explore.0-Scan", description: "scan deps" }] }),
+			makeAssistantMessage("found it"),
+		]);
+		await writeTranscript(childFile, "0-Explore.0-Scan", [
+			{ role: "user", content: [{ type: "text", text: "Scan dependencies" }], timestamp: Date.now() },
+			{ ...makeAssistantMessage("partial"), stopReason: "error" as const, errorMessage: "boom" },
+		]);
+
+		return stored;
+	}
+
+	it("replays each child from its own transcript on load, nested children included", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const stored = await storeDelegatedSession(harness);
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const parent = stored.sessionId;
+		const child = `${parent}:subagent:0-Explore`;
+		const nested = `${parent}:subagent:0-Explore.0-Scan`;
+		const replayed = harness.updates.filter(n => n.update.sessionUpdate !== "available_commands_update");
+
+		expect(
+			replayed
+				.filter(n => n.update.sessionUpdate !== "tool_call_update")
+				.map(n => {
+					const { update } = n;
+					if (update.sessionUpdate === "subagent_update")
+						return [n.sessionId, update.sessionId, update.state ?? null];
+					if (update.sessionUpdate === "session_message") return [n.sessionId, update.messageId];
+					if (update.sessionUpdate === "agent_message_chunk" && update.content.type === "text")
+						return [n.sessionId, update.content.text];
+					return [n.sessionId, update.sessionUpdate];
+				}),
+		).toEqual([
+			[parent, "user_message_chunk"],
+			[parent, "tool_call"],
+			[parent, child, null],
+			[child, `${child}:prompt:1`],
+			[child, "tool_call"],
+			[child, nested, null],
+			[nested, `${nested}:prompt:1`],
+			[nested, "partial"],
+			[child, nested, { state: "idle", stopReason: "error" }],
+			[child, "found it"],
+			[parent, child, { state: "idle", stopReason: "end_turn" }],
+			[parent, "done"],
+		]);
+		expect(replayed.find(n => n.update.sessionUpdate === "subagent_update")?.update).toEqual({
+			sessionUpdate: "subagent_update",
+			sessionId: child,
+			title: "0-Explore",
+			description: "map the repo",
+		});
+		expect(replayed.find(n => n.update.sessionUpdate === "session_message")).toEqual(
+			prompt(child, parent, 1, "Map the repository"),
+		);
+		expectAcpNotifications(replayed);
+
+		// A later run of a replayed child continues its session and its prompt numbering.
+		const before = harness.updates.length;
+		const bus = harness.eventBuses.at(-1)!;
+		lifecycle(bus, "0-Explore", "started", { assignment: "Follow up" });
+		await Bun.sleep(0);
+		expect(subagentUpdates({ ...harness, updates: harness.updates.slice(before) })).toEqual([
+			{
+				sessionId: parent,
+				update: { sessionUpdate: "subagent_update", sessionId: child, state: { state: "running" } },
+			},
+			prompt(child, parent, 2, "Follow up"),
+		]);
+		harness.abortController.abort();
+	});
+
+	it("announces a resumed session's child and its ancestors before the child runs again", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const stored = await storeDelegatedSession(harness);
+		await harness.agent.resumeSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		await Bun.sleep(0);
+		expect(subagentUpdates(harness)).toEqual([]);
+
+		const parent = stored.sessionId;
+		const child = `${parent}:subagent:0-Explore`;
+		const nested = `${parent}:subagent:0-Explore.0-Scan`;
+		lifecycle(harness.eventBuses.at(-1)!, "0-Explore.0-Scan", "started", { assignment: "Scan again" });
+		await Bun.sleep(0);
+		expect(subagentUpdates(harness)).toEqual([
+			{
+				sessionId: parent,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: child,
+					title: "0-Explore",
+					description: "map the repo",
+				},
+			},
+			{
+				sessionId: child,
+				update: {
+					sessionUpdate: "subagent_update",
+					sessionId: nested,
+					title: "0-Explore.0-Scan",
+					description: "scan deps",
+				},
+			},
+			{
+				sessionId: child,
+				update: { sessionUpdate: "subagent_update", sessionId: nested, state: { state: "running" } },
+			},
+			prompt(nested, child, 2, "Scan again"),
+		]);
+		harness.abortController.abort();
+	});
+
+	it("keeps subagent frames off the wire for clients without the capability", async () => {
+		const harness = await createHarness({ clientCapabilities: {} });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const before = harness.updates.length;
+
+		lifecycle(bus, "0-Explore", "started");
+		bus.emit(TASK_SUBAGENT_PROGRESS_CHANNEL, {
+			assignment: "Hidden assignment",
+			progress: { id: "0-Explore", description: "Hidden label" },
+		});
+		childEvent(bus, "0-Explore", {
+			type: "tool_execution_start",
+			toolCallId: "child-tool",
+			toolName: "read",
+			args: {},
+		} as AgentSessionEvent);
+		lifecycle(bus, "0-Explore", "completed");
+		await Bun.sleep(0);
+
+		expect(harness.updates.slice(before)).toEqual([]);
+		harness.abortController.abort();
+	});
 });

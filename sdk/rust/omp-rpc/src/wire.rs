@@ -4109,6 +4109,8 @@ pub struct SubagentLifecyclePayload {
 	pub status: SubagentLifecycleStatus,
 	pub index: i64,
 	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub assignment: Option<String>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub description: Option<String>,
 	#[serde(rename = "sessionFile", default, skip_serializing_if = "Option::is_none")]
 	pub session_file: Option<String>,

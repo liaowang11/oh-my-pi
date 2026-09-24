@@ -57,6 +57,7 @@ export const frameDefs = {
 		id: "string",
 		agent: "string",
 		agentSource: "AgentSource",
+		"assignment?": "string",
 		"description?": "string",
 		status: "SubagentLifecycleStatus",
 		"sessionFile?": "string",
