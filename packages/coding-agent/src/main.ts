@@ -1838,12 +1838,7 @@ export async function runRootCommand(
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_PTY = "1";
 		}
-		if (
-			parsedArgs.noTitle ||
-			parsedArgs.mode === "rpc" ||
-			parsedArgs.mode === "rpc-ui" ||
-			parsedArgs.mode === "acp"
-		) {
+		if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_TITLE = "1";
 		}
 

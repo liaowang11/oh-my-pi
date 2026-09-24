@@ -199,6 +199,9 @@ class FakeAgentSession {
 	setSlashCommands(_commands: unknown[]): void {
 		// no-op for tests
 	}
+	maybeStartTitleGeneration(_firstMessage: string, _onStart?: () => (() => void) | void): void {
+		// no-op for tests
+	}
 	setUsageFallbackConfirmer(
 		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
 	): void {
