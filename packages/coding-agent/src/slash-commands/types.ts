@@ -54,6 +54,9 @@ export type SlashCommandResult =
 	| { consumed: true; agentInvoked?: boolean }
 	| { prompt: string; synthetic?: boolean };
 
+/** Text-mode hosts that dispatch builtin slash commands without the TUI. */
+export type TextSlashCommandHost = "acp" | "rpc";
+
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
  *
@@ -63,7 +66,7 @@ export type SlashCommandResult =
  */
 export interface SlashCommandRuntime {
 	/** Text-command host; omitted for ACP-compatible callers. */
-	host?: "acp" | "rpc";
+	host?: TextSlashCommandHost;
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -161,12 +164,7 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 		  ) => SlashCommandResult | Promise<SlashCommandResult>)
 		| ((command: ParsedSlashCommand, runtime: SlashCommandRuntime) => void | Promise<void>);
 	/** ACP-only handler. RPC dispatch uses `handle` and does not advertise this command. */
-	handleAcp?:
-		| ((
-				command: ParsedSlashCommand,
-				runtime: SlashCommandRuntime,
-		  ) => SlashCommandResult | Promise<SlashCommandResult>)
-		| ((command: ParsedSlashCommand, runtime: SlashCommandRuntime) => void | Promise<void>);
+	handleAcp?: SlashCommandHandler;
 	/**
 	 * TUI-only handler that supersedes `handle` when both are present. Use for
 	 * selectors, wizards, dashboards, and anything else that requires
@@ -186,3 +184,6 @@ export type AcpBuiltinSlashCommandResult =
 	| false
 	| { consumed: true; agentInvoked?: boolean }
 	| { prompt: string; synthetic?: boolean };
+
+/** Shape of `handle` / `handleAcp`; see `handle` for why it is a two-member union. */
+export type SlashCommandHandler = NonNullable<SlashCommandSpec["handle"]>;

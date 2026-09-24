@@ -222,8 +222,9 @@ class FakeAgentSession {
 	setSlashCommands(_commands: unknown[]): void {
 		// no-op for tests
 	}
-	maybeStartTitleGeneration(_firstMessage: string, _onStart?: () => (() => void) | void): void {
-		// no-op for tests
+	titleInputs: string[] = [];
+	maybeStartTitleGeneration(firstMessage: string, _onStart?: () => (() => void) | void): void {
+		this.titleInputs.push(firstMessage);
 	}
 	setUsageFallbackConfirmer(
 		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
@@ -299,10 +300,12 @@ class FakeAgentSession {
 		this.isStreaming = false;
 	}
 
+	/** Messages the next custom-message turn reports on `agent_end`, after its reply. */
+	customTurnMessages: (() => unknown[]) | undefined;
 	async promptCustomMessage(
 		message: { customType: string; content: string; details?: unknown },
 		options?: { streamingBehavior?: "steer" | "followUp"; queueChipText?: string },
-	): Promise<void> {
+	): Promise<boolean> {
 		this.customMessages.push(message);
 		this.customMessageOptions.push(options);
 		this.isStreaming = true;
@@ -315,13 +318,15 @@ class FakeAgentSession {
 			} as AgentSessionEvent);
 		}
 		this.sessionManager.appendMessage(assistantMessage);
+		const turnMessages = [...(this.customTurnMessages?.() ?? []), assistantMessage];
 		for (const listener of this.#listeners) {
 			listener({
 				type: "agent_end",
-				messages: [assistantMessage],
+				messages: turnMessages,
 			} as AgentSessionEvent);
 		}
 		this.isStreaming = false;
+		return true;
 	}
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
@@ -1957,7 +1962,8 @@ describe("ACP agent", () => {
 		expect(names).toContain("skill:sample");
 		expect(names).not.toContain("settings");
 		expect(names).not.toContain("copy");
-		expect(names).not.toContain("plan");
+		expect(names).toContain("plan");
+		expect(names).toContain("guided-goal");
 		expect(names).not.toContain("loop");
 		expect(names).not.toContain("login");
 		expect(names).not.toContain("new");
@@ -2058,6 +2064,167 @@ describe("ACP agent", () => {
 		expect(restored.getGoalModeState()).toBeUndefined();
 		expect(restored.getEnabledToolNames()).not.toContain("goal");
 		expect(restored.sessionManager.buildSessionContext().mode).toBe("none");
+		harness.abortController.abort();
+	});
+
+	it("continues an active goal inside the owning prompt turn until a continuation stalls", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		let settled = false;
+		let settledBeforeContinuation = false;
+		// Each continuation reads the same file: the first makes progress over the
+		// user's turn, the second repeats it exactly and must stop the chain.
+		session.customTurnMessages = () => {
+			if (settled) settledBeforeContinuation = true;
+			return [
+				{
+					role: "assistant",
+					content: [{ type: "toolCall", id: crypto.randomUUID(), name: "read", arguments: { path: "a.ts" } }],
+				},
+				{
+					role: "toolResult",
+					toolCallId: crypto.randomUUID(),
+					toolName: "read",
+					content: [{ type: "text", text: "same" }],
+					isError: false,
+				},
+			];
+		};
+
+		const response = await harness.agent
+			.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/goal Ship the release" }],
+			} as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+
+		expect(response.stopReason).toBe("end_turn");
+		const continuations = session.customMessages.filter(message => message.customType === "goal-continuation");
+		expect(continuations).toHaveLength(2);
+		expect(continuations[0]?.content).toContain("Ship the release");
+		expect(settledBeforeContinuation).toBe(false);
+		harness.abortController.abort();
+	});
+
+	it("does not auto-continue a goal when goal.continuationModes excludes acp", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/goal Ship the release" }],
+		} as PromptRequest);
+
+		expect(response.stopReason).toBe("end_turn");
+		expect(session.promptCalls).toEqual(["Ship the release"]);
+		expect(session.customMessages).toEqual([]);
+		harness.abortController.abort();
+	});
+
+	it("titles the session from model-bound text, never from builtin command text", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const send = async (text: string) =>
+			await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text }],
+			} as PromptRequest);
+
+		await send("/goal show");
+		await send("/guided-goal ship something");
+		expect(session.titleInputs).toEqual([]);
+		await send("/goal drop");
+		await send("/goal set Ship the release");
+		await send("plain follow-up");
+		expect(session.titleInputs).toEqual(["Ship the release", "plain follow-up"]);
+		harness.abortController.abort();
+	});
+
+	it("keeps a background turn's agent_end from settling a prompt that reserved the slot mid-turn", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const finishPrompt = holdPromptStreaming(session);
+
+		// A background-job turn no session/prompt owns is streaming when the client prompts.
+		session.isStreaming = true;
+		let settled = false;
+		const prompt = harness.agent
+			.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "next task" }] } as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+
+		const background = makeAssistantMessage("Background job finished");
+		for (const listener of session.listeners()) {
+			listener({
+				type: "message_update",
+				message: background,
+				assistantMessageEvent: { type: "text_delta", delta: "Background job finished" },
+			} as AgentSessionEvent);
+			listener({ type: "agent_end", messages: [background] } as AgentSessionEvent);
+		}
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+
+		finishPrompt();
+		const response = await prompt;
+		expect(response.stopReason).toBe("end_turn");
+		const texts = harness.updates.flatMap(update =>
+			update.sessionId === created.sessionId &&
+			update.update.sessionUpdate === "agent_message_chunk" &&
+			update.update.content.type === "text"
+				? [update.update.content.text]
+				: [],
+		);
+		expect(texts).toEqual(["Background job finished", "pong"]);
+		harness.abortController.abort();
+	});
+
+	it("settles on its own agent_end when the background turn ended before the prompt subscribed", async () => {
+		const harness = await createHarness();
+		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		// The background turn's agent_end already fired; isStreaming is still unwinding.
+		session.isStreaming = true;
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			const reply = makeAssistantMessage("own reply");
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_start" } as AgentSessionEvent);
+				listener({
+					type: "message_update",
+					message: reply,
+					assistantMessageEvent: { type: "text_delta", delta: "own reply" },
+				} as AgentSessionEvent);
+				listener({ type: "agent_end", messages: [reply] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const response = await Promise.race([
+			harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "next task" }],
+			} as PromptRequest),
+			Bun.sleep(500).then(() => "timed out" as const),
+		]);
+		expect(response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
 		harness.abortController.abort();
 	});
 
@@ -3771,6 +3938,37 @@ describe("ACP session steering (_session/steering)", () => {
 		expect(await first).toEqual({ outcome: "injected" });
 		expect(await second).toEqual({ outcome: "injected" });
 		expect(session.steerCalls.map(call => call.text)).toEqual(["first", "second"]);
+	});
+
+	it("queues an idle-branch steer behind a running local command instead of cancelling it", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const compactGate = Promise.withResolvers<void>();
+		session.compact = async () => {
+			await compactGate.promise;
+		};
+
+		const compact = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "/compact" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+		expect(session.isStreaming).toBe(false);
+
+		const outcome = await steer(harness, {
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "after the compaction" }],
+		});
+		expect(outcome).toEqual({ outcome: "startedNewTurn" });
+		await Bun.sleep(0);
+		expect(session.promptCalls).toEqual([]);
+
+		compactGate.resolve();
+		expect((await compact).stopReason).toBe("end_turn");
+		for (let i = 0; i < 10 && session.promptCalls.length === 0; i++) await Bun.sleep(0);
+		expect(session.promptCalls).toEqual(["after the compaction"]);
+		harness.abortController.abort();
 	});
 
 	it("keeps the content client-owned when the client opts into promptRequired", async () => {

@@ -1,4 +1,5 @@
 import { describe, expect, test } from "bun:test";
+import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
 import { buildAvailableSlashCommands } from "@oh-my-pi/pi-coding-agent/slash-commands/available-commands";
 
 describe("buildAvailableSlashCommands", () => {
@@ -60,6 +61,30 @@ describe("buildAvailableSlashCommands", () => {
 		expect(byName["server:prompt"].source).toBe("mcp_prompt");
 		expect(byName["custom:hello"].source).toBe("custom");
 		expect(byName.notes.source).toBe("file");
+	});
+
+	test("keeps ACP-only mode commands out of the RPC host", async () => {
+		// /goal, /guided-goal and /plan depend on ACP's end-of-turn goal cleanup and
+		// session modes; the RPC host has neither, so it must not list or run them.
+		const session = {
+			customCommands: [],
+			skills: [],
+			sessionManager: { getCwd: () => process.cwd() },
+			setSlashCommands() {},
+		};
+		const names = async (host: "acp" | "rpc") =>
+			(await buildAvailableSlashCommands(session as never, async () => [], host)).map(command => command.name);
+
+		const acp = await names("acp");
+		const rpc = await names("rpc");
+		for (const name of ["goal", "guided-goal", "plan"]) {
+			expect(acp).toContain(name);
+			expect(rpc).not.toContain(name);
+		}
+		expect(rpc).toContain("model");
+		// Unmatched on RPC, so the text falls through to the prompt path instead
+		// of running the ACP handler against a host without goal cleanup.
+		expect(await executeAcpBuiltinSlashCommand("/goal show", { host: "rpc" } as never)).toBe(false);
 	});
 
 	test("loads file commands into the session before advertising them", async () => {

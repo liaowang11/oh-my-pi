@@ -27,7 +27,7 @@ export const cfgGoalStatusInFooter = register({
 export const cfgGoalContinuationModes = register({
 	id: "goal.continuationModes",
 	type: "array",
-	default: ["interactive"],
+	default: ["interactive", "acp"],
 	ui: {
 		tab: "tasks",
 		group: "Modes",
