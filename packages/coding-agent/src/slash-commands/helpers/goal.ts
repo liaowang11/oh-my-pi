@@ -1,4 +1,6 @@
 import { prompt } from "@oh-my-pi/pi-utils";
+import { isGoalInterviewActive } from "../../goals/mode";
+import { cfgGoalEnabled } from "../../goals/settings";
 import type { GoalModeState } from "../../goals/state";
 import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
@@ -44,7 +46,7 @@ export async function handleAcpGuidedGoalCommand(
 	runtime: SlashCommandRuntime,
 ): Promise<SlashCommandResult> {
 	const { session } = runtime;
-	if (!runtime.settings.get("goal.enabled")) {
+	if (!cfgGoalEnabled.get(runtime.settings)) {
 		await runtime.output("Goal mode is disabled. Enable it in settings (goal.enabled).");
 		return;
 	}
@@ -60,7 +62,7 @@ export async function handleAcpGuidedGoalCommand(
 		await runtime.output("A goal already exists. Use /goal to manage it, or /goal drop to start over.");
 		return;
 	}
-	if (session.getEnabledToolNames().includes("goal")) {
+	if (isGoalInterviewActive(session)) {
 		await runtime.output("A goal interview is already in progress. Use /goal drop to stop it.");
 		return;
 	}
@@ -126,9 +128,9 @@ export async function handleAcpGoalCommand(
 	const { session } = runtime;
 	const { sub, rest } = parseGoalSubcommand(command.args);
 	const state = session.getGoalModeState();
-	const interviewing = !state && session.getEnabledToolNames().includes("goal");
+	const interviewing = isGoalInterviewActive(session);
 	if (
-		!runtime.settings.get("goal.enabled") &&
+		!cfgGoalEnabled.get(runtime.settings) &&
 		((!state && !interviewing) || sub === "set" || sub === "resume" || (!sub && Boolean(rest)))
 	) {
 		await runtime.output("Goal mode is disabled. Enable it in settings (goal.enabled).");

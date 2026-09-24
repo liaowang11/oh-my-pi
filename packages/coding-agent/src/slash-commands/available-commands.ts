@@ -5,8 +5,9 @@ import type { LoadedCustomCommand } from "../extensibility/custom-commands";
 import type { ExtensionRunner } from "../extensibility/extensions";
 import { getSkillSlashCommandName, type Skill } from "../extensibility/skills";
 import { type FileSlashCommand, loadSlashCommands } from "../extensibility/slash-commands";
-import { ACP_BUILTIN_RESERVED_NAMES, isAcpBuiltinShadowedName, RPC_BUILTIN_RESERVED_NAMES } from "./acp-builtins";
+import { builtinReservedNames, isAcpBuiltinShadowedName, resolveTextSlashCommandHandler } from "./acp-builtins";
 import { BUILTIN_SLASH_COMMANDS_INTERNAL } from "./builtin-registry";
+import type { TextSlashCommandHost } from "./types";
 
 export type AvailableSlashCommandSource = "builtin" | "skill" | "extension" | "custom" | "mcp_prompt" | "file";
 
@@ -34,11 +35,11 @@ export async function buildAvailableSlashCommands(
 	session: AvailableCommandsSession,
 	loadFileCommands: (cwd: string) => Promise<FileSlashCommand[]> = cwd =>
 		loadSlashCommands({ cwd, extensionRoots: session.effectiveExtensionRoots }),
-	host: "acp" | "rpc" = "acp",
+	host: TextSlashCommandHost = "acp",
 ): Promise<InternalAvailableSlashCommand[]> {
 	const commands: InternalAvailableSlashCommand[] = [];
 	const seenNames = new Set<string>();
-	const reservedNames = host === "acp" ? ACP_BUILTIN_RESERVED_NAMES : RPC_BUILTIN_RESERVED_NAMES;
+	const reservedNames = builtinReservedNames(host);
 	const appendCommand = (command: InternalAvailableSlashCommand): void => {
 		if (seenNames.has(command.name)) return;
 		seenNames.add(command.name);
@@ -46,8 +47,7 @@ export async function buildAvailableSlashCommands(
 	};
 
 	for (const command of BUILTIN_SLASH_COMMANDS_INTERNAL) {
-		const handler = host === "acp" ? (command.handleAcp ?? command.handle) : command.handle;
-		if (!handler) continue;
+		if (!resolveTextSlashCommandHandler(command, host)) continue;
 		const hint = command.acpInputHint ?? command.inlineHint;
 		appendCommand({
 			name: command.name,
