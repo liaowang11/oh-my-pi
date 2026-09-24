@@ -1,9 +1,37 @@
 import type { AvailableCommand } from "@oh-my-pi/pi-utils/acp";
 import { BUILTIN_SLASH_COMMANDS_INTERNAL, lookupBuiltinSlashCommand } from "./builtin-registry";
 import { parseSlashCommand } from "./helpers/parse";
-import type { AcpBuiltinSlashCommandResult, SlashCommandRuntime } from "./types";
+import type {
+	AcpBuiltinSlashCommandResult,
+	SlashCommandHandler,
+	SlashCommandRuntime,
+	SlashCommandSpec,
+	TextSlashCommandHost,
+} from "./types";
 
 export type { AcpBuiltinSlashCommandResult } from "./types";
+
+/**
+ * The handler a text-mode host runs for `command`, or `undefined` when the
+ * command is unavailable there. ACP prefers `handleAcp` over the shared
+ * `handle`; RPC runs only `handle`. Advertising and dispatch both resolve
+ * through here so a host never lists a command it would not run.
+ */
+export function resolveTextSlashCommandHandler(
+	command: SlashCommandSpec,
+	host: TextSlashCommandHost,
+): SlashCommandHandler | undefined {
+	return host === "acp" ? (command.handleAcp ?? command.handle) : command.handle;
+}
+
+function buildReservedNames(host: TextSlashCommandHost): ReadonlySet<string> {
+	return new Set(
+		BUILTIN_SLASH_COMMANDS_INTERNAL.filter(c => resolveTextSlashCommandHandler(c, host) !== undefined).flatMap(c => [
+			c.name,
+			...(c.aliases ?? []),
+		]),
+	);
+}
 
 /**
  * All names (primary + aliases) that are reserved by ACP builtins. Used to
@@ -11,16 +39,14 @@ export type { AcpBuiltinSlashCommandResult } from "./types";
  * dispatch time (e.g. `models` is an alias for `/model`, so an extension
  * registering `models` would appear in the palette but execute the builtin).
  */
-export const ACP_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
-	BUILTIN_SLASH_COMMANDS_INTERNAL.filter(c => c.handleAcp !== undefined || c.handle !== undefined).flatMap(c => [
-		c.name,
-		...(c.aliases ?? []),
-	]),
-);
+export const ACP_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = buildReservedNames("acp");
 
-export const RPC_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
-	BUILTIN_SLASH_COMMANDS_INTERNAL.filter(c => c.handle !== undefined).flatMap(c => [c.name, ...(c.aliases ?? [])]),
-);
+const RPC_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = buildReservedNames("rpc");
+
+/** {@link ACP_BUILTIN_RESERVED_NAMES} for the given text-mode host. */
+export function builtinReservedNames(host: TextSlashCommandHost): ReadonlySet<string> {
+	return host === "acp" ? ACP_BUILTIN_RESERVED_NAMES : RPC_BUILTIN_RESERVED_NAMES;
+}
 
 /**
  * Whether an extension command named `name` would be captured by ACP builtin
@@ -41,7 +67,7 @@ export function isAcpBuiltinShadowedName(name: string, reservedNames = ACP_BUILT
  * (e.g. `/quit`, `/login`, dashboards) are filtered out.
  */
 export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMMANDS_INTERNAL.filter(
-	command => command.handleAcp !== undefined || command.handle !== undefined,
+	command => resolveTextSlashCommandHandler(command, "acp") !== undefined,
 ).map(command => {
 	// Honor mode-specific copy: ACP clients receive concise text-mode
 	// descriptions/hints when the spec sets `acpDescription` / `acpInputHint`,
@@ -70,7 +96,7 @@ export async function executeAcpBuiltinSlashCommand(
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return false;
 	const command = lookupBuiltinSlashCommand(parsed.name);
-	const handler = runtime.host === "rpc" ? command?.handle : (command?.handleAcp ?? command?.handle);
+	const handler = command && resolveTextSlashCommandHandler(command, runtime.host ?? "acp");
 	if (!handler) return false;
 	const result = await handler(parsed, runtime);
 	if (result === undefined) return { consumed: true };

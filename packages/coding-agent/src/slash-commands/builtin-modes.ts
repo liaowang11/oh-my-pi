@@ -21,6 +21,7 @@ import {
 	type ModelPresetSession,
 	saveModelPreset,
 } from "../config/model-presets";
+import { isGoalInterviewActive } from "../goals/mode";
 import { describeLoopCondition } from "../modes/loop-condition";
 import { describeLoopLimitRuntime } from "../modes/loop-limit";
 import type { InteractiveModeContext } from "../modes/types";
@@ -341,11 +342,11 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output("Plan mode disabled.");
 				return;
 			}
-			if (!runtime.settings.get("plan.enabled")) {
+			if (!cfgPlanEnabled.get(runtime.settings)) {
 				await runtime.output("Plan mode is disabled. Enable it in settings (plan.enabled).");
 				return;
 			}
-			if (runtime.session.getGoalModeState() || runtime.session.getEnabledToolNames().includes("goal")) {
+			if (runtime.session.getGoalModeState() || isGoalInterviewActive(runtime.session)) {
 				await runtime.output("Exit goal mode first.");
 				return;
 			}
@@ -418,7 +419,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		],
 		inlineHint: "[objective]",
 		allowArgs: true,
-		handle: handleAcpGoalCommand,
+		handleAcp: handleAcpGoalCommand,
 		getTuiAutocompleteDescription: runtime => {
 			if (!cfgGoalEnabled.get(runtime.ctx.settings)) return "Goal: disabled in settings";
 			if (runtime.ctx.planModeEnabled) return "Goal: blocked by plan mode";
