@@ -56,11 +56,15 @@ export interface ParsedSlashCommand {
  * - `{ consumed: true }` — explicit equivalent of the above (ACP shape).
  * - `{ prompt: string }` — command handled, pass `prompt` through as the new
  *   user input (e.g. `/force <tool> <prompt>` keeps `<prompt>` as the message).
+ *   `synthetic` sends it as a hidden developer message, as `/guided-goal` does.
  */
 export type SlashCommandResult =
 	| undefined
 	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
-	| { prompt: string };
+	| { prompt: string; synthetic?: boolean };
+
+/** Text-mode hosts that dispatch builtin slash commands without the TUI. */
+export type TextSlashCommandHost = "acp" | "rpc";
 
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
@@ -70,6 +74,8 @@ export type SlashCommandResult =
  * state (editor, selectors, status line).
  */
 export interface SlashCommandRuntime {
+	/** Text-command host; omitted for ACP-compatible callers. */
+	host?: TextSlashCommandHost;
 	session: AgentSession;
 	sessionManager: SessionManager;
 	settings: Settings;
@@ -129,6 +135,8 @@ export interface SlashCommandRuntime {
 	 * those servers resolve like configured ones.
 	 */
 	mcpManager?: MCPManager | undefined;
+	/** ACP host mode switch; absent from the RPC text-command host. */
+	setAcpMode?: (modeId: "default" | "plan") => Promise<void>;
 	notifyTitleChanged?: () => Promise<void> | void;
 	/**
 	 * Push the host's view of the session config (model, thinking level, mode).
@@ -197,6 +205,8 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 				runtime: SlashCommandRuntime,
 		  ) => SlashCommandResult | Promise<SlashCommandResult>)
 		| ((command: ParsedSlashCommand, runtime: SlashCommandRuntime) => void | Promise<void>);
+	/** ACP-only handler. RPC dispatch uses `handle` and does not advertise this command. */
+	handleAcp?: SlashCommandHandler;
 	/**
 	 * TUI-only handler that supersedes `handle` when both are present. Use for
 	 * selectors, wizards, dashboards, and anything else that requires
@@ -215,4 +225,7 @@ export interface SlashCommandSpec extends BuiltinSlashCommand {
 export type AcpBuiltinSlashCommandResult =
 	| false
 	| { consumed: true; agentInvoked?: boolean; failed?: boolean }
-	| { prompt: string };
+	| { prompt: string; synthetic?: boolean };
+
+/** Shape of `handle` / `handleAcp`; see `handle` for why it is a two-member union. */
+export type SlashCommandHandler = NonNullable<SlashCommandSpec["handle"]>;

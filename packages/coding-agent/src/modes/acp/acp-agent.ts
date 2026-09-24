@@ -57,6 +57,15 @@ import { runExtensionCompact } from "../../extensibility/extensions/compact-hand
 import { getSessionSlashCommands } from "../../extensibility/extensions/get-commands-handler";
 import { parseSkillInvocation } from "../../extensibility/skills";
 import { PYTHON_KERNEL_CANCEL_BUDGET_MS } from "../../eval/py/kernel";
+import {
+	completeExitingGoal,
+	GOAL_CONTINUATION_MESSAGE_TYPE,
+	isGoalInterviewActive,
+	isStalledGoalContinuation,
+	restoreGoalMode,
+} from "../../goals/mode";
+import { cfgGoalContinuationModes } from "../../goals/settings";
+import { goalContinuationActivity } from "../../goals/state";
 import { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { MCPServerConfig } from "../../mcp/types";
@@ -175,6 +184,15 @@ type PromptTurnState = {
 	 * "turn in flight" predicate (`isPromptTurnInFlight`) every consumer gates on.
 	 */
 	cleanup: Promise<void> | undefined;
+	/**
+	 * An agent turn no `session/prompt` owns (a background-job delivery) was
+	 * already streaming when this prompt reserved the slot. Its remaining events,
+	 * up to and including its `agent_end`, still reach this turn's subscription;
+	 * they are forwarded as autonomous output so that `agent_end` cannot settle
+	 * this prompt before its own turn has run. Cleared by that `agent_end`, or by
+	 * this prompt's own `agent_start` if the foreign turn ended unseen.
+	 */
+	inheritedForeignTurn: boolean;
 	usageBaseline: UsageStatistics;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
@@ -370,6 +388,10 @@ type ManagedSessionRecord = {
 	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
 	// re-sent at every turn end or by the rename that already pushed it.
 	sentTitle: string | undefined;
+	// Goal auto-continuation bookkeeping, same rule as the TUI: a continuation
+	// turn that did no tool work, or repeated the previous one, stops the chain
+	// until the user speaks again.
+	goalContinuation: { pendingTurns: number; previousActivity: string | undefined; stalled: boolean };
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -1070,6 +1092,7 @@ export class AcpAgent implements Agent {
 					settled: false,
 					errorTextDelivery: undefined,
 					cleanup: undefined,
+					inheritedForeignTurn: record.session.isStreaming,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
@@ -1077,6 +1100,8 @@ export class AcpAgent implements Agent {
 					promise: pendingPrompt.promise,
 				};
 
+				// A client prompt starts a fresh continuation chain, as a typed TUI message does.
+				record.goalContinuation.pendingTurns = 0;
 				record.promptTurn.unsubscribe = record.session.subscribe(event => {
 					this.#trackPromptEvent(record, event);
 				});
@@ -1239,6 +1264,9 @@ export class AcpAgent implements Agent {
 				// path below.
 				await this.#waitForPromptEventHandlers(record);
 			},
+			setAcpMode: async modeId => {
+				await this.setSessionMode({ sessionId: record.session.sessionId, modeId });
+			},
 			notifyTitleChanged: async () => {
 				await this.#pushSessionInfoUpdate(record);
 			},
@@ -1259,7 +1287,10 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, { images });
+				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, {
+					images,
+					synthetic: builtinResult.synthetic,
+				});
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1708,6 +1739,7 @@ export class AcpAgent implements Agent {
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
+			await this.#restoreStoredGoal(session);
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
 			this.#sessions.set(session.sessionId, record);
@@ -1715,6 +1747,14 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			await this.#disposeSessionRecord(record);
 			throw error;
+		}
+	}
+
+	async #restoreStoredGoal(session: AgentSession): Promise<void> {
+		// Cold resume pauses an active goal, matching the interactive session path.
+		const restored = await restoreGoalMode(session, session.sessionManager.buildSessionContext());
+		if (restored?.enabled) {
+			await session.setActiveToolsByName([...new Set([...session.getEnabledToolNames(), "goal"])]);
 		}
 	}
 
@@ -1741,6 +1781,7 @@ export class AcpAgent implements Agent {
 			lifetimeUnsubscribe: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
+			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 		};
 	}
 
@@ -1810,6 +1851,18 @@ export class AcpAgent implements Agent {
 		if (!promptTurn || promptTurn.settled || promptTurn.cancelRequested) {
 			return;
 		}
+		if (promptTurn.inheritedForeignTurn) {
+			// Every agent loop opens with `agent_start`, so one arriving here is this
+			// prompt's own turn: the foreign turn's `agent_end` fired before the
+			// subscription while `isStreaming` was still unwinding.
+			if (event.type === "agent_start") {
+				promptTurn.inheritedForeignTurn = false;
+			} else {
+				if (event.type === "agent_end") promptTurn.inheritedForeignTurn = false;
+				await this.#handleAutonomousEvent(record, event);
+				return;
+			}
+		}
 
 		const streamedAssistantError =
 			event.type === "message_update" &&
@@ -1832,13 +1885,89 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			try {
+				await this.#finishGoalModeAfterTurn(record);
+			} catch (error) {
+				logger.warn("Failed to finish ACP goal mode after turn", { sessionId: record.session.sessionId, error });
+			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
-			this.#finishPrompt(record, {
+			const response: PromptResponse = {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-			});
+			};
+			if (response.stopReason === "end_turn" && this.#continueGoalInPromptTurn(record, promptTurn, response)) {
+				return;
+			}
+			this.#finishPrompt(record, response);
 		}
+	}
+
+	/**
+	 * Run the next goal-continuation turn inside the prompt turn that just
+	 * ended, instead of settling it. Upstream keeps agent-initiated work inside
+	 * an owning `session/prompt` for ACP (async job deliveries drain the same
+	 * way) so the client shows the session busy and `session/cancel` can stop
+	 * it; cancelling aborts the turn, which pauses the goal. The continuation's
+	 * own `agent_end` re-enters here and either continues or settles.
+	 */
+	#continueGoalInPromptTurn(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState,
+		response: PromptResponse,
+	): boolean {
+		const { session } = record;
+		const continuation = record.goalContinuation;
+		if (continuation.stalled || promptTurn.cancelRequested || record.promptTurn !== promptTurn) return false;
+		if (!cfgGoalContinuationModes.get(session.settings).includes("acp")) return false;
+		if (session.getPlanModeState()?.enabled) return false;
+		const prompt = session.goalRuntime.buildContinuationPrompt();
+		if (!prompt) return false;
+		continuation.pendingTurns++;
+		const settle = (): void => {
+			continuation.pendingTurns = Math.max(0, continuation.pendingTurns - 1);
+			this.#finishPrompt(record, response);
+		};
+		session
+			.promptCustomMessage({
+				customType: GOAL_CONTINUATION_MESSAGE_TYPE,
+				content: prompt,
+				display: false,
+				attribution: "agent",
+			})
+			.then(
+				started => {
+					// `true` resolves after the continuation's own `agent_end` already
+					// decided this turn's fate; only a turn that never ran settles here.
+					if (!started) settle();
+				},
+				(error: unknown) => {
+					if (!(error instanceof AgentBusyError)) {
+						logger.warn("ACP goal continuation failed", { sessionId: session.sessionId, error });
+					}
+					settle();
+				},
+			);
+		return true;
+	}
+
+	#trackGoalContinuation(record: ManagedSessionRecord, event: AgentSessionEvent): void {
+		const continuation = record.goalContinuation;
+		if (event.type === "message_start" && event.message.role === "user" && !event.message.synthetic) {
+			continuation.stalled = false;
+			continuation.previousActivity = undefined;
+			return;
+		}
+		if (event.type !== "agent_end") return;
+		if (continuation.pendingTurns === 0) {
+			continuation.stalled = false;
+			continuation.previousActivity = undefined;
+			return;
+		}
+		continuation.pendingTurns--;
+		const activity = goalContinuationActivity(event.messages);
+		continuation.stalled = isStalledGoalContinuation(activity, continuation.previousActivity);
+		continuation.previousActivity = activity;
 	}
 
 	/**
@@ -1856,6 +1985,7 @@ export class AcpAgent implements Agent {
 			if (event.type === "agent_end") {
 				await this.#flushMissedFinalAssistantText(record, event);
 				await this.#flushUnreportedTurnError(record, event);
+				await this.#finishGoalModeAfterTurn(record);
 				record.liveMessageId = undefined;
 				record.liveMessageProgress = undefined;
 			}
@@ -1869,6 +1999,7 @@ export class AcpAgent implements Agent {
 		event: AgentSessionEvent,
 		onDelivery?: (delivery: Promise<void>) => void,
 	): Promise<void> {
+		this.#trackGoalContinuation(record, event);
 		if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
 			record.toolArgsById.set(event.toolCallId, event.args);
 		}
@@ -1898,6 +2029,18 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	async #finishGoalModeAfterTurn(record: ManagedSessionRecord): Promise<void> {
+		const { session } = record;
+		const completed = completeExitingGoal(session);
+		// ACP keeps the `goal` tool enabled exactly while a goal is enabled or a
+		// /guided-goal interview is running (tool on, no goal yet), so drop it
+		// once the goal completes or is paused by the agent.
+		const state = session.getGoalModeState();
+		if ((completed || (state && !state.enabled)) && session.getEnabledToolNames().includes("goal")) {
+			await session.setActiveToolsByName(session.getEnabledToolNames().filter(name => name !== "goal"));
+		}
 	}
 
 	/**
@@ -2286,6 +2429,9 @@ export class AcpAgent implements Agent {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
 		if (modeId === ACP_PLAN_MODE_ID) {
+			if (session.getGoalModeState() || isGoalInterviewActive(session)) {
+				throw new Error("Exit goal mode before entering plan mode.");
+			}
 			const previous = session.getPlanModeState();
 			session.setPlanModeState({
 				enabled: true,
