@@ -1865,7 +1865,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 		process.exit(0);
 	};
 
-	const getAvailableCommands = async () => buildAvailableSlashCommands(session);
+	const getAvailableCommands = async () => buildAvailableSlashCommands(session, undefined, "rpc");
 	const reloadPluginState = async () => {
 		const cwd = session.sessionManager.getCwd();
 		const projectPath = await resolveActiveProjectRegistryPath(cwd);
@@ -1932,6 +1932,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 				builtinCommandAborts.add(builtinAbort);
 				let backgroundedBuiltin = false;
 				const builtinResult = await executeAcpBuiltinSlashCommand(text, {
+					host: "rpc",
 					session,
 					sessionManager: session.sessionManager,
 					settings: session.settings,
