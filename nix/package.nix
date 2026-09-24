@@ -216,6 +216,15 @@ stdenv.mkDerivation {
       patchelf --print-rpath "packages/natives/native/${platform.addon}" \
         > "$out/nix-support/embedded-addon-runpath"
     ''}
+    ${lib.optionalString stdenv.hostPlatform.isDarwin ''
+      # The addon is gzip-compressed inside the compiled binary, so its linked
+      # store paths are invisible to the output reference scanner. Keep its
+      # absolute Nix library dependencies in the package closure.
+      mkdir -p "$out/nix-support"
+      otool -L "packages/natives/native/${platform.addon}" \
+        | awk 'NR > 1 && $1 ~ /^\/nix\/store\// { print $1 }' \
+        | sort -u > "$out/nix-support/embedded-addon-linked-libraries"
+    ''}
 
     runHook postInstall
   '';
