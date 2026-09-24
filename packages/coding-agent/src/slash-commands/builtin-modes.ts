@@ -28,7 +28,7 @@ import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "t
 import type { AgentSession } from "../session/agent-session";
 import { CLI_THINKING_LEVELS, getConfiguredThinkingLevelMetadata } from "@oh-my-pi/pi-tui/thinking";
 import { noThinkingMessage, resolveThinkingArgument } from "./helpers/effort";
-import { handleAcpGoalCommand } from "./helpers/goal";
+import { handleAcpGoalCommand, handleAcpGuidedGoalCommand } from "./helpers/goal";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSecurityCommand } from "./helpers/security";
 import type { ParsedSlashCommand, SlashCommandSpec, TuiSlashCommandRuntime } from "./types";
@@ -327,8 +327,37 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "plan",
 		icon: "plan",
 		description: "Toggle plan mode (agent plans before executing)",
+		acpDescription: "Toggle read-only planning mode",
 		inlineHint: "[prompt]",
 		allowArgs: true,
+		handleAcp: async (command, runtime) => {
+			const setMode = runtime.setAcpMode;
+			if (!setMode) {
+				await runtime.output("Plan mode is unavailable in this host.");
+				return;
+			}
+			if (runtime.session.getPlanModeState()?.enabled) {
+				await setMode("default");
+				await runtime.output("Plan mode disabled.");
+				return;
+			}
+			if (!runtime.settings.get("plan.enabled")) {
+				await runtime.output("Plan mode is disabled. Enable it in settings (plan.enabled).");
+				return;
+			}
+			if (runtime.session.getGoalModeState() || runtime.session.getEnabledToolNames().includes("goal")) {
+				await runtime.output("Exit goal mode first.");
+				return;
+			}
+			if (runtime.session.getVibeModeState()?.enabled) {
+				await runtime.output("Exit vibe mode first.");
+				return;
+			}
+			await setMode("plan");
+			const initialPrompt = command.args.trim();
+			if (initialPrompt) return { prompt: initialPrompt };
+			await runtime.output("Plan mode enabled.");
+		},
 		getTuiAutocompleteDescription: runtime => {
 			if (!cfgPlanEnabled.get(runtime.ctx.settings)) return "Plan: disabled in settings";
 			if (runtime.ctx.planModeEnabled) {
@@ -406,8 +435,10 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "guided-goal",
 		icon: "compass",
 		description: "Have the agent interview you in chat, then set up goal mode",
+		acpDescription: "Interview for a goal, then set it up in chat",
 		inlineHint: "[rough objective]",
 		allowArgs: true,
+		handleAcp: handleAcpGuidedGoalCommand,
 		handleTui: async (command, runtime) => {
 			await runWithDetachedModeDraft(command, runtime, () =>
 				runtime.ctx.handleGuidedGoalCommand(command.args || undefined, runtime.input),
