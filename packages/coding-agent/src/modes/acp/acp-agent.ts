@@ -1706,6 +1706,9 @@ export class AcpAgent implements Agent {
 		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
 	}
 
+	/**
+	 * The entry `session/fork`'s fork point names in `sessionManager`, the fork
+
 	async #openStoredSession(
 		sessionPath: string,
 		cwd: string,
@@ -1790,6 +1793,9 @@ export class AcpAgent implements Agent {
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
+		if (event.type !== "thinking_level_changed" && event.type !== "model_changed" && !isPromptTurnInFlight(record.promptTurn)) {
+			this.#trackLifetimeDelivery(record, event.type, this.#handleAutonomousEvent(record, event));
+		}
 		const sessionId = record.protocolSessionId;
 		let notification: AcpCompactionNotification;
 		if (event.type === "auto_compaction_start") {
@@ -1901,6 +1907,64 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
+		const streamedAssistantError =
+			event.type === "message_update" &&
+			event.message.role === "assistant" &&
+			event.assistantMessageEvent.type === "error";
+		await this.#forwardSessionEvent(record, event, delivery => {
+			if (!streamedAssistantError) return;
+			// Resolves true only once the error chunk actually reached the
+			// client — a failed delivery keeps the agent_end fallback armed.
+			const outcome = delivery.then(
+				() => true,
+				() => false,
+			);
+			const prior = promptTurn.errorTextDelivery;
+			promptTurn.errorTextDelivery = prior ? Promise.all([prior, outcome]).then(([a, b]) => a || b) : outcome;
+		});
+
+		if (event.type === "agent_end") {
+			await this.#flushMissedFinalAssistantText(record, event);
+			await this.#flushUnreportedTurnError(record, event);
+			await this.#emitEndOfTurnUpdates(record);
+			await this.#waitForAcpPromptIdle(record);
+			record.liveMessageId = undefined;
+			record.liveMessageProgress = undefined;
+			this.#finishPrompt(record, {
+				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
+				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+			});
+		}
+	}
+
+	/**
+	 * Stream a turn the agent started on its own — a finished background job or
+	 * a queued follow-up flushed by the idle yield queue after `end_turn`. No
+	 * `session/prompt` owns it, so nothing here may touch `record.promptTurn`
+	 * or settle a `PromptResponse`; the content simply reaches the client as
+	 * ordinary `session/update`s instead of vanishing into the session file
+	 * (#9157). The `agent_end` fallbacks mirror the owned path so a turn that
+	 * only streamed thinking, or failed before streaming, still surfaces.
+	 */
+	async #handleAutonomousEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
+		try {
+			await this.#forwardSessionEvent(record, event);
+			if (event.type === "agent_end") {
+				await this.#flushMissedFinalAssistantText(record, event);
+				await this.#flushUnreportedTurnError(record, event);
+				record.liveMessageId = undefined;
+				record.liveMessageProgress = undefined;
+			}
+		} catch (error) {
+			logger.warn("ACP autonomous event handler failed", { sessionId: record.session.sessionId, error });
+		}
+	}
+
+	async #forwardSessionEvent(
+		record: ManagedSessionRecord,
+		event: AgentSessionEvent,
+		onDelivery?: (delivery: Promise<void>) => void,
+	): Promise<void> {
 		if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
 			record.toolArgsById.set(event.toolCallId, event.args);
 		}
@@ -1915,10 +1979,6 @@ export class AcpAgent implements Agent {
 			imageDataCache.set(key, resolved);
 			return resolved;
 		};
-		const streamedAssistantError =
-			event.type === "message_update" &&
-			event.message.role === "assistant" &&
-			event.assistantMessageEvent.type === "error";
 		for (const notification of mapAgentSessionEventToAcpSessionUpdates(event, record.protocolSessionId, {
 			getMessageId: message => this.#getLiveMessageId(record, message),
 			getMessageProgress: message => this.#getLiveMessageProgress(record, message),
@@ -1927,35 +1987,13 @@ export class AcpAgent implements Agent {
 			resolveImageData: resolveImageDataForAcp,
 		})) {
 			const delivery = this.#connection.sessionUpdate(notification);
-			if (streamedAssistantError) {
-				// Resolves true only once the error chunk actually reached the
-				// client — a failed delivery keeps the agent_end fallback armed.
-				const outcome = delivery.then(
-					() => true,
-					() => false,
-				);
-				const prior = promptTurn.errorTextDelivery;
-				promptTurn.errorTextDelivery = prior ? Promise.all([prior, outcome]).then(([a, b]) => a || b) : outcome;
-			}
+			onDelivery?.(delivery);
 			await delivery;
 		}
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
-
-		if (event.type === "agent_end") {
-			await this.#flushMissedFinalAssistantText(record, event);
-			await this.#flushUnreportedTurnError(record, event);
-			await this.#emitEndOfTurnUpdates(record);
-			await this.#waitForAcpPromptIdle(record);
-			record.liveMessageId = undefined;
-			record.liveMessageProgress = undefined;
-			this.#finishPrompt(record, {
-				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
-				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
-			});
-		}
 	}
 
 	/**
