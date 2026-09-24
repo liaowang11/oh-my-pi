@@ -138,6 +138,59 @@ export interface AgentsHubCallbacks {
 	onCancel: () => void;
 }
 
+/** The settings override `agent` carries for `property`, if any. */
+export function agentPropertyOverride(agent: HubAgent, property: PropertyKind): string | undefined {
+	switch (property) {
+		case "model":
+			return agent.overrideModel;
+		case "prewalk":
+			return agent.prewalkOverride;
+		case "advisor":
+			return agent.advisorOverride;
+	}
+}
+
+/** Store `value` (trimmed; empty clears) as `agent`'s override for `property`; returns the stored value. */
+export function setAgentPropertyOverride(
+	agent: HubAgent,
+	property: PropertyKind,
+	value: string | undefined,
+): string | undefined {
+	const trimmed = value?.trim() || undefined;
+	switch (property) {
+		case "model":
+			agent.overrideModel = trimmed;
+			break;
+		case "prewalk":
+			agent.prewalkOverride = trimmed;
+			break;
+		case "advisor":
+			agent.advisorOverride = trimmed;
+			break;
+	}
+	return trimmed;
+}
+
+/** One-line effective description of `agent`'s `property`, e.g. `scout model: @smol → p/m`. */
+export function describeAgentProperty(deps: AgentsHubDeps, agent: HubAgent, property: PropertyKind): string {
+	switch (property) {
+		case "model": {
+			const patterns = deps.effectiveModelPatterns(agent);
+			const resolved = deps.resolvePatterns(patterns);
+			const base = agent.overrideModel ?? (patterns.length > 0 ? patterns.join(",") : "session model");
+			return `${agent.name} model: ${base}${resolved ? ` → ${resolved}` : ""}`;
+		}
+		case "prewalk": {
+			const pattern = deps.effectivePrewalkPattern(agent);
+			return `${agent.name} prewalk: ${pattern ? `on (${pattern})` : "off"}`;
+		}
+		case "advisor": {
+			const pattern = deps.effectiveAdvisorPattern(agent);
+			return `${agent.name} advisor: ${pattern ? `on (${pattern})` : "off"}`;
+		}
+	}
+}
+
 const IDENTIFIER_PATTERN = /^[a-z0-9]+(?:-[a-z0-9]+){1,5}$/;
 
 function extractJsonObject(raw: string): string {
@@ -384,53 +437,10 @@ export class AgentsHubComponent implements Component {
 		this.#requestRender();
 	}
 
-	#overrideFor(agent: HubAgent, property: PropertyKind): string | undefined {
-		switch (property) {
-			case "model":
-				return agent.overrideModel;
-			case "prewalk":
-				return agent.prewalkOverride;
-			case "advisor":
-				return agent.advisorOverride;
-		}
-	}
-
 	#setOverride(agent: HubAgent, property: PropertyKind, value: string | undefined): void {
-		const trimmed = value?.trim() || undefined;
-		switch (property) {
-			case "model":
-				agent.overrideModel = trimmed;
-				break;
-			case "prewalk":
-				agent.prewalkOverride = trimmed;
-				break;
-			case "advisor":
-				agent.advisorOverride = trimmed;
-				break;
-		}
-		this.#deps.setAgentOverride(property, agent.name, trimmed);
-		this.#notice = this.#describeProperty(agent, property);
+		this.#deps.setAgentOverride(property, agent.name, setAgentPropertyOverride(agent, property, value));
+		this.#notice = describeAgentProperty(this.#deps, agent, property);
 		this.#requestRender();
-	}
-
-	/** One-line effective description used for notices and the status row. */
-	#describeProperty(agent: HubAgent, property: PropertyKind): string {
-		switch (property) {
-			case "model": {
-				const patterns = this.#deps.effectiveModelPatterns(agent);
-				const resolved = this.#deps.resolvePatterns(patterns);
-				const base = agent.overrideModel ?? (patterns.length > 0 ? patterns.join(",") : "session model");
-				return `${agent.name} model: ${base}${resolved ? ` → ${resolved}` : ""}`;
-			}
-			case "prewalk": {
-				const pattern = this.#deps.effectivePrewalkPattern(agent);
-				return `${agent.name} prewalk: ${pattern ? `on (${pattern})` : "off"}`;
-			}
-			case "advisor": {
-				const pattern = this.#deps.effectiveAdvisorPattern(agent);
-				return `${agent.name} advisor: ${pattern ? `on (${pattern})` : "off"}`;
-			}
-		}
 	}
 
 	// ═══════════════════════════════════════════════════════════════════════
@@ -479,7 +489,7 @@ export class AgentsHubComponent implements Component {
 
 	/** Level-2 strip: value choices for one property of `agent`. */
 	#openPropertyStrip(agent: HubAgent, property: PropertyKind): void {
-		const current = this.#overrideFor(agent, property)?.toLowerCase();
+		const current = agentPropertyOverride(agent, property)?.toLowerCase();
 		const chips: StripChip[] = [];
 		const mark = (label: string, active: boolean, color: "accent" | "muted" = "muted"): string =>
 			active ? theme.fg("accent", `${theme.status.enabled} ${label}`) : theme.fg(color, label);
@@ -533,7 +543,7 @@ export class AgentsHubComponent implements Component {
 
 	#openPatternStrip(agent: HubAgent, property: PropertyKind): void {
 		const input = new Input();
-		const current = this.#overrideFor(agent, property);
+		const current = agentPropertyOverride(agent, property);
 		if (current) input.setValue(current);
 		this.#strip = { kind: "pattern", agent, property, input };
 	}
@@ -588,7 +598,7 @@ export class AgentsHubComponent implements Component {
 		this.#assigning = { agent, property };
 		this.#browser.setItems(items);
 		this.#browser.setQuery("");
-		const current = this.#overrideFor(agent, property);
+		const current = agentPropertyOverride(agent, property);
 		if (current) this.#browser.selectSelector(current);
 	}
 
@@ -1500,7 +1510,7 @@ export class AgentsHubComponent implements Component {
 	#stripChipOn(agent: HubAgent, property: PropertyKind | undefined, chip: StripChip): boolean | undefined {
 		const action = chip.action;
 		if (action.kind !== "set" || action.property === "model" || !property) return undefined;
-		return this.#overrideFor(agent, property)?.toLowerCase() === action.value;
+		return agentPropertyOverride(agent, property)?.toLowerCase() === action.value;
 	}
 
 	/** Preview of the selected agent: description, effective settings, system prompt. */
@@ -1732,7 +1742,7 @@ export class AgentsHubComponent implements Component {
 				return [span(action.property, "accent"), span(`: ${this.#propertySummary(agent, action.property)}`, "dim")];
 			case "set": {
 				if (action.property === "model") return [span(chip.label, "warning")];
-				const current = property ? this.#overrideFor(agent, property)?.toLowerCase() : undefined;
+				const current = property ? agentPropertyOverride(agent, property)?.toLowerCase() : undefined;
 				return current === action.value
 					? [span(`${theme.status.enabled} ${chip.label}`, "accent")]
 					: [span(chip.label, "muted")];
