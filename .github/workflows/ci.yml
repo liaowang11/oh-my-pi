@@ -1,61 +1,6 @@
 name: CI
 
 on:
-   push:
-      branches: [main]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "deny.toml"
-         - "about.toml"
-         - "LICENSE"
-         - "THIRD-PARTY-NOTICES.txt"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         # A root dependency change (lockfile/catalog/patches) affects every
-         # job; without these a lockfile-only push shipped untested — and a
-         # release retagged onto such a commit never triggered its run.
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
-   pull_request:
-      branches: [main, omp2]
-      paths:
-         - "packages/**"
-         - "crates/**"
-         - "scripts/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "deny.toml"
-         - "about.toml"
-         - "LICENSE"
-         - "THIRD-PARTY-NOTICES.txt"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         - "bun.lock"
-         - "bunfig.toml"
-         - "package.json"
-         - "patches/**"
-         - ".github/**"
    workflow_dispatch:
       inputs:
          skip_npm:

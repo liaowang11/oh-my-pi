@@ -31,23 +31,6 @@ name: Warm bazel disk cache
 # packages/** push cannot change any archive, so it does not trigger a warm.
 
 on:
-   push:
-      branches: [main]
-      paths:
-         - "crates/**"
-         - "bazel/**"
-         - "MODULE.bazel"
-         - "MODULE.bazel.lock"
-         - "BUILD.bazel"
-         - ".bazelrc"
-         - ".bazelignore"
-         - ".bazelversion"
-         - "Cargo.toml"
-         - "Cargo.lock"
-         - "rust-toolchain.toml"
-         - "rustfmt.toml"
-         - "bun.lock"
-         - ".github/**"
    workflow_dispatch:
 
 permissions:
