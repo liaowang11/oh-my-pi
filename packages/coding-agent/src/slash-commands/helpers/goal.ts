@@ -1,4 +1,6 @@
+import { prompt } from "@oh-my-pi/pi-utils";
 import type { GoalModeState } from "../../goals/state";
+import guidedGoalInterviewPrompt from "../../prompts/goals/guided-goal-interview.md" with { type: "text" };
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 
 export type GoalSubcommand = "set" | "show" | "pause" | "resume" | "drop" | "budget";
@@ -35,6 +37,50 @@ function goalDetails(state: GoalModeState | undefined): string {
 async function setGoalToolEnabled(runtime: SlashCommandRuntime, enabled: boolean): Promise<void> {
 	const tools = runtime.session.getEnabledToolNames().filter(name => name !== "goal");
 	await runtime.session.setActiveToolsByName(enabled ? [...tools, "goal"] : tools);
+}
+
+export async function handleAcpGuidedGoalCommand(
+	command: ParsedSlashCommand,
+	runtime: SlashCommandRuntime,
+): Promise<SlashCommandResult> {
+	const { session } = runtime;
+	if (!runtime.settings.get("goal.enabled")) {
+		await runtime.output("Goal mode is disabled. Enable it in settings (goal.enabled).");
+		return;
+	}
+	if (session.getPlanModeState()?.enabled) {
+		await runtime.output("Exit plan mode first.");
+		return;
+	}
+	if (session.getVibeModeState()?.enabled) {
+		await runtime.output("Exit vibe mode first.");
+		return;
+	}
+	if (session.getGoalModeState()) {
+		await runtime.output("A goal already exists. Use /goal to manage it, or /goal drop to start over.");
+		return;
+	}
+	if (session.getEnabledToolNames().includes("goal")) {
+		await runtime.output("A goal interview is already in progress. Use /goal drop to stop it.");
+		return;
+	}
+
+	const kickoff = prompt.render(guidedGoalInterviewPrompt, { initial: command.args.trim() || undefined });
+	const previousTools = session.getEnabledToolNames();
+	if (!previousTools.includes("goal")) {
+		try {
+			await session.setActiveToolsByName([...previousTools, "goal"]);
+		} catch (error) {
+			await session.setActiveToolsByName(previousTools);
+			throw error;
+		}
+	}
+	if (!session.getEnabledToolNames().includes("goal")) {
+		await session.setActiveToolsByName(previousTools);
+		await runtime.output("Goal tool is unavailable in this session.");
+		return;
+	}
+	return { prompt: kickoff, synthetic: true };
 }
 
 async function setGoal(objective: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
@@ -80,9 +126,10 @@ export async function handleAcpGoalCommand(
 	const { session } = runtime;
 	const { sub, rest } = parseGoalSubcommand(command.args);
 	const state = session.getGoalModeState();
+	const interviewing = !state && session.getEnabledToolNames().includes("goal");
 	if (
 		!runtime.settings.get("goal.enabled") &&
-		(!state || sub === "set" || sub === "resume" || (!sub && Boolean(rest)))
+		((!state && !interviewing) || sub === "set" || sub === "resume" || (!sub && Boolean(rest)))
 	) {
 		await runtime.output("Goal mode is disabled. Enable it in settings (goal.enabled).");
 		return;
@@ -96,7 +143,7 @@ export async function handleAcpGoalCommand(
 		return;
 	}
 	if (sub === "show" || (!sub && !rest)) {
-		await runtime.output(goalDetails(state));
+		await runtime.output(interviewing ? "Goal interview in progress." : goalDetails(state));
 		return;
 	}
 	if (sub === "set" || !sub) return await setGoal(rest, runtime);
@@ -131,7 +178,12 @@ export async function handleAcpGoalCommand(
 	}
 	if (sub === "drop") {
 		if (!state) {
-			await runtime.output("No goal to drop.");
+			if (interviewing) {
+				await setGoalToolEnabled(runtime, false);
+				await runtime.output("Goal interview stopped.");
+			} else {
+				await runtime.output("No goal to drop.");
+			}
 			return;
 		}
 		await session.goalRuntime.dropGoal();

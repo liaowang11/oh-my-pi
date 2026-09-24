@@ -12,6 +12,13 @@ export type { AcpBuiltinSlashCommandResult } from "./types";
  * registering `models` would appear in the palette but execute the builtin).
  */
 export const ACP_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
+	BUILTIN_SLASH_COMMANDS_INTERNAL.filter(c => c.handleAcp !== undefined || c.handle !== undefined).flatMap(c => [
+		c.name,
+		...(c.aliases ?? []),
+	]),
+);
+
+export const RPC_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
 	BUILTIN_SLASH_COMMANDS_INTERNAL.filter(c => c.handle !== undefined).flatMap(c => [c.name, ...(c.aliases ?? [])]),
 );
 
@@ -23,19 +30,18 @@ export const ACP_BUILTIN_RESERVED_NAMES: ReadonlySet<string> = new Set(
  * executes the `/model` builtin with `foo` as args. Such names must not be
  * advertised to ACP clients.
  */
-export function isAcpBuiltinShadowedName(name: string): boolean {
-	if (ACP_BUILTIN_RESERVED_NAMES.has(name)) return true;
+export function isAcpBuiltinShadowedName(name: string, reservedNames = ACP_BUILTIN_RESERVED_NAMES): boolean {
+	if (reservedNames.has(name)) return true;
 	const colon = name.indexOf(":");
-	return colon !== -1 && ACP_BUILTIN_RESERVED_NAMES.has(name.slice(0, colon));
+	return colon !== -1 && reservedNames.has(name.slice(0, colon));
 }
 
 /**
- * Commands advertised to ACP clients. Entries without a text-mode `handle`
- * (e.g. `/quit`, `/login`, dashboards) are filtered out so the client doesn't
- * see commands it cannot drive.
+ * Commands advertised to ACP clients. Entries without an ACP-capable handler
+ * (e.g. `/quit`, `/login`, dashboards) are filtered out.
  */
 export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMMANDS_INTERNAL.filter(
-	command => command.handle !== undefined,
+	command => command.handleAcp !== undefined || command.handle !== undefined,
 ).map(command => {
 	// Honor mode-specific copy: ACP clients receive concise text-mode
 	// descriptions/hints when the spec sets `acpDescription` / `acpInputHint`,
@@ -49,7 +55,8 @@ export const ACP_BUILTIN_SLASH_COMMANDS: AvailableCommand[] = BUILTIN_SLASH_COMM
 });
 
 /**
- * Dispatch a slash command in ACP/text mode. Returns:
+ * Dispatch a slash command in ACP or RPC text mode. ACP prefers `handleAcp`;
+ * RPC uses only the shared `handle`. Returns:
  * - `false` when no builtin matched (or matched a TUI-only entry); the caller
  *   should forward the input as a prompt.
  * - `{ consumed: true }` when the command handled the input entirely.
@@ -63,8 +70,9 @@ export async function executeAcpBuiltinSlashCommand(
 	const parsed = parseSlashCommand(text);
 	if (!parsed) return false;
 	const command = lookupBuiltinSlashCommand(parsed.name);
-	if (!command?.handle) return false;
-	const result = await command.handle(parsed, runtime);
+	const handler = runtime.host === "rpc" ? command?.handle : (command?.handleAcp ?? command?.handle);
+	if (!handler) return false;
+	const result = await handler(parsed, runtime);
 	if (result === undefined) return { consumed: true };
 	return result;
 }
