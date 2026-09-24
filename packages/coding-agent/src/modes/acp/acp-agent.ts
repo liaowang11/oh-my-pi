@@ -42,6 +42,7 @@ import {
 	type SetSessionConfigOptionResponse,
 	type SetSessionModeRequest,
 	type SetSessionModeResponse,
+	type SubagentWorkState,
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
 import { disableProvider, enableProvider } from "../../capability";
@@ -79,6 +80,7 @@ import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager } from "../../session/session-manager";
+import { loadSessionMessagesReadOnly } from "../../session/session-loader";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -96,6 +98,7 @@ import {
 	TTS_SPEED_MIN,
 	TTS_SPEED_OPTIONS,
 } from "../../tts/models";
+import type { EventBus } from "../../utils/event-bus";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
@@ -103,6 +106,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import { AcpSubagentRelay, clientSupportsSubagents, subagentSessionId } from "./acp-subagents";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
@@ -379,6 +383,9 @@ type ManagedSessionRecord = {
 	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
 	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
 	lifetimeUnsubscribe: (() => void) | undefined;
+	// Relays task-tool subagents as ACP subagents-RFD child sessions; set only when the
+	// client advertises `subagents`. Released in `#disposeSessionRecord`.
+	subagentRelay: AcpSubagentRelay | undefined;
 	// Pushes `session_info_update` as soon as a title resolves, instead of only
 	// at bootstrap/end-of-turn: auto title generation runs async and can settle
 	// after `agent_end` already fired, or after a turn with no `agent_end` at
@@ -405,6 +412,20 @@ type ReplayableMessage = {
 	toolName?: string;
 	details?: unknown;
 	isError?: boolean;
+	stopReason?: string;
+};
+
+/**
+ * State of one pass over a session's subagent children: a `session/load`
+ * replay, or (`send` a no-op) a `session/resume` that registers them unsent.
+ */
+type SubagentReplay = {
+	rootSessionId: string;
+	relay: AcpSubagentRelay;
+	cwd: string;
+	replayed: Set<string>;
+	send: (notification: SessionNotification) => Promise<void>;
+	announce: boolean;
 };
 
 type ReplayableToolItem = {
@@ -433,6 +454,8 @@ type MCPSourceMap = {
 type AcpSessionHandle = {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
+	// The bus the session's task tool publishes subagent frames on.
+	eventBus?: EventBus;
 };
 
 type CreateAcpSession = (
@@ -440,11 +463,49 @@ type CreateAcpSession = (
 	options?: { interactivePrompts?: boolean },
 ) => Promise<AgentSession | AcpSessionHandle>;
 
+/**
+ * The subagents a task tool result spawned: `results` for a run the call
+ * waited on, `progress` for a detached one.
+ */
+function taskResultSubagents(details: unknown): Array<{ id: string; description: string | undefined }> {
+	if (typeof details !== "object" || details === null) return [];
+	const { results, progress } = details as { results?: unknown; progress?: unknown };
+	const children = new Map<string, string | undefined>();
+	for (const list of [results, progress]) {
+		if (!Array.isArray(list)) continue;
+		for (const item of list) {
+			if (typeof item !== "object" || item === null) continue;
+			const { id, description } = item as { id?: unknown; description?: unknown };
+			if (typeof id !== "string" || id.length === 0) continue;
+			const label = typeof description === "string" ? description.trim() || undefined : undefined;
+			children.set(id, children.get(id) ?? label);
+		}
+	}
+	return [...children].map(([id, description]) => ({ id, description }));
+}
+
+/** The idle snapshot that ends a replayed child, from its last assistant message's stop reason. */
+function replayedIdleState(stopReason: string | undefined): SubagentWorkState {
+	switch (stopReason) {
+		case undefined:
+			return { state: "idle" };
+		case "error":
+			return { state: "idle", stopReason: "error" };
+		case "aborted":
+			return { state: "idle", stopReason: "cancelled" };
+		default:
+			return { state: "idle", stopReason: "end_turn" };
+	}
+}
+
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
+	eventBus: EventBus | undefined;
 } {
-	return "session" in created ? created : { session: created, setToolUIContext: undefined };
+	return "session" in created
+		? { session: created.session, setToolUIContext: created.setToolUIContext, eventBus: created.eventBus }
+		: { session: created, setToolUIContext: undefined, eventBus: undefined };
 }
 
 type AcpSpeechOption = {
@@ -949,6 +1010,7 @@ export class AcpAgent implements Agent {
 	async resumeSession(params: ResumeSessionRequest): Promise<ResumeSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#resumeManagedSession(params.sessionId, params.cwd, params.mcpServers ?? []);
+		await this.#replaySessionHistory(record, { send: false });
 		const response: ResumeSessionResponse = {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
@@ -1635,7 +1697,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1646,7 +1708,7 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
@@ -1681,7 +1743,7 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1699,7 +1761,7 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
+		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext, eventBus);
 	}
 
 	async #openStoredSession(
@@ -1708,7 +1770,7 @@ export class AcpAgent implements Agent {
 		mcpServers: McpServer[],
 		sessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -1722,13 +1784,14 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
 	}
 
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
+		eventBus: EventBus | undefined,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext);
 		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
@@ -1736,6 +1799,15 @@ export class AcpAgent implements Agent {
 		// own (ACP sessions run with `enableMCP: false`); read it live so every
 		// reconfiguration's `refreshMCPTools` rebuild renders its instructions.
 		session.setMcpServerInstructionsSource(() => record.mcpManager?.getServerInstructions());
+		if (eventBus && clientSupportsSubagents(this.#clientCapabilities)) {
+			record.subagentRelay = new AcpSubagentRelay({
+				sessionId: session.sessionId,
+				eventBus,
+				send: notification => this.#connection.sessionUpdate(notification),
+				getCwd: () => session.sessionManager.getCwd(),
+				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
+			});
+		}
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
@@ -1779,6 +1851,7 @@ export class AcpAgent implements Agent {
 			pendingPromptDispatches: [],
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
+			subagentRelay: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
@@ -2877,21 +2950,148 @@ export class AcpAgent implements Agent {
 		return parsed;
 	}
 
-	async #replaySessionHistory(record: ManagedSessionRecord): Promise<void> {
-		const cwd = record.session.sessionManager.getCwd();
+	/**
+	 * Replays the session's history, or with `send: false` (`session/resume`)
+	 * only registers its subagent children, so one that runs again is
+	 * announced, ancestors first, before its traffic.
+	 */
+	async #replaySessionHistory(record: ManagedSessionRecord, options: { send?: boolean } = {}): Promise<void> {
+		const { sessionId, sessionManager } = record.session;
+		const cwd = sessionManager.getCwd();
+		const send =
+			options.send === false
+				? async () => {}
+				: (notification: SessionNotification) => this.#connection.sessionUpdate(notification);
+		if (options.send === false && !record.subagentRelay) return;
+		const subagents: SubagentReplay | undefined = record.subagentRelay && {
+			rootSessionId: sessionId,
+			relay: record.subagentRelay,
+			cwd,
+			replayed: new Set(),
+			send,
+			announce: options.send !== false,
+		};
+		await this.#replayMessages(
+			send,
+			sessionId,
+			sessionManager.buildSessionContext().messages as ReplayableMessage[],
+			cwd,
+			sessionManager.getSessionFile(),
+			subagents,
+		);
+	}
+
+	/**
+	 * Replays `messages` into `sessionId`. With `subagents`, each task tool
+	 * result is followed by the replay of the children it spawned; with
+	 * `prompts`, the session is such a child and its user messages are the
+	 * prompts its parent sent. Returns the number of prompts replayed.
+	 */
+	async #replayMessages(
+		send: (notification: SessionNotification) => Promise<void>,
+		sessionId: string,
+		messages: ReplayableMessage[],
+		cwd: string,
+		sessionFile: string | undefined,
+		subagents: SubagentReplay | undefined,
+		prompts?: { parentSessionId: string },
+	): Promise<number> {
 		const replayedToolCallIds = new Set<string>();
 		const replayedToolCallArgs = new Map<string, unknown>();
-		for (const message of record.session.sessionManager.buildSessionContext().messages as ReplayableMessage[]) {
+		let promptCount = 0;
+		for (const message of messages) {
+			if (prompts && message.role === "user") {
+				promptCount += 1;
+				await send({
+					sessionId,
+					update: {
+						sessionUpdate: "session_message",
+						messageId: `${sessionId}:prompt:${promptCount}`,
+						senderSessionId: prompts.parentSessionId,
+						recipientSessionId: sessionId,
+						content: this.#extractReplayContent(
+							typeof message.content === "string" ? [{ type: "text", text: message.content }] : message.content,
+							undefined,
+						),
+					},
+				});
+				continue;
+			}
 			for (const notification of this.#messageToReplayNotifications(
-				record.session.sessionId,
+				sessionId,
 				message,
 				cwd,
 				replayedToolCallIds,
 				replayedToolCallArgs,
 			)) {
-				await this.#connection.sessionUpdate(notification);
+				await send(notification);
+			}
+			if (subagents && sessionFile && message.role === "toolResult" && message.toolName === "task") {
+				for (const child of taskResultSubagents(message.details)) {
+					await this.#replaySubagent(child, sessionId, sessionFile, subagents);
+				}
 			}
 		}
+		return promptCount;
+	}
+
+	/**
+	 * Replays one subagent from its own transcript, which the task tool keeps
+	 * at `<caller session file minus .jsonl>/<id>.jsonl`: an announcement on
+	 * its parent without a work state, its history under its live session id,
+	 * then an idle snapshot. A child without a transcript stays unexposed.
+	 */
+	async #replaySubagent(
+		child: { id: string; description: string | undefined },
+		parentSessionId: string,
+		parentSessionFile: string,
+		subagents: SubagentReplay,
+	): Promise<void> {
+		if (subagents.replayed.has(child.id) || !parentSessionFile.endsWith(".jsonl")) return;
+		subagents.replayed.add(child.id);
+		const sessionFile = path.join(parentSessionFile.slice(0, -".jsonl".length), `${child.id}.jsonl`);
+		let messages: ReplayableMessage[];
+		try {
+			messages = (await loadSessionMessagesReadOnly(sessionFile)) as ReplayableMessage[];
+		} catch (error) {
+			logger.debug("ACP subagent transcript unavailable for replay", { sessionFile, error: String(error) });
+			return;
+		}
+		if (messages.length === 0) return;
+		const sessionId = subagentSessionId(subagents.rootSessionId, child.id);
+		await subagents.send({
+			sessionId: parentSessionId,
+			update: {
+				sessionUpdate: "subagent_update",
+				sessionId,
+				title: child.id,
+				...(child.description ? { description: child.description } : {}),
+			},
+		});
+		const prompts = await this.#replayMessages(
+			subagents.send,
+			sessionId,
+			messages,
+			subagents.cwd,
+			sessionFile,
+			subagents,
+			{
+				parentSessionId,
+			},
+		);
+		const last = messages.findLast(message => message.role === "assistant");
+		await subagents.send({
+			sessionId: parentSessionId,
+			update: { sessionUpdate: "subagent_update", sessionId, state: replayedIdleState(last?.stopReason) },
+		});
+		subagents.relay.restore(child.id, {
+			sessionId,
+			parentSessionId,
+			title: child.id,
+			description: child.description,
+			prompts,
+			announced: subagents.announce,
+		});
 	}
 
 	#messageToReplayNotifications(
@@ -3393,6 +3593,7 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.titleUnsubscribe?.();
+		record.subagentRelay?.dispose();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();
