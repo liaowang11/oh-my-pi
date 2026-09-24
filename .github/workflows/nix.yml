@@ -1,13 +1,7 @@
 name: OMP Nix
 
-# Nightly, on-demand, and release runs only. Releases push their `v*` tag
-# atomically with main (scripts/release.ts), so the tag push is the release
-# trigger; branch pushes and pull requests never run this workflow.
+# On-demand runs only; the fork uses its Cachix workflow for package builds.
 on:
-  push:
-    tags: ["v*"]
-  schedule:
-    - cron: "17 3 * * *"
   workflow_dispatch:
 
 # Each run gets its own never-cancelled group so a later run cannot cancel a
