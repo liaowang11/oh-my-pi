@@ -2,9 +2,13 @@
   description = "OMP coding agent and development environment";
 
   nixConfig = {
-    extra-substituters = [ "https://nix-community.cachix.org" ];
+    extra-substituters = [
+      "https://nix-community.cachix.org"
+      "https://iosevka-wliao.cachix.org"
+    ];
     extra-trusted-public-keys = [
       "nix-community.cachix.org-1:mB9FSh9qf2dCimDSUo8Zy7bkq5CX+/rkCWyvRCYg3Fs="
+      "iosevka-wliao.cachix.org-1:IJ+8jBJgx0SkMs2IA7V7XME5tdcVmpQSoL2JH1Bcy9E="
     ];
   };
 
