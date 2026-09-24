@@ -926,6 +926,62 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("forwards an agent-initiated turn that runs with no session/prompt in flight (#9157)", async () => {
+		// A background job finishing after `end_turn` makes AgentSession start a
+		// turn of its own (yield-queue idle flush). No `session/prompt` owns it, so
+		// nothing may settle a PromptResponse — but the content still has to
+		// reach the client instead of vanishing into the session file.
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "run echo hello in the background" }],
+		});
+		expect(response.stopReason).toBe("end_turn");
+		const updatesBefore = harness.updates.length;
+
+		const assistantMessage = makeAssistantMessage("Background job finished: hello");
+		session.isStreaming = true;
+		for (const listener of session.listeners()) {
+			listener({
+				type: "message_update",
+				message: assistantMessage,
+				assistantMessageEvent: { type: "text_delta", delta: "Background job finished: hello" },
+			} as AgentSessionEvent);
+		}
+		for (const listener of session.listeners()) {
+			listener({ type: "agent_end", messages: [assistantMessage] } as AgentSessionEvent);
+		}
+		session.isStreaming = false;
+		await Bun.sleep(0);
+
+		const pushed = harness.updates.slice(updatesBefore).filter(update => update.sessionId === created.sessionId);
+		const autonomousChunks = pushed.filter(update => update.update.sessionUpdate === "agent_message_chunk");
+		expect(autonomousChunks).toHaveLength(1);
+		expect(autonomousChunks[0]?.update).toEqual(
+			expect.objectContaining({
+				sessionUpdate: "agent_message_chunk",
+				content: { type: "text", text: "Background job finished: hello" },
+			}),
+		);
+		expectAcpNotifications(pushed);
+
+		// The client-owned turn before it was delivered exactly once even though
+		// the lifetime subscription was already installed while it ran.
+		const allChunks = harness.updates.filter(
+			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
+		);
+		expect(allChunks).toHaveLength(2);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("suppresses lifetime config_option_update during the bootstrap window", async () => {
 		// Regression for codex review on #1060: an extension `session_start`
 		// handler calling `setThinkingLevel` must not push a
