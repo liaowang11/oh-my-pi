@@ -19,6 +19,7 @@ import { theme } from "@oh-my-pi/pi-tui/theme";
 import { sanitizeText } from "@oh-my-pi/pi-utils";
 import { handleMcpAcp } from "./helpers/mcp";
 import { markdownFenceFor } from "../utils/markdown-fence";
+import { handleAcpAgentsCommand } from "./helpers/agents";
 import { commandConsumed, errorMessage, parseSubcommand, usage } from "./helpers/parse";
 import {
 	describeRedeemOutcome,
@@ -574,6 +575,9 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "agents",
 		icon: "agents",
 		description: "Open the agents hub (per-agent model, prewalk, and advisor)",
+		acpDescription: "List agents and set their per-agent model, prewalk, and advisor",
+		acpInputHint: "[list|enable|disable|model|prewalk|advisor] <name> [value]",
+		handleAcp: handleAcpAgentsCommand,
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showAgentsDashboard();
 			clearSubmittedText(runtime);
