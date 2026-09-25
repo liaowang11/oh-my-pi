@@ -22,7 +22,12 @@ import { initTheme } from "@oh-my-pi/pi-tui/theme";
 import { cfgBrowserEnabled, cfgBrowserHeadless } from "@oh-my-pi/pi-coding-agent/tools/browser/settings";
 import { cfgExtendedContext } from "@oh-my-pi/pi-coding-agent/session/context-settings";
 import { cfgMemoryBackend } from "@oh-my-pi/pi-coding-agent/memory-backend/settings";
-import { cfgWorktreeCleanSource } from "@oh-my-pi/pi-coding-agent/task/settings";
+import {
+	cfgTaskAgentModelOverrides,
+	cfgTaskAgentPrewalk,
+	cfgTaskDisabledAgents,
+	cfgWorktreeCleanSource,
+} from "@oh-my-pi/pi-coding-agent/task/settings";
 
 interface FakeAcpBuiltinSession {
 	fastMode: boolean;
@@ -849,7 +854,6 @@ describe("ACP builtin slash commands", () => {
 			"/loop",
 			"/hotkeys",
 			"/extensions",
-			"/agents",
 			"/copy",
 			"/btw hi",
 			"/new",
@@ -1759,5 +1763,52 @@ describe("/move preflight flush", () => {
 			setProjectDir(originalProjectDir);
 			await fs.rm(targetDir, { recursive: true, force: true });
 		}
+	});
+});
+
+describe("/agents", () => {
+	it("disables an agent in the live session even when the host pinned the default", async () => {
+		const { output, runtime } = createRuntime();
+		// ACP/RPC soft-pin unconfigured task.* keys to their defaults (`applyProtocolDefaults`).
+		cfgTaskDisabledAgents.pinDefault(runtime.settings);
+
+		expect(await executeAcpBuiltinSlashCommand("/agents disable scout", runtime)).toEqual({ consumed: true });
+
+		expect(cfgTaskDisabledAgents.get(runtime.settings)).toEqual(["scout"]);
+		expect(output).toEqual(["scout disabled"]);
+	});
+
+	it("sets and clears a per-agent model override", async () => {
+		const { output, runtime } = createRuntime();
+		cfgTaskAgentModelOverrides.pinDefault(runtime.settings);
+
+		await executeAcpBuiltinSlashCommand("/agents model scout anthropic/claude-haiku", runtime);
+		expect(cfgTaskAgentModelOverrides.get(runtime.settings)).toEqual({ scout: "anthropic/claude-haiku" });
+		expect(output.at(-1)).toBe("scout model: anthropic/claude-haiku");
+
+		await executeAcpBuiltinSlashCommand("/agents model scout default", runtime);
+		expect(cfgTaskAgentModelOverrides.get(runtime.settings)).toEqual({});
+		expect(output.at(-1)).toBe("scout model: @smol");
+	});
+
+	it("lists agents with their overrides applied", async () => {
+		const { output, runtime } = createRuntime();
+		cfgTaskAgentPrewalk.set(runtime.settings, { scout: "on" });
+		cfgTaskDisabledAgents.set(runtime.settings, ["reviewer"]);
+
+		await executeAcpBuiltinSlashCommand("/agents", runtime);
+
+		const lines = output[0]?.split("\n") ?? [];
+		expect(lines).toContain("scout [bundled] enabled · model: @smol · prewalk: on (@smol) · advisor: off");
+		expect(lines.find(line => line.startsWith("reviewer "))).toStartWith("reviewer [bundled] disabled");
+	});
+
+	it("rejects an unknown agent without writing settings", async () => {
+		const { output, runtime } = createRuntime();
+
+		await executeAcpBuiltinSlashCommand("/agents disable no-such-agent", runtime);
+
+		expect(cfgTaskDisabledAgents.get(runtime.settings)).toEqual([]);
+		expect(output[0]).toStartWith("Unknown agent: no-such-agent.");
 	});
 });
