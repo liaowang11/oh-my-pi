@@ -574,13 +574,16 @@ describe("ACP builtin slash commands", () => {
 		expect(output[0]).toContain("anthropic/claude-opus-4-5");
 	});
 
-	it("model: returns no-selection message when undefined", async () => {
+	it("model: lists every role grouped by chat vs. kind when nothing is set", async () => {
 		const { output, runtime } = createRuntime();
 
 		const result = await executeAcpBuiltinSlashCommand("/model", runtime);
 
 		expect(result).toEqual({ consumed: true });
-		expect(output[0]).toContain("No model");
+		expect(output[0]).toContain("Chat models:");
+		expect(output[0]).toContain("default: (unset)");
+		expect(output[0]).toContain("Other models:");
+		expect(output[0]).toContain("speech: (unset)");
 	});
 
 	it("model: returns ACP usage message when args provided", async () => {
@@ -625,6 +628,74 @@ describe("ACP builtin slash commands", () => {
 		await executeAcpBuiltinSlashCommand("/model nonexistent", runtime);
 
 		expect(configNotified).toBe(0);
+	});
+
+	// /model role: session-scoped role assignment (never touches global/project settings)
+	it("model role bogus: rejects an unknown role", async () => {
+		const { output, runtime } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/model role bogus", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("Unknown role: bogus");
+	});
+
+	it("model role smol: shows unset when the role has no configured model", async () => {
+		const { output, runtime } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/model role smol", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toBe("smol: (unset)");
+	});
+
+	it("model role smol <selector>: sets a runtime-only override, never persisted", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "openai", id: "gpt-5.2" }];
+
+		const result = await executeAcpBuiltinSlashCommand("/model role smol openai/gpt-5.2", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("smol model set to openai/gpt-5.2 for this session.");
+		expect(runtime.settings.getModelRole("smol")).toBe("openai/gpt-5.2");
+		expect(runtime.settings.getGlobalModelRole("smol")).toBeUndefined();
+		expect(runtime.settings.getProjectModelRole("smol")).toBeUndefined();
+	});
+
+	it("model role speech <selector>: resolves against the role's own model kind", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [
+			{ provider: "anthropic", id: "claude-opus-4-5" },
+			{ provider: "local", id: "kokoro", kind: "tts" } as never,
+		];
+
+		const result = await executeAcpBuiltinSlashCommand("/model role speech local/kokoro", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("speech model set to local/kokoro for this session.");
+		expect(runtime.settings.getModelRole("speech")).toBe("local/kokoro");
+	});
+
+	it("model role smol clear: reverts the session-only override", async () => {
+		const { output, runtime, session } = createRuntime();
+		session.getAvailableModels = () => [{ provider: "openai", id: "gpt-5.2" }];
+		await executeAcpBuiltinSlashCommand("/model role smol openai/gpt-5.2", runtime);
+		expect(runtime.settings.getModelRole("smol")).toBe("openai/gpt-5.2");
+
+		const result = await executeAcpBuiltinSlashCommand("/model role smol clear", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[1]).toContain("smol role cleared for this session.");
+		expect(runtime.settings.getModelRole("smol")).toBeUndefined();
+	});
+
+	it("model role default clear: rejected — the default role has no unset state", async () => {
+		const { output, runtime } = createRuntime();
+
+		const result = await executeAcpBuiltinSlashCommand("/model role default clear", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		expect(output[0]).toContain("can't be cleared");
 	});
 
 	// /switch resolves like `omp bench`: fuzzy ids, @role aliases, :level suffixes

@@ -1,8 +1,17 @@
 import * as path from "node:path";
+import type { Model } from "@oh-my-pi/pi-catalog/types";
+import {
+	CHAT_MODEL_ROLE_IDS,
+	KIND_ROLE_IDS,
+	getKnownRoleIds,
+	getRoleInfo,
+	roleCandidatePool,
+} from "../config/model-roles";
 import {
 	formatModelString,
 	getModelMatchPreferences,
 	resolveCliModel,
+	resolveModelRoleValue,
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -14,7 +23,13 @@ import type { AgentSession } from "../session/agent-session";
 import { handleAcpGoalCommand, handleAcpGuidedGoalCommand } from "./helpers/goal";
 import { commandConsumed, errorMessage, usage } from "./helpers/parse";
 import { handleSecurityCommand } from "./helpers/security";
-import type { ParsedSlashCommand, SlashCommandSpec, TuiSlashCommandRuntime } from "./types";
+import type {
+	ParsedSlashCommand,
+	SlashCommandResult,
+	SlashCommandRuntime,
+	SlashCommandSpec,
+	TuiSlashCommandRuntime,
+} from "./types";
 
 import { cfgComputerDisplay, cfgComputerEnabled, cfgComputerMaxHeight, cfgComputerMaxWidth } from "../tools/settings";
 import { cfgSkillful } from "../session/settings";
@@ -47,6 +62,153 @@ function resolveSessionModelSelector(
 		settings,
 		preferences: getModelMatchPreferences(settings),
 	});
+}
+
+/** Candidate pool for `role`: the `default`-role scope above, else the role's own model-kind pool. */
+function roleModelPool(role: string, session: AgentSession, settings: Settings): Model[] {
+	if (role === "default") {
+		const scoped = session.scopedModels.map(entry => entry.model);
+		return scoped.length > 0 ? scoped : session.modelRegistry.getAvailable();
+	}
+	return roleCandidatePool(role, settings, session.modelRegistry);
+}
+
+/** Resolve a `/model role <role> <selector>` selector against that role's candidate pool. */
+function resolveRoleModelSelector(
+	role: string,
+	selector: string,
+	session: AgentSession,
+	settings: Settings,
+): ResolveCliModelResult {
+	if (role === "default") return resolveSessionModelSelector(selector, session, settings);
+	return resolveCliModel({
+		cliModel: selector,
+		modelRegistry: session.modelRegistry,
+		availableModels: roleModelPool(role, session, settings),
+		settings,
+		preferences: getModelMatchPreferences(settings),
+	});
+}
+
+/** The model currently effective for `role`, formatted for display. */
+function effectiveRoleModelLabel(role: string, session: AgentSession, settings: Settings): string {
+	if (role === "default") {
+		return session.model ? formatModelString(session.model) : "(unset)";
+	}
+	const raw = settings.getModelRole(role);
+	if (!raw) return "(unset)";
+	const resolved = resolveModelRoleValue(raw, roleModelPool(role, session, settings), {
+		settings,
+		matchPreferences: getModelMatchPreferences(settings),
+	});
+	return resolved.model ? formatModelString(resolved.model) : `${raw} (unresolved)`;
+}
+
+function formatRoleLine(role: string, session: AgentSession, settings: Settings): string {
+	return `${role}: ${effectiveRoleModelLabel(role, session, settings)}`;
+}
+
+/** Chat-kind roles, then kind-specific roles (image/web/speech/dictation/judge), for `/model`'s grouped listing. */
+function modelListingGroups(settings: Settings): Array<{ label: string; roles: string[] }> {
+	const chat: string[] = [...CHAT_MODEL_ROLE_IDS];
+	const kind: string[] = [...KIND_ROLE_IDS];
+	for (const role of getKnownRoleIds(settings)) {
+		if (chat.includes(role) || kind.includes(role)) continue;
+		(getRoleInfo(role, settings).section === "kind" ? kind : chat).push(role);
+	}
+	return [
+		{ label: "Chat models", roles: chat },
+		{ label: "Other models", roles: kind },
+	];
+}
+
+function formatModelRoleListing(session: AgentSession, settings: Settings): string {
+	return modelListingGroups(settings)
+		.map(
+			group =>
+				`${group.label}:\n${group.roles.map(role => `  ${formatRoleLine(role, session, settings)}`).join("\n")}`,
+		)
+		.join("\n\n");
+}
+
+/** Shared `/model <selector>` body: resolve and apply a default-role selector, session-only. */
+async function applyDefaultModelSelector(selector: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
+	const match = resolved.model;
+	if (!match) {
+		return usage(
+			`Unknown model: ${selector}. Use ACP \`session/setModel\` for picker-driven selection or list available models with /model.`,
+			runtime,
+		);
+	}
+	try {
+		await runtime.session.setModel(match);
+		if (resolved.thinkingLevel !== undefined) runtime.session.setThinkingLevel(resolved.thinkingLevel);
+		await runtime.output(`Model set to ${match.provider}/${match.id}.`);
+		await runtime.notifyTitleChanged?.();
+		await runtime.notifyConfigChanged?.();
+		return commandConsumed();
+	} catch (err) {
+		return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
+	}
+}
+
+/**
+ * `/model role <role> [selector|clear]`: text-mode, session-scoped counterpart
+ * to the TUI's role-assignment model hub. `default` is special: it is the live
+ * session model (set via `session.setModel`, never persisted here — matching
+ * the existing bare `/model <selector>` behavior), so it can't be "cleared"
+ * the way other roles can. Every other role only ever writes the runtime
+ * override layer (`settings.overrideModelRoles` / `clearModelRoleOverride`),
+ * never global or project settings.
+ */
+async function handleModelRoleSubcommand(rest: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
+	const trimmed = rest.trim();
+	if (!trimmed) {
+		await runtime.output(formatModelRoleListing(runtime.session, runtime.settings));
+		return commandConsumed();
+	}
+
+	const spaceIdx = trimmed.search(/\s/);
+	const role = (spaceIdx === -1 ? trimmed : trimmed.slice(0, spaceIdx)).toLowerCase();
+	const value = spaceIdx === -1 ? "" : trimmed.slice(spaceIdx + 1).trim();
+	if (!getKnownRoleIds(runtime.settings).includes(role)) {
+		return usage(`Unknown role: ${role}. Use /model to list known roles.`, runtime);
+	}
+
+	if (!value) {
+		await runtime.output(formatRoleLine(role, runtime.session, runtime.settings));
+		return commandConsumed();
+	}
+
+	if (value.toLowerCase() === "clear" || value.toLowerCase() === "unset" || value.toLowerCase() === "reset") {
+		if (role === "default") {
+			return usage("The default role can't be cleared; use /model <selector> to switch it.", runtime);
+		}
+		runtime.settings.clearModelRoleOverride(role);
+		await runtime.notifyConfigChanged?.();
+		await runtime.output(`${role} role cleared for this session.`);
+		return commandConsumed();
+	}
+
+	const resolved = resolveRoleModelSelector(role, value, runtime.session, runtime.settings);
+	if (!resolved.model) {
+		return usage(resolved.error ?? `Unknown model: ${value}`, runtime);
+	}
+	try {
+		if (role === "default") {
+			await runtime.session.setModel(resolved.model);
+			if (resolved.thinkingLevel !== undefined) runtime.session.setThinkingLevel(resolved.thinkingLevel);
+			await runtime.notifyTitleChanged?.();
+		} else {
+			runtime.settings.overrideModelRoles({ [role]: value });
+		}
+		await runtime.output(`${role} model set to ${formatModelString(resolved.model)} for this session.`);
+		await runtime.notifyConfigChanged?.();
+		return commandConsumed();
+	} catch (err) {
+		return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
+	}
 }
 
 async function runWithDetachedModeDraft(
@@ -401,39 +563,33 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		aliases: ["models"],
 		icon: "model",
 		description: "Switch model for this session",
-		acpDescription: "Show current model selection",
+		acpDescription: "Show or switch models per role, session-scoped",
+		acpInputHint: "[selector|role <role> [selector|clear]]",
+		subcommands: [{ name: "role", description: "Show or set a role's model", usage: "<role> [selector|clear]" }],
 		getTuiAutocompleteDescription: runtime => {
 			const model = runtime.ctx.session.model;
 			return model ? `Model: ${model.provider}/${model.id}` : "Model: none selected";
 		},
 		handle: async (command, runtime) => {
-			if (command.args) {
-				const selector = command.args.trim();
-				const resolved = resolveSessionModelSelector(selector, runtime.session, runtime.settings);
-				const match = resolved.model;
-				if (!match) {
-					return usage(
-						`Unknown model: ${selector}. Use ACP \`session/setModel\` for picker-driven selection or list available models with /model.`,
-						runtime,
-					);
-				}
-				try {
-					await runtime.session.setModel(match);
-					if (resolved.thinkingLevel !== undefined) runtime.session.setThinkingLevel(resolved.thinkingLevel);
-					await runtime.output(`Model set to ${match.provider}/${match.id}.`);
-					await runtime.notifyTitleChanged?.();
-					await runtime.notifyConfigChanged?.();
-					return commandConsumed();
-				} catch (err) {
-					return usage(`Failed to set model: ${errorMessage(err)}`, runtime);
-				}
-			}
+			if (command.args) return applyDefaultModelSelector(command.args.trim(), runtime);
 
 			const model = runtime.session.model;
 			await runtime.output(
 				model ? `Current model: ${model.provider}/${model.id}` : "No model is currently selected.",
 			);
 			return commandConsumed();
+		},
+		handleAcp: async (command, runtime) => {
+			const trimmed = command.args.trim();
+			if (!trimmed) {
+				await runtime.output(formatModelRoleListing(runtime.session, runtime.settings));
+				return commandConsumed();
+			}
+
+			const roleMatch = /^role\b\s*(.*)$/is.exec(trimmed);
+			if (roleMatch) return handleModelRoleSubcommand(roleMatch[1] ?? "", runtime);
+
+			return applyDefaultModelSelector(trimmed, runtime);
 		},
 		handleTui: (_command, runtime) => {
 			runtime.ctx.showModelSelector();
