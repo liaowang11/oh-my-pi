@@ -75,6 +75,51 @@ export interface HubAgent {
 /** The per-agent knob a strip or the model browser edits. */
 export type PropertyKind = "model" | "prewalk" | "advisor";
 
+/** The settings override `agent` carries for `property`, if any. */
+export function agentPropertyOverride(agent: HubAgent, property: PropertyKind): string | undefined {
+	switch (property) {
+		case "model":
+			return agent.overrideModel;
+		case "prewalk":
+			return agent.prewalkOverride;
+		case "advisor":
+			return agent.advisorOverride;
+	}
+}
+
+/** Store `value` (trimmed; empty clears) as `agent`'s override for `property`; returns the stored value. */
+export function setAgentPropertyOverride(
+	agent: HubAgent,
+	property: PropertyKind,
+	value: string | undefined,
+): string | undefined {
+	const trimmed = value?.trim() || undefined;
+	switch (property) {
+		case "model":
+			agent.overrideModel = trimmed;
+			break;
+		case "prewalk":
+			agent.prewalkOverride = trimmed;
+			break;
+		case "advisor":
+			agent.advisorOverride = trimmed;
+			break;
+	}
+	return trimmed;
+}
+
+/** One-line effective description of `agent`'s `property`, e.g. `scout model: @smol → p/m`. */
+export function describeAgentProperty(deps: AgentsHubDeps, agent: HubAgent, property: PropertyKind): string {
+	if (property === "model") {
+		const patterns = deps.effectiveModelPatterns(agent);
+		const resolved = deps.resolvePatterns(patterns);
+		const base = agent.overrideModel ?? (patterns.length > 0 ? patterns.join(",") : "session model");
+		return `${agent.name} model: ${base}${resolved ? ` → ${resolved}` : ""}`;
+	}
+	const pattern = property === "prewalk" ? deps.effectivePrewalkPattern(agent) : deps.effectiveAdvisorPattern(agent);
+	return `${agent.name} ${property}: ${pattern ? `on (${pattern})` : "off"}`;
+}
+
 export interface GeneratedAgentSpec {
 	identifier: string;
 	whenToUse: string;
@@ -375,12 +420,7 @@ export function AgentsHub(props: AgentsHubProps): JSXNode {
 
 	// ─── Settings ───────────────────────────────────────────────────────────
 
-	const overrideFor = (agent: HubAgent, property: PropertyKind): string | undefined =>
-		property === "model"
-			? agent.overrideModel
-			: property === "prewalk"
-				? agent.prewalkOverride
-				: agent.advisorOverride;
+	const overrideFor = agentPropertyOverride;
 
 	/** One line on what `property` resolves to now (notices). */
 	const describeProperty = (agent: HubAgent, property: PropertyKind): string => {
@@ -409,11 +449,7 @@ export function AgentsHub(props: AgentsHubProps): JSXNode {
 	};
 
 	const setOverride = (agent: HubAgent, property: PropertyKind, value: string | undefined): void => {
-		const trimmed = value?.trim() || undefined;
-		if (property === "model") agent.overrideModel = trimmed;
-		else if (property === "prewalk") agent.prewalkOverride = trimmed;
-		else agent.advisorOverride = trimmed;
-		deps.setAgentOverride(property, agent.name, trimmed);
+		deps.setAgentOverride(property, agent.name, setAgentPropertyOverride(agent, property, value));
 		notice = describeProperty(agent, property);
 	};
 
