@@ -7,8 +7,14 @@ import {
 	type PropertyKind,
 	setAgentPropertyOverride,
 } from "@oh-my-pi/pi-tui/overlays/agents-hub";
-import type { SettingPath } from "../../config/settings";
+import type { AnySetting } from "../../config/registry";
 import { createAgentsHubDeps } from "../../modes/agents-hub-deps";
+import {
+	cfgTaskAgentAdvisor,
+	cfgTaskAgentModelOverrides,
+	cfgTaskAgentPrewalk,
+	cfgTaskDisabledAgents,
+} from "../../task/settings";
 import type { ParsedSlashCommand, SlashCommandResult, SlashCommandRuntime } from "../types";
 import { commandConsumed, parseSubcommand, usage } from "./parse";
 
@@ -19,21 +25,21 @@ const USAGE = [
 	"       /agents prewalk|advisor <name> <on|off|pattern|default>",
 ].join("\n");
 
-const PROPERTY_SETTING: Record<PropertyKind, SettingPath> = {
-	model: "task.agentModelOverrides",
-	prewalk: "task.agentPrewalk",
-	advisor: "task.agentAdvisor",
+const PROPERTY_SETTING: Record<PropertyKind, AnySetting> = {
+	model: cfgTaskAgentModelOverrides,
+	prewalk: cfgTaskAgentPrewalk,
+	advisor: cfgTaskAgentAdvisor,
 };
 
 /**
- * Protocol hosts pin these paths to their defaults as runtime overrides when
+ * Protocol hosts pin these settings to their defaults as runtime overrides when
  * the user left them unset (`applyAcpDefaultSettingOverrides`). Overrides merge
  * last and replace arrays, so a persisted `set` alone would never reach the
  * running session. Dropping the pin once the user writes a value hands the
  * key back to their settings, as it would be had they configured it upfront.
  */
-function releaseHostDefault(runtime: SlashCommandRuntime, path: SettingPath): void {
-	runtime.settings.clearOverride(path);
+function releaseHostDefault(runtime: SlashCommandRuntime, setting: AnySetting): void {
+	setting.clearOverride(runtime.settings);
 }
 
 /**
@@ -85,7 +91,7 @@ export async function handleAcpAgentsCommand(
 	if ((verb === "enable" || verb === "disable") && agent && !value) {
 		agent.disabled = verb === "disable";
 		deps.setDisabledAgents(disabledAgentNames(agents));
-		releaseHostDefault(runtime, "task.disabledAgents");
+		releaseHostDefault(runtime, cfgTaskDisabledAgents);
 		return usage(`${agent.name} ${agent.disabled ? "disabled" : "enabled"}`, runtime);
 	}
 

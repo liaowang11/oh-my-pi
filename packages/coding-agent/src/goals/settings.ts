@@ -1,5 +1,7 @@
 import { register } from "../config/registry";
 
+const DEFAULT_GOAL_CONTINUATION_MODES: string[] = ["interactive", "acp"];
+
 export const cfgGoalEnabled = register({
 	id: "goal.enabled",
 	type: "boolean",
@@ -27,7 +29,7 @@ export const cfgGoalStatusInFooter = register({
 export const cfgGoalContinuationModes = register({
 	id: "goal.continuationModes",
 	type: "array",
-	default: ["interactive", "acp"],
+	default: DEFAULT_GOAL_CONTINUATION_MODES,
 	ui: {
 		tab: "tasks",
 		group: "Modes",

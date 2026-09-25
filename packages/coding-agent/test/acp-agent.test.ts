@@ -51,6 +51,7 @@ import {
 } from "@oh-my-pi/pi-utils/acp";
 import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp";
 
+import { cfgGoalContinuationModes } from "@oh-my-pi/pi-coding-agent/goals/settings";
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
 
 /** Validates an ACP wire payload against the in-house protocol schemas. */
@@ -2124,7 +2125,7 @@ describe("ACP agent", () => {
 
 	it("does not auto-continue a goal when goal.continuationModes excludes acp", async () => {
 		const harness = await createHarness();
-		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 
@@ -2141,7 +2142,7 @@ describe("ACP agent", () => {
 
 	it("titles the session from model-bound text, never from builtin command text", async () => {
 		const harness = await createHarness();
-		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 		const send = async (text: string) =>
@@ -2207,7 +2208,7 @@ describe("ACP agent", () => {
 
 	it("settles on its own agent_end when the background turn ended before the prompt subscribed", async () => {
 		const harness = await createHarness();
-		Settings.instance.set("goal.continuationModes", ["interactive"]);
+		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
 		// The background turn's agent_end already fired; isStreaming is still unwinding.
