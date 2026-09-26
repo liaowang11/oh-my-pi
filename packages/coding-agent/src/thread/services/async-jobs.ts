@@ -184,6 +184,7 @@ function mainRegisterOptions(options: WireRegisterOptions | undefined, feed: Job
 		queued: options?.queued,
 		foreground: options?.foreground,
 		intent: options?.intent,
+		toolCallId: options?.toolCallId,
 		process: feed?.process,
 		widgetInputs: feed?.widgetInputs,
 	};
@@ -221,6 +222,7 @@ function serveManager(
 						signal: toWireSignal(ctx.signal),
 						reportProgress: ctx.reportProgress,
 						markRunning: ctx.markRunning,
+						reportOutputFile: ctx.reportOutputFile,
 						pushFeed: feed ? delta => feed.apply(delta, true) : undefined,
 					};
 					return run(wire);

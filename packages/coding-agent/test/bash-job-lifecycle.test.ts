@@ -102,3 +102,25 @@ it.skipIf(process.platform === "win32")("gives a background job the session iden
 	expect(file).toBe(sessionFile);
 	expect(callId).toBe("bg-env");
 });
+
+it.skipIf(process.platform === "win32")("reports a background job's spill file once output overflows", async () => {
+	const spill = path.join(cwd, "spill.log");
+	const job = new BashTool({
+		cwd,
+		hasUI: false,
+		getSessionFile: () => null,
+		getSessionId: () => cwd,
+		getSessionSpawns: () => "*",
+		asyncJobManager: manager,
+		settings: Settings.isolated({}),
+		allocateOutputArtifact: async () => ({ id: "spill", path: spill }),
+	});
+	const result = await job.execute("bg-spill", {
+		command: "head -c 400000 /dev/zero | tr '\\0' a",
+		async: true,
+	});
+	const id = result.details?.async?.jobId;
+	if (!id) throw new Error("expected background job");
+	await manager.waitForAll();
+	expect(manager.getJob(id)?.outputFilePath).toBe(spill);
+});

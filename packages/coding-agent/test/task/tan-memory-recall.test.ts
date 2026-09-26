@@ -67,6 +67,7 @@ async function runTan(parent: AgentSession, work: string, onClone: () => Promise
 				signal: new AbortController().signal,
 				reportProgress: async () => {},
 				markRunning: () => {},
+				reportOutputFile: () => {},
 			});
 		return "tan-test";
 	});
