@@ -227,6 +227,7 @@ it.each([false, true])("keeps tan's copied candidate model-gated (explicit=%s)",
 				signal: new AbortController().signal,
 				reportProgress: async () => {},
 				markRunning: () => {},
+				reportOutputFile: () => {},
 			});
 		return "tan-test";
 	});

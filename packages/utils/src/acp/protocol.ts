@@ -341,7 +341,10 @@ export type SessionUpdate =
 			cost?: { amount: number; currency: string } | null;
 	  } & Meta)
 	| ({ sessionUpdate: "subagent_update" } & SubagentUpdate)
-	| ({ sessionUpdate: "session_message" } & SessionMessage);
+	| ({ sessionUpdate: "session_message" } & SessionMessage)
+	| ({ sessionUpdate: "async_task_spawned" } & AsyncTaskSpawned)
+	| ({ sessionUpdate: "async_task_progress" } & AsyncTaskProgress)
+	| ({ sessionUpdate: "async_task_state_update" } & AsyncTaskStateUpdate);
 /** Current-work snapshot of a subagent session (ACP subagents RFD). */
 export type SubagentWorkState =
 	| ({ state: "running" } & Meta)
@@ -368,6 +371,37 @@ export interface SessionMessage extends Meta {
 	senderSessionId?: SessionId | null;
 	recipientSessionId?: SessionId | null;
 	content?: ContentBlock[] | null;
+}
+/** Lifecycle state of a background task (JetBrains AIR `asyncTasks` extension). */
+export type AsyncTaskState = "running" | "paused" | "completed" | "failed" | "stopped";
+/** Announces a background task on its session (AIR `asyncTasks`). */
+export interface AsyncTaskSpawned extends Meta {
+	asyncTaskId: string;
+	name: string;
+	taskType: string;
+	description: string;
+	showInTranscript: boolean;
+	canStop: boolean;
+	outputFilePath?: string;
+	toolCallId?: string;
+}
+/** Reports interim progress of an announced background task (AIR `asyncTasks`). */
+export interface AsyncTaskProgress extends Meta {
+	asyncTaskId: string;
+	description?: string;
+	summary?: string;
+	lastToolName?: string;
+	usage?: { totalTokens: number; toolUses: number; durationMs: number };
+	outputFilePath?: string;
+	toolCallId?: string;
+}
+/** Reports a background task's state change (AIR `asyncTasks`). */
+export interface AsyncTaskStateUpdate extends Meta {
+	asyncTaskId: string;
+	state: AsyncTaskState;
+	summary?: string;
+	outputFilePath?: string;
+	toolCallId?: string;
 }
 /** Notification containing a session update. */
 export interface SessionNotification extends Meta {

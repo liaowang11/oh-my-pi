@@ -111,6 +111,11 @@ export class AcpSubagentRelay {
 		this.#toolCallOwner.clear();
 	}
 
+	/** The ACP session id of subagent `id`, live or restored, or `undefined` if this relay does not know it. */
+	sessionIdOf(id: string): string | undefined {
+		return this.#children.get(id)?.sessionId;
+	}
+
 	/**
 	 * Registers an idle child of a loaded or resumed session, so a later run
 	 * continues its session and prompt numbering. One a replay did not
