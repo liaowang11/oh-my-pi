@@ -717,6 +717,7 @@ export class EvalTool implements AgentTool<typeof evalSchema> {
 				ownerId: session.getAgentId?.() ?? undefined,
 				foreground: !startBackgrounded,
 				intent: session.getToolCallIntent?.(_toolCallId),
+				toolCallId: _toolCallId,
 			},
 		);
 
