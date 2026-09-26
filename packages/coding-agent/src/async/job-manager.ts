@@ -126,6 +126,8 @@ export interface AsyncJob {
 	foreground?: boolean;
 	/** Id of the tool call that started the job, when one did (bash/eval). */
 	toolCallId?: string;
+	/** Durable capture of the job's output, once the body confirmed the file exists. */
+	outputFilePath?: string;
 	/**
 	 * Disposal closure for a detached spawn's temporary artifacts directory
 	 * that `runStructuredSubagent()` retained past completion (so a
@@ -161,9 +163,11 @@ export interface AsyncJobProcess {
  * - `cancelled`: `cancel()` flipped a running job's status.
  * - `released`: a foreground-backed job was released and will never surface
  *   as a background job.
+ * - `output_file`: the body reported where its output is captured
+ *   (`job.outputFilePath`); fired only when the path changes.
  */
 export type AsyncJobChangeEvent = {
-	kind: "registered" | "backgrounded" | "progress" | "settled" | "cancelled" | "released";
+	kind: "registered" | "backgrounded" | "progress" | "settled" | "cancelled" | "released" | "output_file";
 	job: AsyncJob;
 	text?: string;
 };
@@ -398,6 +402,11 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/**
+			 * Record the file that durably captures this job's output. Call it only
+			 * once the file is known to exist; observers hand the path to clients.
+			 */
+			reportOutputFile: (path: string) => void;
 		}) => Promise<string | AsyncJobRunResult>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -463,6 +472,11 @@ export class AsyncJobManager {
 					reportProgress,
 					markRunning: () => {
 						job.queued = false;
+					},
+					reportOutputFile: (path: string) => {
+						if (!path || job.outputFilePath === path) return;
+						job.outputFilePath = path;
+						this.#emitJobChange("output_file", job);
 					},
 				});
 				job.endTime = Date.now();
