@@ -1567,7 +1567,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, reportOutputFile }) => {
 				// Records the job's progress and shows it on the call's card: plain output
 				// while the call still waits on it, the job frame (`details.async`) once
 				// backgrounded, so the card keeps filling and settles with the job.
@@ -1599,6 +1599,16 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						: undefined;
 				// A cancelled job reports nothing more, even while its command is still shutting down.
 				if (notifier) runSignal.addEventListener("abort", () => notifier.stop(), { once: true });
+				// The sink claims a spill file only on overflow; remember its path for the job's report.
+				let artifactPath: string | undefined;
+				const allocate = this.session.allocateOutputArtifact;
+				const allocateArtifact = allocate
+					? async () => {
+							const artifact = await allocate();
+							artifactPath = artifact.path;
+							return artifact;
+						}
+					: undefined;
 				const wallTimeStart = performance.now();
 				try {
 					const result = await executeBash(options.command, {
@@ -1639,7 +1649,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 								});
 							},
 						}),
-						allocateArtifact: this.session.allocateOutputArtifact,
+						allocateArtifact,
 						onChunk: chunk => {
 							outputModified = Date.now();
 							outputTap.append(chunk);
@@ -1670,6 +1680,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						notifier?.stop();
 					});
 					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
+					// The sink opens the artifact lazily (spill/overflow only) and reports
+					// its id only once the file was written without error, so this is the
+					// first moment the path is known to exist on disk.
+					if (result.artifactId && artifactPath) reportOutputFile(artifactPath);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						command: options.command,
@@ -1735,6 +1749,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						intent: options.intent,
 					}),
 				},
+				toolCallId: options.toolCallId,
 			},
 		);
 

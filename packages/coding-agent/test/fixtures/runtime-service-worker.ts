@@ -30,6 +30,7 @@ interface Body {
 	finish: PromiseWithResolvers<string | AsyncJobRunResult>;
 	signal?: AbortSignal;
 	report?: (text: string, assignment?: string) => Promise<void>;
+	reportOutputFile?: (path: string) => void;
 	tap?: TextTap;
 }
 
@@ -64,17 +65,23 @@ function bus(value: unknown): EventBus | undefined {
 	return value;
 }
 
-function registerBody(jobs: AsyncJobManagerApi, ownerId: string, withInputs: boolean): string {
+function registerBody(
+	jobs: AsyncJobManagerApi,
+	ownerId: string,
+	withInputs: boolean,
+	toolCallId: string | undefined,
+): string {
 	const entry: Body = { finish: Promise.withResolvers() };
 	const tap = withInputs ? new TextTap("out", "fixture output") : undefined;
 	entry.tap = tap;
 	const id = jobs.register(
 		"bash",
 		"fixture job",
-		async ({ signal, reportProgress, markRunning }) => {
+		async ({ signal, reportProgress, markRunning, reportOutputFile }) => {
 			entry.signal = signal;
 			entry.report = (text, assignment) =>
 				reportProgress(text, assignment ? { progress: [{ assignment }] } : undefined);
+			entry.reportOutputFile = reportOutputFile;
 			markRunning();
 			const aborted = Promise.withResolvers<never>();
 			signal.addEventListener("abort", () => aborted.reject(new Error("aborted")), { once: true });
@@ -86,6 +93,7 @@ function registerBody(jobs: AsyncJobManagerApi, ownerId: string, withInputs: boo
 		},
 		{
 			ownerId,
+			...(toolCallId ? { toolCallId } : {}),
 			...(tap
 				? {
 						process: { command: "fixture --run", cwd: "/fixture", pids: () => [4242] },
@@ -106,9 +114,17 @@ const probe: RuntimeProbe = async (op, ...args) => {
 		case "noop":
 			return true;
 		case "register":
-			return registerBody(manager(args[0]), String(args[1]), args[2] === true);
+			return registerBody(
+				manager(args[0]),
+				String(args[1]),
+				args[2] === true,
+				typeof args[3] === "string" ? args[3] : undefined,
+			);
 		case "progress":
 			await body(args[0]).report?.(String(args[1]), typeof args[2] === "string" ? args[2] : undefined);
+			return true;
+		case "outputFile":
+			body(args[0]).reportOutputFile?.(String(args[1]));
 			return true;
 		case "finish":
 			body(args[0]).finish.resolve(String(args[1]));

@@ -112,6 +112,7 @@ it("sends the parent's recalled system prompt unchanged from a /tan clone", asyn
 					signal: new AbortController().signal,
 					reportProgress: async () => {},
 					markRunning: () => {},
+					reportOutputFile: () => {},
 				});
 			return "tan-test";
 		});
