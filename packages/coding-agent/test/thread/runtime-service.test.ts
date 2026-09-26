@@ -187,6 +187,19 @@ describe("runtime thread services: async jobs", () => {
 		});
 	});
 
+	it("records a worker job's tool call and reported output file on main's row", async () => {
+		const manager = newManager();
+		const probe = await startWorker();
+		const id = await probe("register", manager, "Worker", false, "call_7");
+		if (typeof id !== "string") throw new Error("register returned no id");
+
+		await probe("outputFile", id, "/artifacts/bg_1.log");
+
+		const job = manager.getJob(id);
+		expect(job?.toolCallId).toBe("call_7");
+		expect(job?.outputFilePath).toBe("/artifacts/bg_1.log");
+	});
+
 	it("cancels the worker body from main and keeps the shutdown reason a symbol", async () => {
 		const manager = newManager();
 		const probe = await startWorker();
