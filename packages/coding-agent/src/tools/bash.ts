@@ -815,7 +815,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, reportOutputFile }) => {
 				const { path: artifactPath, id: artifactId } = (await this.session.allocateOutputArtifact?.("bash")) ?? {};
 				const tailBuffer = new TailBuffer(DEFAULT_MAX_BYTES);
 				const wallTimeStart = performance.now();
@@ -840,6 +840,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						onMinimizedSave: originalText => saveBashOriginalArtifact(this.session, originalText),
 					});
 					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
+					// The sink opens the artifact lazily (spill/overflow only) and reports
+					// its id only once the file was written without error, so this is the
+					// first moment the path is known to exist on disk.
+					if (result.artifactId && artifactPath) reportOutputFile(artifactPath);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,

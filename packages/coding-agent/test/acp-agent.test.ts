@@ -4541,4 +4541,67 @@ describe("ACP async tasks", () => {
 		).toHaveLength(1);
 		harness.abortController.abort();
 	});
+
+	it("carries the output file path on a metadata-only progress update and on the terminal state", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const gate = Promise.withResolvers<string>();
+
+		const logged = manager.register(
+			"bash",
+			"npm run build",
+			async ({ reportOutputFile }) => {
+				await Promise.resolve();
+				reportOutputFile("/sessions/a/artifacts/bash-1.txt");
+				return await gate.promise;
+			},
+			{ ownerId: "Main", toolCallId: "call-build" },
+		);
+		const silent = manager.register("bash", "echo hi", async () => "hi", { ownerId: "Main" });
+		gate.resolve("built");
+		await pollUntil(
+			() =>
+				asyncTaskUpdates(harness).filter(update => update.sessionUpdate === "async_task_state_update").length === 2,
+		);
+
+		const forLogged = asyncTaskUpdates(harness).filter(
+			update => "asyncTaskId" in update && update.asyncTaskId === logged,
+		);
+		// The client opens this path as the task's log; a summary-less progress
+		// frame is how the reference agent publishes a path learned after spawn.
+		expect(forLogged).toEqual([
+			{
+				sessionUpdate: "async_task_spawned",
+				asyncTaskId: logged,
+				name: "npm run build",
+				taskType: "shell",
+				description: "npm run build",
+				showInTranscript: false,
+				canStop: true,
+				toolCallId: "call-build",
+			},
+			{
+				sessionUpdate: "async_task_progress",
+				asyncTaskId: logged,
+				outputFilePath: "/sessions/a/artifacts/bash-1.txt",
+				toolCallId: "call-build",
+			},
+			{
+				sessionUpdate: "async_task_state_update",
+				asyncTaskId: logged,
+				state: "completed",
+				summary: "built",
+				outputFilePath: "/sessions/a/artifacts/bash-1.txt",
+				toolCallId: "call-build",
+			},
+		]);
+		// A job whose output never spilled to a file advertises no path at all.
+		expect(
+			asyncTaskUpdates(harness)
+				.filter(update => "asyncTaskId" in update && update.asyncTaskId === silent)
+				.some(update => "outputFilePath" in update),
+		).toBe(false);
+		harness.abortController.abort();
+	});
 });

@@ -1086,4 +1086,33 @@ describe("AsyncJobManager.onJobChange", () => {
 		expect(manager.getJob(id)?.resultText).toBe("done");
 		await manager.dispose({ timeoutMs: 0 });
 	});
+
+	test("reportOutputFile publishes the capture path once and ignores a repeat of the same path", async () => {
+		const manager = new AsyncJobManager({});
+		const paths: Array<string | undefined> = [];
+		manager.onJobChange(event => {
+			if (event.kind === "output_file") paths.push(event.job.outputFilePath);
+		});
+		const gate = Promise.withResolvers<string>();
+		const id = manager.register(
+			"bash",
+			"build",
+			async ({ reportOutputFile }) => {
+				await Promise.resolve();
+				reportOutputFile("/tmp/build.log");
+				reportOutputFile("/tmp/build.log");
+				reportOutputFile("");
+				return await gate.promise;
+			},
+			{ ownerId: "Main" },
+		);
+		gate.resolve("done");
+		await manager.waitForAll();
+
+		// Observers relay this path to clients as the task's log; a duplicate
+		// would re-publish identical metadata, an empty path would erase it.
+		expect(paths).toEqual(["/tmp/build.log"]);
+		expect(manager.getJob(id)?.outputFilePath).toBe("/tmp/build.log");
+		await manager.dispose({ timeoutMs: 0 });
+	});
 });

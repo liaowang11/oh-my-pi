@@ -46,6 +46,7 @@ export interface AcpAsyncTaskRelayOptions {
 
 type AnnouncedTask = {
 	toolCallId: string | undefined;
+	outputFilePath: string | undefined;
 	terminal: boolean;
 	lastProgressAt: number;
 	lastSummary: string | undefined;
@@ -131,6 +132,9 @@ export class AcpAsyncTaskRelay {
 			case "progress":
 				this.#onProgress(job, event.text);
 				return;
+			case "output_file":
+				this.#onOutputFile(job);
+				return;
 			case "cancelled":
 				// Report the stop now; the body's later `settled` is then ignored.
 				this.#publishTerminalFor(job, "stopped", undefined);
@@ -153,6 +157,7 @@ export class AcpAsyncTaskRelay {
 		if (this.#announced.has(job.id) || this.#released.has(job.id)) return;
 		this.#announced.set(job.id, {
 			toolCallId: job.toolCallId,
+			outputFilePath: job.outputFilePath,
 			terminal: false,
 			lastProgressAt: 0,
 			lastSummary: undefined,
@@ -173,6 +178,7 @@ export class AcpAsyncTaskRelay {
 				// promoted to the background does not render one worth keeping.
 				showInTranscript: job.type === "eval",
 				canStop: true,
+				...(job.outputFilePath ? { outputFilePath: job.outputFilePath } : {}),
 				...(job.toolCallId ? { toolCallId: job.toolCallId } : {}),
 			},
 		});
@@ -207,6 +213,27 @@ export class AcpAsyncTaskRelay {
 			task.timer = undefined;
 			this.#flushPendingProgress(job.id, task);
 		}, ASYNC_TASK_PROGRESS_THROTTLE_MS - elapsed);
+	}
+
+	/**
+	 * A metadata-only progress update: the durable output path became known
+	 * (bash learns it only once the sink has actually written the file). Bypasses
+	 * the summary throttle; the terminal edge repeats the path so a client that
+	 * joins late still sees it.
+	 */
+	#onOutputFile(job: AsyncJob): void {
+		const task = this.#announced.get(job.id);
+		if (!task || task.terminal || !job.outputFilePath || task.outputFilePath === job.outputFilePath) return;
+		task.outputFilePath = job.outputFilePath;
+		this.#enqueue({
+			sessionId: this.#options.sessionId,
+			update: {
+				sessionUpdate: "async_task_progress",
+				asyncTaskId: job.id,
+				outputFilePath: task.outputFilePath,
+				...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
+			},
+		});
 	}
 
 	#flushPendingProgress(jobId: string, task: AnnouncedTask): void {
@@ -245,6 +272,7 @@ export class AcpAsyncTaskRelay {
 				asyncTaskId: jobId,
 				state,
 				...(summary ? { summary } : {}),
+				...(task.outputFilePath ? { outputFilePath: task.outputFilePath } : {}),
 				...(task.toolCallId ? { toolCallId: task.toolCallId } : {}),
 			},
 		});
