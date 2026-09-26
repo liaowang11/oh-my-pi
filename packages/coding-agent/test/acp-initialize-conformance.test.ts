@@ -249,6 +249,19 @@ describe("ACP initialize conformance", () => {
 		expect(response._meta).toEqual(expect.objectContaining({ steering: { supported: true } }));
 	});
 
+	it("advertises AIR asyncTasks next to steering in the top-level _meta", async () => {
+		const agent = await createAgent();
+		const response = await agent.initialize(buildInitializeRequest());
+		// A JetBrains AIR client gates async_task_* rendering and
+		// `_session/async_task/stop` on this advertisement.
+		expect(response._meta).toEqual(
+			expect.objectContaining({
+				steering: { supported: true },
+				jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } },
+			}),
+		);
+	});
+
 	it("preserves the agentCapabilities contract clients depend on", async () => {
 		const agent = await createAgent();
 		const response = await agent.initialize(buildInitializeRequest());

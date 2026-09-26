@@ -5,6 +5,7 @@ import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
@@ -162,7 +163,12 @@ class FakeAgentSession {
 	goalModeState: GoalModeState | undefined;
 	activeToolNames: string[] = [];
 	promptHook: (() => Promise<void>) | undefined;
+	asyncJobManager: AsyncJobManager | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
+
+	getAgentId(): string {
+		return "Main";
+	}
 
 	constructor(
 		cwd: string,
@@ -546,6 +552,8 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		/** Background job manager handed to every factory-created session. */
+		asyncJobManager?: AsyncJobManager;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -583,6 +591,7 @@ async function createHarness(
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
 		const session = new FakeAgentSession(cwd);
+		session.asyncJobManager = options.asyncJobManager;
 		const setToolUIContext = vi.fn();
 		sessions.push(session);
 		setToolUIContextSpies.push(setToolUIContext);
@@ -4238,6 +4247,298 @@ describe("ACP subagent sessions", () => {
 		await Bun.sleep(0);
 
 		expect(harness.updates.slice(before)).toEqual([]);
+		harness.abortController.abort();
+	});
+});
+
+describe("ACP async tasks", () => {
+	const AIR_ASYNC_TASKS: ClientCapabilities = {
+		_meta: { jetbrains: { air: { version: 1, capabilities: ["asyncTasks"] } } },
+	};
+	const managers: AsyncJobManager[] = [];
+
+	afterEach(async () => {
+		for (const manager of managers.splice(0)) await manager.dispose({ timeoutMs: 0 });
+	});
+
+	function createManager(): AsyncJobManager {
+		const manager = new AsyncJobManager({ retentionMs: 0, consumedResultEvictionMs: 0 });
+		managers.push(manager);
+		return manager;
+	}
+
+	function asyncTaskUpdates(harness: AgentHarness): SessionNotification["update"][] {
+		return harness.updates
+			.map(notification => notification.update)
+			.filter(update => update.sessionUpdate.startsWith("async_task_"));
+	}
+
+	async function pollUntil(predicate: () => boolean, timeoutMs = 3_000): Promise<void> {
+		const deadline = Date.now() + timeoutMs;
+		while (!predicate()) {
+			if (Date.now() >= deadline) throw new Error("pollUntil timed out");
+			await Bun.sleep(1);
+		}
+	}
+
+	it("announces a background bash job and reports its completion to an AIR asyncTasks client", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const gate = Promise.withResolvers<string>();
+
+		const jobId = manager.register("bash", "npm test", () => gate.promise, {
+			ownerId: "Main",
+			toolCallId: "call-bash-1",
+		});
+		gate.resolve("\n12 passed\nall green");
+		await pollUntil(() => asyncTaskUpdates(harness).length === 2);
+
+		expect(
+			harness.updates.filter(n => n.update.sessionUpdate.startsWith("async_task_")).map(n => n.sessionId),
+		).toEqual([created.sessionId, created.sessionId]);
+		expect(asyncTaskUpdates(harness)).toEqual([
+			{
+				sessionUpdate: "async_task_spawned",
+				asyncTaskId: jobId,
+				name: "npm test",
+				taskType: "shell",
+				description: "npm test",
+				showInTranscript: false,
+				canStop: true,
+				toolCallId: "call-bash-1",
+			},
+			{
+				sessionUpdate: "async_task_state_update",
+				asyncTaskId: jobId,
+				state: "completed",
+				summary: "12 passed",
+				toolCallId: "call-bash-1",
+			},
+		]);
+		harness.abortController.abort();
+	});
+
+	it("sends no async task frames to a client without the AIR asyncTasks capability", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: {}, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		manager.register("bash", "npm test", async () => "done", { ownerId: "Main", toolCallId: "call-bash-1" });
+		await manager.waitForAll();
+		await Bun.sleep(0);
+
+		expect(asyncTaskUpdates(harness)).toEqual([]);
+		harness.abortController.abort();
+	});
+
+	it("never announces a foreground job that finishes in the foreground, and announces a promoted one once", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		const quick = manager.register("bash", "echo hi", async () => "hi", { ownerId: "Main", foreground: true });
+		await manager.waitForAll();
+		manager.releaseForegroundJob(quick);
+
+		const gate = Promise.withResolvers<string>();
+		const slow = manager.register("bash", "sleep 60", () => gate.promise, { ownerId: "Main", foreground: true });
+		manager.backgroundJob(slow);
+		manager.backgroundJob(slow);
+		gate.resolve("slept");
+		await pollUntil(() => asyncTaskUpdates(harness).length === 2);
+		await Bun.sleep(0);
+
+		expect(
+			asyncTaskUpdates(harness).map(update => [update.sessionUpdate, "asyncTaskId" in update && update.asyncTaskId]),
+		).toEqual([
+			["async_task_spawned", slow],
+			["async_task_state_update", slow],
+		]);
+		harness.abortController.abort();
+	});
+
+	it("stops an announced task over _session/async_task/stop exactly once", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		let bodyAborted = false;
+		const jobId = manager.register(
+			"eval",
+			"train model",
+			async ({ signal }) => {
+				const aborted = Promise.withResolvers<void>();
+				signal.addEventListener("abort", () => aborted.resolve(), { once: true });
+				await aborted.promise;
+				bodyAborted = true;
+				return "interrupted";
+			},
+			{ ownerId: "Main" },
+		);
+
+		await expect(
+			harness.agent.extMethod("_session/async_task/stop", { sessionId: created.sessionId, asyncTaskId: jobId }),
+		).resolves.toEqual({ stopped: true });
+		// The stop response resolves only after the client has the terminal state.
+		expect(asyncTaskUpdates(harness).at(-1)).toEqual({
+			sessionUpdate: "async_task_state_update",
+			asyncTaskId: jobId,
+			state: "stopped",
+		});
+		await expect(
+			harness.agent.extMethod("_session/async_task/stop", { sessionId: created.sessionId, asyncTaskId: jobId }),
+		).resolves.toEqual({ stopped: false });
+		await manager.waitForAll();
+		await Bun.sleep(0);
+		expect(
+			asyncTaskUpdates(harness).filter(update => update.sessionUpdate === "async_task_state_update"),
+		).toHaveLength(1);
+		expect(bodyAborted).toBe(true);
+
+		await expect(
+			harness.agent.extMethod("_session/async_task/stop", { sessionId: created.sessionId, asyncTaskId: " " }),
+		).rejects.toThrow("asyncTaskId");
+		harness.abortController.abort();
+	});
+
+	it("leaves task-type jobs to the subagent relay", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		manager.register("task", "explore repo", async () => "found", { ownerId: "Main" });
+		await manager.waitForAll();
+		await Bun.sleep(0);
+
+		expect(asyncTaskUpdates(harness)).toEqual([]);
+		harness.abortController.abort();
+	});
+
+	it("throttles progress to the latest line and flushes it before the terminal state", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const gate = Promise.withResolvers<string>();
+
+		const jobId = manager.register(
+			"bash",
+			"build",
+			async ({ reportProgress }) => {
+				// Real bodies await setup first; progress reported before
+				// register() returns precedes the announce and is dropped.
+				await Promise.resolve();
+				await reportProgress("step 1\n");
+				await reportProgress("step 1\nstep 2");
+				await reportProgress("step 1\nstep 2\nstep 3\n\n");
+				return await gate.promise;
+			},
+			{ ownerId: "Main" },
+		);
+		gate.resolve("built");
+		await pollUntil(() =>
+			asyncTaskUpdates(harness).some(update => update.sessionUpdate === "async_task_state_update"),
+		);
+
+		expect(
+			asyncTaskUpdates(harness).map(update => [update.sessionUpdate, "summary" in update && update.summary]),
+		).toEqual([
+			["async_task_spawned", false],
+			["async_task_progress", "step 1"],
+			// "step 2" was superseded inside the throttle window.
+			["async_task_progress", "step 3"],
+			["async_task_state_update", "built"],
+		]);
+		expect(asyncTaskUpdates(harness).every(update => "asyncTaskId" in update && update.asyncTaskId === jobId)).toBe(
+			true,
+		);
+		harness.abortController.abort();
+	});
+
+	it("marks the originating bash tool_call_update as backgrounded", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const gate = Promise.withResolvers<string>();
+
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			manager.register("bash", "npm run dev", () => gate.promise, { ownerId: "Main", toolCallId: "call-bg" });
+			for (const listener of session.listeners()) {
+				for (const toolCallId of ["call-bg", "call-fg"]) {
+					listener({
+						type: "tool_execution_end",
+						toolCallId,
+						toolName: "bash",
+						isError: false,
+						result: { content: [{ type: "text", text: "started" }], details: {} },
+					} as AgentSessionEvent);
+				}
+				listener({ type: "agent_end", messages: [] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		await harness.agent.prompt({
+			sessionId: created.sessionId,
+			messageId: "00000000-0000-4000-8000-000000000071",
+			prompt: [{ type: "text", text: "start the dev server" }],
+		} as PromptRequest);
+
+		const toolUpdates = harness.updates
+			.map(notification => notification.update)
+			.filter(update => update.sessionUpdate === "tool_call_update");
+		expect(toolUpdates.find(update => update.toolCallId === "call-bg")?._meta).toEqual(
+			expect.objectContaining({ jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } } }),
+		);
+		expect(toolUpdates.find(update => update.toolCallId === "call-fg")?._meta?.jetbrains).toBeUndefined();
+		gate.resolve("stopped");
+		harness.abortController.abort();
+	});
+
+	it("answers { stopped: false } for an unknown session instead of failing the request", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		// A client may race a stop against session/close; the reference agent
+		// treats a missing session as "nothing to stop", not as an error.
+		await expect(
+			harness.agent.extMethod("_session/async_task/stop", { sessionId: "sess-gone", asyncTaskId: "job-1" }),
+		).resolves.toEqual({ stopped: false });
+		harness.abortController.abort();
+	});
+
+	it("closes live tasks with `stopped` when their session is closed", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const gate = Promise.withResolvers<string>();
+		const jobId = manager.register("bash", "npm run dev", () => gate.promise, {
+			ownerId: "Main",
+			toolCallId: "call-dev",
+		});
+		await pollUntil(() => asyncTaskUpdates(harness).length === 1);
+
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+		await Bun.sleep(0);
+
+		// Without this edge the client would keep a running card for a session
+		// that no longer exists.
+		expect(asyncTaskUpdates(harness).at(-1)).toEqual({
+			sessionUpdate: "async_task_state_update",
+			asyncTaskId: jobId,
+			state: "stopped",
+			toolCallId: "call-dev",
+		});
+		gate.resolve("late");
+		await manager.waitForAll();
+		await Bun.sleep(0);
+		expect(
+			asyncTaskUpdates(harness).filter(update => update.sessionUpdate === "async_task_state_update"),
+		).toHaveLength(1);
 		harness.abortController.abort();
 	});
 });
