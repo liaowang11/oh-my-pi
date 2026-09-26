@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, test, vi } from "bun:test";
 import { scheduler } from "node:timers/promises";
 import type { ImageContent } from "@oh-my-pi/pi-ai";
-import { AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { type AsyncJobChangeEvent, AsyncJobError, AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 
 async function waitForJobEviction(manager: AsyncJobManager, jobId: string): Promise<void> {
 	const deadline = Date.now() + 2_000;
@@ -1008,5 +1008,82 @@ describe("AsyncJobManager", () => {
 		manager.cancelAll({ ownerId: "Sub" });
 		await expect(reap).resolves.toBe(true);
 		expect(manager.getJob("hung-1")?.status).toBe("cancelled");
+	});
+});
+
+describe("AsyncJobManager.onJobChange", () => {
+	afterEach(() => {
+		vi.restoreAllMocks();
+	});
+
+	function record(manager: AsyncJobManager): Array<[AsyncJobChangeEvent["kind"], string, boolean]> {
+		const events: Array<[AsyncJobChangeEvent["kind"], string, boolean]> = [];
+		manager.onJobChange(event => events.push([event.kind, event.job.status, event.job.foreground === true]));
+		return events;
+	}
+
+	test("a foreground job surfaces as backgrounded only once promoted, then settles", async () => {
+		const manager = new AsyncJobManager({});
+		const events = record(manager);
+		const gate = Promise.withResolvers<string>();
+		const id = manager.register("bash", "sleep", () => gate.promise, { ownerId: "Main", foreground: true });
+
+		expect(events).toEqual([["registered", "running", true]]);
+		manager.backgroundJob(id);
+		gate.resolve("done");
+		await manager.waitForAll();
+
+		expect(events).toEqual([
+			["registered", "running", true],
+			["backgrounded", "running", false],
+			["settled", "completed", false],
+		]);
+		await manager.dispose({ timeoutMs: 0 });
+	});
+
+	test("a foreground job finished in the foreground is released and never backgrounded", async () => {
+		const manager = new AsyncJobManager({});
+		const events = record(manager);
+		const id = manager.register("bash", "echo", async () => "done", { ownerId: "Main", foreground: true });
+		await manager.waitForAll();
+		manager.releaseForegroundJob(id);
+
+		expect(events.map(([kind]) => kind)).toEqual(["registered", "settled", "released"]);
+		expect(manager.getJob(id)).toBeUndefined();
+		await manager.dispose({ timeoutMs: 0 });
+	});
+
+	test("cancel() reports the stop synchronously, before the body settles", async () => {
+		const manager = new AsyncJobManager({});
+		const events = record(manager);
+		const gate = Promise.withResolvers<string>();
+		const id = manager.register("bash", "hang", () => gate.promise, { ownerId: "Main" });
+
+		expect(manager.cancel(id)).toBeTrue();
+		expect(events.at(-1)).toEqual(["cancelled", "cancelled", false]);
+
+		gate.resolve("late output");
+		await manager.waitForAll();
+		expect(events.map(([kind, status]) => [kind, status])).toEqual([
+			["registered", "running"],
+			["cancelled", "cancelled"],
+			["settled", "cancelled"],
+		]);
+		await manager.dispose({ timeoutMs: 0 });
+	});
+
+	test("a throwing listener neither blocks other listeners nor breaks the job", async () => {
+		const manager = new AsyncJobManager({});
+		manager.onJobChange(() => {
+			throw new Error("listener boom");
+		});
+		const events = record(manager);
+		const id = manager.register("bash", "echo", async () => "done", { ownerId: "Main" });
+		await manager.waitForAll();
+
+		expect(events.map(([kind]) => kind)).toEqual(["registered", "settled"]);
+		expect(manager.getJob(id)?.status).toBe("completed");
+		expect(manager.getJob(id)?.resultText).toBe("done");
+		await manager.dispose({ timeoutMs: 0 });
 	});
 });
