@@ -112,6 +112,19 @@ import {
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
 import { AcpSubagentRelay, clientSupportsSubagents, subagentSessionId } from "./acp-subagents";
+import {
+	AIR_ASYNC_TASKS_CAPABILITY,
+	airCapabilityMeta,
+	clientSupportsAsyncTasks,
+	isAirClient,
+	withAirMeta,
+} from "./acp-air";
+import {
+	AcpAsyncTaskRelay,
+	ASYNC_TASK_STOP_METHOD,
+	type AsyncTaskStopRequest,
+	parseAsyncTaskStopRequest,
+} from "./acp-async-tasks";
 import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
@@ -402,6 +415,10 @@ type ManagedSessionRecord = {
 	// Relays task-tool subagents as ACP subagents-RFD child sessions; set only when the
 	// client advertises `subagents`. Released in `#disposeSessionRecord`.
 	subagentRelay: AcpSubagentRelay | undefined;
+	// Relays the session's background bash/eval jobs as AIR `async_task_*`
+	// updates; set only when the client advertises AIR `asyncTasks` and the
+	// session owns a job manager. Released in `#disposeSessionRecord`.
+	asyncTaskRelay: AcpAsyncTaskRelay | undefined;
 	// Pushes `session_info_update` as soon as a title resolves, instead of only
 	// at bootstrap/end-of-turn: auto title generation runs async and can settle
 	// after `agent_end` already fired, or after a turn with no `agent_end` at
@@ -960,11 +977,14 @@ export class AcpAgent implements Agent {
 					close: {},
 				},
 			},
-			// Top-level `_meta` (sibling of `agentCapabilities`) is where
-			// claude-agent-acp and codex-acp advertise steering; clients such as
-			// agent-shell gate `_session/steering` on it.
+			// Top-level `_meta`, sibling of `agentCapabilities`: the shared ACP
+			// steering extension advertises itself here, so a client learns it may
+			// send `_session/steering` without probing the method first. The
+			// JetBrains AIR extension advertises its capabilities alongside, to
+			// an AIR client only.
 			_meta: {
 				steering: { supported: true },
+				...(isAirClient(params.clientCapabilities) ? airCapabilityMeta(AIR_ASYNC_TASKS_CAPABILITY) : {}),
 			},
 		};
 	}
@@ -1544,6 +1564,8 @@ export class AcpAgent implements Agent {
 
 	async extMethod(method: string, params: { [key: string]: unknown }): Promise<{ [key: string]: unknown }> {
 		switch (method) {
+			case ASYNC_TASK_STOP_METHOD:
+				return await this.#stopAsyncTask(parseAsyncTaskStopRequest(params));
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
@@ -1829,9 +1851,22 @@ export class AcpAgent implements Agent {
 			record.subagentRelay = new AcpSubagentRelay({
 				sessionId: session.sessionId,
 				eventBus,
-				send: notification => this.#connection.sessionUpdate(notification),
+				// A child's tool call that started a background job is stamped too.
+				send: notification => this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification)),
 				getCwd: () => session.sessionManager.getCwd(),
 				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
+			});
+		}
+		// Secondary in-process sessions own no job manager (issue #1923): no relay.
+		const asyncJobManager = session.asyncJobManager;
+		if (asyncJobManager && clientSupportsAsyncTasks(this.#clientCapabilities)) {
+			record.asyncTaskRelay = new AcpAsyncTaskRelay({
+				sessionId: session.sessionId,
+				manager: asyncJobManager,
+				ownerId: session.getAgentId(),
+				// A job a subagent started goes to the subagent's child session.
+				routeOf: ownerId => record.subagentRelay?.sessionIdOf(ownerId),
+				send: notification => this.#connection.sessionUpdate(notification),
 			});
 		}
 		// `record.lifetimeUnsubscribe` is installed in `#scheduleBootstrapUpdates`
@@ -1878,6 +1913,7 @@ export class AcpAgent implements Agent {
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
 			subagentRelay: undefined,
+			asyncTaskRelay: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
@@ -2120,7 +2156,7 @@ export class AcpAgent implements Agent {
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {
-			const delivery = this.#connection.sessionUpdate(notification);
+			const delivery = this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification));
 			onDelivery?.(delivery);
 			await delivery;
 		}
@@ -2128,6 +2164,49 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	/**
+	 * Marks the `tool_call_update` of a tool call whose job was backgrounded with
+	 * AIR `asyncTasks.backgrounded`, so the client links the card to its task.
+	 * Only updates forwarded after the job is announced carry it: an `async` or
+	 * zero-wait job is announced as it registers, so its tool call's final update
+	 * is stamped (the spawn itself rides the relay's own queue, so it may reach
+	 * the client just before or after that update); an auto-backgrounded job is
+	 * announced when the foreground wait gives up, so updates streamed during
+	 * that wait are not stamped, while the final one is.
+	 */
+	#stampBackgroundedToolCall(record: ManagedSessionRecord, notification: SessionNotification): SessionNotification {
+		const { update } = notification;
+		if (
+			update.sessionUpdate !== "tool_call_update" ||
+			!record.asyncTaskRelay?.isBackgroundedToolCall(update.toolCallId)
+		) {
+			return notification;
+		}
+		return {
+			...notification,
+			update: { ...update, _meta: withAirMeta(update._meta, AIR_ASYNC_TASKS_CAPABILITY, { backgrounded: true }) },
+		};
+	}
+
+	/**
+	 * `_session/async_task/stop`: cancel one announced background job without
+	 * touching the prompt turn. Resolves after the `stopped` state update is
+	 * delivered. Only tasks this session announced (and not yet finished) are
+	 * stoppable, including one a subagent started (announced on the child's
+	 * session, stopped through the root session as in claude-agent-acp);
+	 * anything else — including an unknown or already closed session —
+	 * answers `{ stopped: false }`.
+	 */
+	async #stopAsyncTask(params: AsyncTaskStopRequest): Promise<{ stopped: boolean }> {
+		const record = this.#sessions.get(params.sessionId);
+		const relay = record?.asyncTaskRelay;
+		const manager = record?.session.asyncJobManager;
+		if (!record || !relay || !manager || !relay.canStop(params.asyncTaskId)) return { stopped: false };
+		const stopped = manager.cancel(params.asyncTaskId, { ownerId: relay.ownerOf(params.asyncTaskId) });
+		await relay.flush();
+		return { stopped };
 	}
 
 	async #finishGoalModeAfterTurn(record: ManagedSessionRecord): Promise<void> {
@@ -3778,6 +3857,7 @@ export class AcpAgent implements Agent {
 		record.lifetimeUnsubscribe?.();
 		record.titleUnsubscribe?.();
 		record.subagentRelay?.dispose();
+		record.asyncTaskRelay?.dispose();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

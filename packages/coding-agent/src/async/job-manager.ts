@@ -128,6 +128,10 @@ export interface AsyncJob {
 	 * the foreground hands it to {@link AsyncJobManager.releaseForegroundJob}.
 	 */
 	foreground?: boolean;
+	/** Id of the tool call that started the job, when one did (bash/eval). */
+	toolCallId?: string;
+	/** Durable capture of the job's output, once the body confirmed the file exists. */
+	outputFilePath?: string;
 	/**
 	 * Disposal closure for a detached spawn's temporary artifacts directory
 	 * that `runStructuredSubagent()` retained past completion (so a
@@ -153,6 +157,29 @@ export interface AsyncJobProcess {
 	/** Copies of the bytes crossing the command's pipes, kept with the job row (`proc://<id>/streams`). */
 	readonly streams?: PipeStreams;
 }
+
+/**
+ * Lifecycle notification for {@link AsyncJobManager.onJobChange} observers.
+ *
+ * - `registered`: the job row exists (it may still be foreground-backed).
+ * - `backgrounded`: a foreground-backed job was promoted by `backgroundJob()`.
+ * - `progress`: the body reported progress; `text` carries it.
+ * - `settled`: the body finished and the terminal status/result is recorded
+ *   (status reads `cancelled` when the body settles after `cancel()`).
+ * - `cancelled`: `cancel()` flipped a running job's status.
+ * - `released`: a foreground-backed job was released and will never surface
+ *   as a background job.
+ * - `output_file`: the body reported where its output is captured
+ *   (`job.outputFilePath`); fired only when the path changes.
+ */
+export type AsyncJobChangeEvent = {
+	kind: "registered" | "backgrounded" | "progress" | "settled" | "cancelled" | "released" | "output_file";
+	job: AsyncJob;
+	text?: string;
+};
+
+/** Observer for {@link AsyncJobChangeEvent}s. */
+export type AsyncJobChangeListener = (event: AsyncJobChangeEvent) => void;
 
 /** Delivery callback for a settled job's result text. */
 export type AsyncJobDeliverySink = (jobId: string, text: string, job?: AsyncJob) => void | Promise<void>;
@@ -244,6 +271,8 @@ export interface AsyncJobRegisterOptions {
 	process?: AsyncJobProcess;
 	/** See {@link AsyncJob.widgetInputs}. */
 	widgetInputs?: JobWidgetInputs;
+	/** Tool call that started the job; see {@link AsyncJob.toolCallId}. */
+	toolCallId?: string;
 }
 
 /**
@@ -282,6 +311,7 @@ export class AsyncJobManager {
 	readonly #consumedJobResults = new Set<string>();
 	readonly #evictionTimers = new Map<string, NodeJS.Timeout>();
 	readonly #releasedForegroundJobs = new Set<string>();
+	readonly #changeListeners = new Set<AsyncJobChangeListener>();
 	#nextAutoId = 1;
 	readonly #deliverySinks = new Map<string, AsyncJobDeliverySink>();
 	readonly #onJobComplete: AsyncJobManagerOptions["onJobComplete"];
@@ -327,6 +357,34 @@ export class AsyncJobManager {
 		);
 	}
 
+	/**
+	 * Observe job lifecycle changes (see {@link AsyncJobChangeEvent}). Listeners
+	 * run synchronously at the change site; a throwing listener is logged and
+	 * never affects the job or other listeners. Returns an unsubscribe function.
+	 */
+	onJobChange(listener: AsyncJobChangeListener): () => void {
+		this.#changeListeners.add(listener);
+		return () => {
+			this.#changeListeners.delete(listener);
+		};
+	}
+
+	#emitJobChange(kind: AsyncJobChangeEvent["kind"], job: AsyncJob, text?: string): void {
+		if (this.#changeListeners.size === 0) return;
+		const event: AsyncJobChangeEvent = text === undefined ? { kind, job } : { kind, job, text };
+		for (const listener of this.#changeListeners) {
+			try {
+				listener(event);
+			} catch (error) {
+				logger.warn("Async job change listener failed", {
+					jobId: job.id,
+					kind,
+					error: error instanceof Error ? error.message : String(error),
+				});
+			}
+		}
+	}
+
 	/** Effective running-job cap (at least 1), resolved at check time. */
 	get #maxRunningJobs(): number {
 		const option = this.#maxRunningJobsOption;
@@ -354,6 +412,11 @@ export class AsyncJobManager {
 			reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
 			/** Clear the queued flag once the job actually starts executing. */
 			markRunning: () => void;
+			/**
+			 * Record the file that durably captures this job's output. Call it only
+			 * once the file is known to exist; observers hand the path to clients.
+			 */
+			reportOutputFile: (path: string) => void;
 		}) => Promise<string | AsyncJobRunResult>,
 		options?: AsyncJobRegisterOptions,
 	): string {
@@ -392,11 +455,13 @@ export class AsyncJobManager {
 			widgetInputs: options?.widgetInputs,
 			queued: options?.queued === true,
 			...(options?.foreground ? { foreground: true } : {}),
+			...(options?.toolCallId ? { toolCallId: options.toolCallId } : {}),
 		};
 
 		const reportProgress = async (text: string, details?: AsyncJobDetails): Promise<void> => {
 			job.progressText = text;
 			if (details) job.latestDetails = details;
+			this.#emitJobChange("progress", job, text);
 			if (!options?.onProgress) return;
 			try {
 				await options.onProgress(text, details);
@@ -415,6 +480,11 @@ export class AsyncJobManager {
 					reportProgress,
 					markRunning: () => {
 						job.queued = false;
+					},
+					reportOutputFile: (path: string) => {
+						if (!path || job.outputFilePath === path) return;
+						job.outputFilePath = path;
+						this.#emitJobChange("output_file", job);
 					},
 				});
 				job.endTime = Date.now();
@@ -438,11 +508,18 @@ export class AsyncJobManager {
 					this.#enqueueDelivery(id, errorText);
 				}
 			}
+			this.#emitJobChange("settled", job);
 			if (this.#releasedForegroundJobs.has(id)) this.#discardForegroundJob(id);
 			else this.#scheduleEviction(id);
 		})();
 
 		this.#jobs.set(id, job);
+		// Fired after the row is stored. The body already started above, so a
+		// body that reports progress before its first await emits `progress`
+		// ahead of `registered`; observers must tolerate that. `settled` follows
+		// `registered` unless `run` throws synchronously (not via a rejection),
+		// so observers should read the job's status at `registered` too.
+		this.#emitJobChange("registered", job);
 		return id;
 	}
 
@@ -491,6 +568,7 @@ export class AsyncJobManager {
 		if (job.status !== "running") return false;
 		job.status = "cancelled";
 		job.abortController.abort();
+		this.#emitJobChange("cancelled", job);
 		return true;
 	}
 
@@ -527,6 +605,7 @@ export class AsyncJobManager {
 		if (!job.foreground) return true;
 		job.foreground = undefined;
 		this.#suppressedDeliveries.delete(jobId);
+		this.#emitJobChange("backgrounded", job);
 		if (job.status === "completed" || job.status === "failed") {
 			this.#enqueueDelivery(jobId, job.status === "completed" ? (job.resultText ?? "") : (job.errorText ?? ""));
 		}
@@ -541,6 +620,7 @@ export class AsyncJobManager {
 	releaseForegroundJob(jobId: string): void {
 		const job = this.#jobs.get(jobId);
 		if (!job?.foreground) return;
+		this.#emitJobChange("released", job);
 		if (job.endTime !== undefined) this.#discardForegroundJob(jobId);
 		else this.#releasedForegroundJobs.add(jobId);
 	}
@@ -655,6 +735,7 @@ export class AsyncJobManager {
 			if (job.status !== "running") continue;
 			job.status = "cancelled";
 			job.abortController.abort(reason);
+			this.#emitJobChange("cancelled", job);
 		}
 	}
 
@@ -842,6 +923,9 @@ export class AsyncJobManager {
 		this.#deliverySinks.clear();
 		this.widgets?.dispose();
 		this.widgets = undefined;
+		// Cleared last, so observers still subscribed at shutdown see the
+		// cancels and settles above.
+		this.#changeListeners.clear();
 		return jobsSettled && drained;
 	}
 

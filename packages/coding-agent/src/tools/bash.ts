@@ -860,6 +860,8 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		sessionEnv: Record<string, string>;
 		/** The model's `i` intent on the call, for the job's widget author. */
 		intent?: string;
+		/** Tool call that started the job; recorded on the job row. */
+		toolCallId: string;
 	}): ManagedBashJobHandle {
 		const manager = this.session.asyncJobManager;
 		if (!manager) {
@@ -884,7 +886,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, reportOutputFile }) => {
 				// Records the job's progress and shows it on the call's card: plain output
 				// while the call still waits on it, the job frame (`details.async`) once
 				// backgrounded, so the card keeps filling and settles with the job.
@@ -934,6 +936,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						outputTap.close();
 					});
 					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
+					// The sink opens the artifact lazily (spill/overflow only) and reports
+					// its id only once the file was written without error, so this is the
+					// first moment the path is known to exist on disk.
+					if (result.artifactId && artifactPath) reportOutputFile(artifactPath);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						requestedTimeoutSec: options.requestedTimeoutSec,
@@ -981,6 +987,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 					sources: () => [outputTap, ...pipeSources.list()],
 					brief: () => ({ kind: "bash", command: options.command, intent: options.intent }),
 				},
+				toolCallId: options.toolCallId,
 			},
 		);
 
@@ -1204,6 +1211,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				sessionId,
 				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
+				toolCallId,
 			});
 			return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
 				requestedTimeoutSec,
@@ -1247,6 +1255,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 				sessionId,
 				sessionEnv,
 				intent: this.session.getToolCallIntent?.(toolCallId),
+				toolCallId,
 			});
 			if (startBackgrounded) {
 				return this.#buildBackgroundStartResult(job.jobId, "", timeoutSec, {
