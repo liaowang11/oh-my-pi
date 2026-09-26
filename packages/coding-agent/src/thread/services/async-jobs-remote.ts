@@ -248,6 +248,7 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 					signal: fromWireSignal(ctx.signal),
 					reportProgress: ctx.reportProgress,
 					markRunning: () => ignoreSettle(ctx.markRunning()),
+					reportOutputFile: path => ignoreSettle(ctx.reportOutputFile(path)),
 				});
 			} finally {
 				// Sent ahead of the result, so main's final widget read sees the job's last output.
@@ -263,6 +264,7 @@ export class RemoteAsyncJobManager implements AsyncJobManagerApi {
 			queued: options?.queued,
 			foreground: options?.foreground,
 			intent: options?.intent,
+			toolCallId: options?.toolCallId,
 			feed: feed?.wire(),
 		};
 		const id = this.#remote.callSync("register", type, label, wired, wireOptions);

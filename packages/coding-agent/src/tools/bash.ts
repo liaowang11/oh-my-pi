@@ -1074,7 +1074,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 		const jobId = manager.register(
 			"bash",
 			label,
-			async ({ jobId, signal: runSignal, reportProgress }) => {
+			async ({ jobId, signal: runSignal, reportProgress, reportOutputFile }) => {
 				// Records the job's progress and shows it on the call's card: plain output
 				// while the call still waits on it, the job frame (`details.async`) once
 				// backgrounded, so the card keeps filling and settles with the job.
@@ -1136,6 +1136,10 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						outputTap.close();
 					});
 					if (result.artifactError) latestProgressDetails = { meta: { artifactError: result.artifactError } };
+					// The sink opens the artifact lazily (spill/overflow only) and reports
+					// its id only once the file was written without error, so this is the
+					// first moment the path is known to exist on disk.
+					if (result.artifactId && artifactPath) reportOutputFile(artifactPath);
 					const wallTimeMs = performance.now() - wallTimeStart;
 					const finalResult = await this.#buildCompletedResult(result, options.timeoutSec, {
 						command: options.command,
@@ -1193,6 +1197,7 @@ export class BashTool implements AgentTool<BashToolSchema, BashToolDetails> {
 						intent: options.intent,
 					}),
 				},
+				toolCallId: options.toolCallId,
 			},
 		);
 

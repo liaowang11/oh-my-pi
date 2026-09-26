@@ -94,6 +94,7 @@ export interface WireRegisterOptions {
 	readonly queued?: boolean;
 	readonly foreground?: boolean;
 	readonly intent?: string;
+	readonly toolCallId?: string;
 	readonly feed?: WireJobFeed;
 }
 
@@ -104,6 +105,7 @@ export interface WireRunContext {
 	readonly signal: AbortSignal;
 	readonly reportProgress: (text: string, details?: AsyncJobDetails) => Promise<void>;
 	readonly markRunning: WireCallback<[]>;
+	readonly reportOutputFile: WireCallback<[path: string]>;
 	/** Present for jobs registered with a feed: applies the body's final delta before its result lands. */
 	readonly pushFeed?: WireCallback<[delta: JobFeedDelta]>;
 }
