@@ -767,7 +767,10 @@ export class AcpAgent implements Agent {
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
 		}
-		const sessions = await this.#listStoredSessions(params.cwd ?? undefined);
+		// Picker view: untitled 0-turn stubs are hidden but still loadable by id.
+		const sessions = (
+			params.cwd ? await SessionManager.listForPicker(params.cwd) : await SessionManager.listAllForPicker()
+		).sort((left, right) => right.modified.getTime() - left.modified.getTime());
 		const offset = this.#parseCursor(params.cursor ?? undefined);
 		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
 		const nextOffset = offset + paged.length;
@@ -1372,12 +1375,8 @@ export class AcpAgent implements Agent {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
 		);
-		try {
-			await session.sessionManager.ensureOnDisk();
-		} catch (error) {
-			await this.#disposeStandaloneSession(session);
-			throw error;
-		}
+		// The session file stays lazy (written with the first assistant message),
+		// so a session/new that is never prompted leaves nothing on disk.
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
 	}
 
@@ -1579,6 +1578,8 @@ export class AcpAgent implements Agent {
 			if (isPromptTurnInFlight(loaded.promptTurn)) {
 				throw new Error(`ACP session fork is unavailable while a prompt is in progress: ${sessionId}`);
 			}
+			// A live session may not be written yet; forking needs a source file.
+			await loaded.session.sessionManager.ensureOnDisk();
 			await loaded.session.sessionManager.flush();
 			const sessionPath = loaded.session.sessionManager.getSessionFile();
 			if (!sessionPath) {
