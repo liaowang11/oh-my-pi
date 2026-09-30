@@ -890,7 +890,7 @@ export class SessionManager {
 	/**
 	 * Armed only when this manager observed a draft sidecar lifecycle that
 	 * materialized an otherwise metadata-only session file. Explicit
-	 * ensureOnDisk() callers (ACP session/new, handoff) must survive close().
+	 * ensureOnDisk() callers (ACP fork sources, handoff) must survive close().
 	 */
 	#draftOnlySessionCleanupArmed = false;
 
@@ -2629,8 +2629,8 @@ export class SessionManager {
 	}
 
 	/**
-	 * Force the session onto disk even with no assistant message yet (ACP
-	 * session/new must create a discoverable file immediately).
+	 * Force the session onto disk even with no assistant message yet (e.g. an
+	 * ACP fork source that has not been answered yet).
 	 */
 	async ensureOnDisk(): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
@@ -2787,7 +2787,7 @@ export class SessionManager {
 	/**
 	 * Drop only session files that this manager saw materialized for a draft and
 	 * that still contain no durable conversation or extension state. Explicit
-	 * ensureOnDisk() records (ACP session/new, handoff) stay resumable.
+	 * ensureOnDisk() records (ACP fork sources, handoff) stay resumable.
 	 */
 	async #dropIfEmptyAndNoDraft(): Promise<void> {
 		if (!this.#draftOnlySessionCleanupArmed) return;

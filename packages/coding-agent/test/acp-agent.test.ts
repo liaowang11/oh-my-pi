@@ -706,6 +706,48 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("writes no session file until the first prompt produces an assistant reply", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const listedIds = async () =>
+			(await harness.agent.listSessions({ cwd: harness.cwdA })).sessions.map(session => session.sessionId);
+
+		expect(harness.findSession(created.sessionId)?.sessionManager.isSessionOnDisk()).toBe(false);
+		expect(await listedIds()).not.toContain(created.sessionId);
+
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "ping" }] });
+
+		expect(harness.findSession(created.sessionId)?.sessionManager.isSessionOnDisk()).toBe(true);
+		expect(await listedIds()).toContain(created.sessionId);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("lists stored sessions without untitled empty stubs", async () => {
+		const harness = await createHarness();
+		const stub = new FakeAgentSession(harness.cwdA);
+		const titled = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stub, titled);
+		await stub.sessionManager.ensureOnDisk();
+		await titled.sessionManager.setSessionName("Named but unprompted", "user");
+		await titled.sessionManager.ensureOnDisk();
+		await stub.sessionManager.flush();
+		await titled.sessionManager.flush();
+
+		const listed = (await harness.agent.listSessions({ cwd: harness.cwdA })).sessions.map(
+			session => session.sessionId,
+		);
+		expect(listed).toContain(titled.sessionId);
+		expect(listed).not.toContain(stub.sessionId);
+
+		// Hidden from the listing, but still loadable by id.
+		await harness.agent.loadSession({ sessionId: stub.sessionId, cwd: harness.cwdA, mcpServers: [] });
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("advertises plan mode and emits schema-valid mode updates", async () => {
 		const harness = await createHarness();
 		cfgPlanEnabled.set(Settings.instance, true);
