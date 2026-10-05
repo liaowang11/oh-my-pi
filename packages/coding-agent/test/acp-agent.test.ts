@@ -7,6 +7,8 @@ import { Database } from "bun:sqlite";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
+import { cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -237,9 +239,16 @@ class FakeAgentSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; authStorage?: AuthStorage } {
+	scopedModels: Array<{ model: Model }> = [];
+
+	get modelRegistry(): {
+		getApiKey: (model: Model) => Promise<string>;
+		hasConfiguredAuth: (model: Model) => boolean;
+		authStorage?: AuthStorage;
+	} {
 		return {
 			getApiKey: async (_model: Model) => "test-key",
+			hasConfiguredAuth: (_model: Model) => true,
 			...(this.authStorage ? { authStorage: this.authStorage } : {}),
 		};
 	}
@@ -478,8 +487,31 @@ class FakeAgentSession {
 		return this.fastMode;
 	}
 
+	ultrafast = false;
 	isUltrafastModeEnabled(): boolean {
-		return false;
+		return this.ultrafast;
+	}
+
+	setUltrafastMode(enabled: boolean): boolean {
+		if (enabled && this.model?.provider !== "openai") return false;
+		this.ultrafast = enabled;
+		if (enabled) this.fastMode = true;
+		return true;
+	}
+
+	advisorEnabled = false;
+	advisorHasModel = true;
+	isAdvisorEnabled(): boolean {
+		return this.advisorEnabled;
+	}
+
+	setAdvisorEnabled(enabled: boolean): boolean {
+		this.advisorEnabled = enabled;
+		return enabled && this.advisorHasModel;
+	}
+
+	getAdvisorStats(): { configured: boolean; active: boolean } {
+		return { configured: this.advisorEnabled, active: this.advisorEnabled && this.advisorHasModel };
 	}
 
 	setForcedToolChoice(toolName: string): void {
@@ -793,6 +825,156 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("exposes fast mode and advisor as config options", async () => {
+		const harness = await createHarness();
+		type Option = { id: string; type: string; currentValue?: unknown; options?: Array<{ value: string }> };
+		const find = (options: unknown[] | null | undefined, id: string) =>
+			(options as Option[] | undefined)?.find(option => option.id === id);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const session = harness.findSession(created.sessionId)!;
+
+		// Anthropic model: on/off only, no ultra.
+		const fast = find(created.configOptions, "fast_mode");
+		expect(fast?.currentValue).toBe("off");
+		expect(fast?.options?.map(option => option.value)).toEqual(["off", "on"]);
+		const set = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "fast_mode",
+			value: "on",
+		});
+		expect(session.fastMode).toBe(true);
+		expect(find(set.configOptions, "fast_mode")?.currentValue).toBe("on");
+		await expect(
+			harness.agent.setSessionConfigOption({ sessionId: created.sessionId, configId: "fast_mode", value: "ultra" }),
+		).rejects.toThrow("Ultrafast is unavailable");
+
+		// OpenAI model: ultra appears and is selectable.
+		await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+		});
+		const ultra = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "fast_mode",
+			value: "ultra",
+		});
+		expect(find(ultra.configOptions, "fast_mode")?.options?.map(option => option.value)).toEqual([
+			"off",
+			"on",
+			"ultra",
+		]);
+		expect(find(ultra.configOptions, "fast_mode")?.currentValue).toBe("ultra");
+
+		// No boolean capability: advisor is an on/off select.
+		const advisor = find(created.configOptions, "advisor");
+		expect(advisor?.type).toBe("select");
+		expect(advisor?.currentValue).toBe("off");
+		const on = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "advisor",
+			value: "on",
+		});
+		expect(session.advisorEnabled).toBe(true);
+		expect(find(on.configOptions, "advisor")?.currentValue).toBe("on");
+		await expect(
+			harness.agent.setSessionConfigOption({ sessionId: created.sessionId, configId: "advisor", value: true }),
+		).rejects.toThrow("Unsupported boolean ACP config option");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("exposes advisor as a boolean option when the client opts in", async () => {
+		const harness = await createHarness({ clientCapabilities: { session: { configOptions: { boolean: {} } } } });
+		type Option = { id: string; type: string; currentValue?: unknown };
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const session = harness.findSession(created.sessionId)!;
+		const advisor = (created.configOptions as Option[] | undefined)?.find(option => option.id === "advisor");
+		expect(advisor).toEqual(expect.objectContaining({ type: "boolean", currentValue: false }));
+
+		const set = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "advisor",
+			value: true,
+		});
+		expect(session.advisorEnabled).toBe(true);
+		expect((set.configOptions as Option[]).find(option => option.id === "advisor")?.currentValue).toBe(true);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("switches saved model presets for the session only", async () => {
+		const harness = await createHarness();
+		type SelectOption = { id: string; currentValue?: unknown; options?: Array<{ value: string }> };
+		const presetOption = (options: unknown[] | null | undefined) =>
+			(options as SelectOption[] | undefined)?.find(option => option.id === "model_preset");
+		const claude = `${TEST_MODELS[0]!.provider}/${TEST_MODELS[0]!.id}`;
+		const gpt = `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`;
+
+		const bare = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expect(presetOption(bare.configOptions)).toBeUndefined();
+
+		cfgModelPresets.set(Settings.instance, {
+			fast: { modelRoles: { default: gpt, smol: claude } },
+			deep: { modelRoles: { default: claude, slow: gpt }, defaultThinkingLevel: Effort.High },
+		});
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const initial = presetOption(created.configOptions);
+		expect(initial?.currentValue).toBe("_custom");
+		expect(initial?.options?.map(option => option.value)).toEqual(["deep", "fast", "_custom"]);
+		const session = harness.findSession(created.sessionId)!;
+
+		const fast = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model_preset",
+			value: "fast",
+		});
+		expect(presetOption(fast.configOptions)?.currentValue).toBe("fast");
+		expect(presetOption(fast.configOptions)?.options?.map(option => option.value)).toEqual(["deep", "fast"]);
+		expect(session.model?.id).toBe(TEST_MODELS[1]!.id);
+		expect(Settings.instance.getModelRole("smol")).toBe(claude);
+		// Session-only: nothing reaches the persisted global layer.
+		expect(Settings.instance.getGlobalModelRole("smol")).toBeUndefined();
+
+		const deep = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model_preset",
+			value: "deep",
+		});
+		expect(presetOption(deep.configOptions)?.currentValue).toBe("deep");
+		expect(session.model?.id).toBe(TEST_MODELS[0]!.id);
+		expect(session.thinkingLevel).toBe("high");
+		expect(Settings.instance.getModelRole("slow")).toBe(gpt);
+		// Roles the new preset leaves out lose the previous preset's session override.
+		expect(Settings.instance.getModelRole("smol")).toBeUndefined();
+
+		// Diverging from the preset (another thinking level) shows Custom again.
+		const diverged = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "thinking",
+			value: "low",
+		});
+		expect(presetOption(diverged.configOptions)?.currentValue).toBe("_custom");
+
+		await expect(
+			harness.agent.setSessionConfigOption({
+				sessionId: created.sessionId,
+				configId: "model_preset",
+				value: "nope",
+			}),
+		).rejects.toThrow("Unknown ACP model preset: nope");
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

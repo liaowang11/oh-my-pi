@@ -1,7 +1,7 @@
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
-import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
+import { type AssistantMessage, type Model, serviceTierFamily, shouldSendServiceTier } from "@oh-my-pi/pi-ai";
 import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
@@ -46,6 +46,12 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
 import { disableProvider, enableProvider } from "../../capability";
+import {
+	applyModelPreset,
+	getModelPreset,
+	getModelPresetNames,
+	sessionMatchesModelPreset,
+} from "../../config/model-presets";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -119,6 +125,16 @@ const REFINE_OPTION = "Refine plan";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
+const MODEL_PRESET_CONFIG_ID = "model_preset";
+const FAST_MODE_CONFIG_ID = "fast_mode";
+const FAST_MODE_OFF = "off";
+const FAST_MODE_ON = "on";
+const FAST_MODE_ULTRA = "ultra";
+const ADVISOR_CONFIG_ID = "advisor";
+const TOGGLE_ON = "on";
+const TOGGLE_OFF = "off";
+/** Preset value shown when no saved preset matches. Preset names start with a letter, so never a name. */
+const MODEL_PRESET_CUSTOM = "_custom";
 const THINKING_OFF = "off";
 const SESSION_PAGE_SIZE = 50;
 const SPEECH_MODELS_LIST_METHOD = "speech.models.list";
@@ -880,6 +896,9 @@ export class AcpAgent implements Agent {
 	#connection: AgentSideConnection;
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
+	// Preset each session last switched to, so the preset select keeps showing
+	// it (not an earlier-named preset with the same roles) while it still matches.
+	readonly #appliedModelPresets = new WeakMap<AgentSession, string>();
 	#sessions = new Map<string, ManagedSessionRecord>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
@@ -1050,7 +1069,13 @@ export class AcpAgent implements Agent {
 	async setSessionConfigOption(params: SetSessionConfigOptionRequest): Promise<SetSessionConfigOptionResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
 		if (typeof params.value === "boolean") {
-			throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
+			// Only options advertised as `boolean` (when the client opted in) take one.
+			if (params.configId !== ADVISOR_CONFIG_ID || !this.#clientSupportsBooleanConfigOptions()) {
+				throw new Error(`Unsupported boolean ACP config option: ${params.configId}`);
+			}
+			record.session.setAdvisorEnabled(params.value);
+			await this.#pushConfigOptionUpdate(record);
+			return { configOptions: this.#buildConfigOptions(record.session) };
 		}
 
 		switch (params.configId) {
@@ -1062,6 +1087,15 @@ export class AcpAgent implements Agent {
 				break;
 			case THINKING_CONFIG_ID:
 				this.#setThinkingLevelById(record.session, params.value);
+				break;
+			case MODEL_PRESET_CONFIG_ID:
+				await this.#applyModelPresetById(record.session, params.value);
+				break;
+			case FAST_MODE_CONFIG_ID:
+				this.#setFastModeById(record.session, params.value);
+				break;
+			case ADVISOR_CONFIG_ID:
+				this.#setAdvisorById(record.session, params.value);
 				break;
 			default:
 				throw new Error(`Unknown ACP config option: ${params.configId}`);
@@ -2426,7 +2460,165 @@ export class AcpAgent implements Agent {
 			),
 			options: this.#buildThinkingOptions(session),
 		});
+		const fastOption = this.#buildFastModeOption(session);
+		if (fastOption) configOptions.push(fastOption);
+		const presetOption = this.#buildModelPresetOption(session);
+		if (presetOption) configOptions.push(presetOption);
+		configOptions.push(this.#buildAdvisorOption(session));
 		return configOptions;
+	}
+
+	#clientSupportsBooleanConfigOptions(): boolean {
+		return this.#clientCapabilities?.session?.configOptions?.boolean !== undefined;
+	}
+
+	/**
+	 * `/fast` for the active model's service-tier family: `off`/`on`, plus
+	 * `ultra` when the model offers the OpenAI `ultrafast` tier. Absent for
+	 * models with no service tier (nothing to toggle).
+	 */
+	#buildFastModeOption(session: AgentSession): SessionConfigOption | undefined {
+		const model = session.model;
+		if (!model || !serviceTierFamily(model)) return undefined;
+		const options = [
+			{ value: FAST_MODE_OFF, name: "Off", description: "Standard service" },
+			{ value: FAST_MODE_ON, name: "On", description: "Priority service tier" },
+		];
+		if (shouldSendServiceTier("ultrafast", model)) {
+			options.push({ value: FAST_MODE_ULTRA, name: "Ultra", description: "OpenAI ultrafast tier" });
+		}
+		const current = session.isUltrafastModeEnabled()
+			? FAST_MODE_ULTRA
+			: session.isFastModeEnabled()
+				? FAST_MODE_ON
+				: FAST_MODE_OFF;
+		return {
+			id: FAST_MODE_CONFIG_ID,
+			name: "Fast mode",
+			description: "Priority service for this model family in this session",
+			category: "model_config",
+			type: "select",
+			currentValue: current,
+			options,
+		};
+	}
+
+	#setFastModeById(session: AgentSession, value: string): void {
+		switch (value) {
+			case FAST_MODE_OFF:
+				session.setFastMode(false);
+				return;
+			case FAST_MODE_ON:
+				if (!session.setFastMode(true)) throw new Error("Fast mode is unavailable for the current model.");
+				return;
+			case FAST_MODE_ULTRA:
+				if (!session.setUltrafastMode(true)) throw new Error("Ultrafast is unavailable for the current model.");
+				return;
+			default:
+				throw new Error(`Unknown ACP fast mode value: ${value}`);
+		}
+	}
+
+	/**
+	 * Advisor toggle: a native `boolean` when the client opted in, else an
+	 * `on`/`off` select. Enabled but inactive (no model on the `advisor` role)
+	 * is called out in the description.
+	 */
+	#buildAdvisorOption(session: AgentSession): SessionConfigOption {
+		const enabled = session.isAdvisorEnabled();
+		const stats = session.getAdvisorStats();
+		const base = {
+			id: ADVISOR_CONFIG_ID,
+			name: "Advisor",
+			description:
+				enabled && !stats.active
+					? "A second model reviews each turn — enabled, but no model is assigned to the advisor role"
+					: "A second model reviews each turn and injects notes",
+		};
+		if (this.#clientSupportsBooleanConfigOptions()) {
+			return { ...base, type: "boolean", currentValue: enabled };
+		}
+		return {
+			...base,
+			type: "select",
+			currentValue: enabled ? TOGGLE_ON : TOGGLE_OFF,
+			options: [
+				{ value: TOGGLE_OFF, name: "Off" },
+				{ value: TOGGLE_ON, name: "On" },
+			],
+		};
+	}
+
+	#setAdvisorById(session: AgentSession, value: string): void {
+		if (value !== TOGGLE_ON && value !== TOGGLE_OFF) throw new Error(`Unknown ACP advisor value: ${value}`);
+		session.setAdvisorEnabled(value === TOGGLE_ON);
+	}
+
+	/**
+	 * Saved model presets as one select. The current value is the preset last
+	 * applied in this session while the session still matches it, else the first
+	 * matching preset, else `_custom`. Uncategorized so clients keep treating the
+	 * `model` option as the single model picker.
+	 */
+	#buildModelPresetOption(session: AgentSession): SessionConfigOption | undefined {
+		const { settings } = session;
+		const presets = getModelPresetNames(settings).flatMap(name => {
+			const lookup = getModelPreset(settings, name);
+			return lookup.kind === "found" ? [{ name, preset: lookup.preset }] : [];
+		});
+		if (presets.length === 0) return undefined;
+		const thinkingLevel = this.#getConfiguredThinkingLevel(session);
+		const matches = (entry: (typeof presets)[number]) =>
+			sessionMatchesModelPreset(settings, entry.preset, thinkingLevel);
+		const applied = this.#appliedModelPresets.get(session);
+		const current =
+			presets.find(entry => entry.name === applied && matches(entry))?.name ??
+			presets.find(matches)?.name ??
+			MODEL_PRESET_CUSTOM;
+		const options = presets.map(entry => ({
+			value: entry.name,
+			name: entry.name,
+			description: Object.entries(entry.preset.modelRoles)
+				.map(([role, selector]) => `${role}: ${selector}`)
+				.join(", "),
+		}));
+		if (current === MODEL_PRESET_CUSTOM) {
+			options.push({
+				value: MODEL_PRESET_CUSTOM,
+				name: "Custom",
+				description: "Roles differ from every saved preset",
+			});
+		}
+		return {
+			id: MODEL_PRESET_CONFIG_ID,
+			name: "Model preset",
+			description: "Switch every model role to a saved preset for this session",
+			type: "select",
+			currentValue: current,
+			options,
+		};
+	}
+
+	/** Session-only preset switch: roles become runtime overrides; nothing is persisted. */
+	async #applyModelPresetById(session: AgentSession, name: string): Promise<void> {
+		if (name === MODEL_PRESET_CUSTOM) throw new Error("Custom is not a preset; pick a saved preset.");
+		const result = await applyModelPreset(session.settings, session, name, { sessionOnly: true });
+		switch (result.kind) {
+			case "switched":
+				this.#appliedModelPresets.set(session, name);
+				return;
+			case "missing":
+				throw new Error(`Unknown ACP model preset: ${name}`);
+			case "invalid":
+				throw new Error(`Model preset "${name}" is malformed: ${result.reason}`);
+			case "unavailable":
+				throw new Error(`Model preset "${name}" not applied: ${result.reason}`);
+			case "failed":
+				this.#appliedModelPresets.set(session, name);
+				throw new Error(
+					`Model preset "${name}" roles set for this session, but the model was not switched: ${result.reason}`,
+				);
+		}
 	}
 
 	#buildThinkingOptions(session: AgentSession): Array<{ value: string; name: string; description?: string }> {
