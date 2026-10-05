@@ -551,8 +551,45 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		name: "vibe",
 		icon: "wave",
 		description: "Toggle vibe mode (direct persistent fast/good worker sessions; read-only toolset)",
+		acpDescription: "Toggle vibe mode (direct fast/good worker sessions)",
 		inlineHint: "[prompt]",
 		allowArgs: true,
+		handleAcp: async (command, runtime) => {
+			const setMode = runtime.setAcpMode;
+			if (!setMode) {
+				await runtime.output("Vibe mode is unavailable in this host.");
+				return;
+			}
+			if (runtime.session.getVibeModeState()?.enabled) {
+				try {
+					await setMode("default");
+				} catch (err) {
+					await runtime.output(`Failed to exit vibe mode: ${errorMessage(err)}`);
+					return;
+				}
+				await runtime.output("Vibe mode disabled.");
+				return;
+			}
+			if (runtime.session.getPlanModeState()?.enabled) {
+				await runtime.output("Exit plan mode first.");
+				return;
+			}
+			if (runtime.session.getGoalModeState() || isGoalInterviewActive(runtime.session)) {
+				await runtime.output("Exit goal mode first.");
+				return;
+			}
+			try {
+				await setMode("vibe");
+			} catch (err) {
+				await runtime.output(`Failed to enter vibe mode: ${errorMessage(err)}`);
+				return;
+			}
+			const initialPrompt = command.args.trim();
+			if (initialPrompt) return { prompt: initialPrompt };
+			await runtime.output(
+				"Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
+			);
+		},
 		getTuiAutocompleteDescription: runtime => {
 			if (runtime.ctx.vibeModeEnabled) return "Vibe: on";
 			if (runtime.ctx.planModeEnabled) return "Vibe: blocked by plan mode";

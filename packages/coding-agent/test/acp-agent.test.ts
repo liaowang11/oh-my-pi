@@ -754,12 +754,12 @@ describe("ACP agent", () => {
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		expectAcpStructure(zNewSessionResponse, created);
-		expect(created.modes?.availableModes.map(mode => mode.id)).toEqual(["default", "plan"]);
+		expect(created.modes?.availableModes.map(mode => mode.id)).toEqual(["default", "plan", "vibe"]);
 		const initialModeConfig = created.configOptions?.find(option => option.id === "mode") as
 			| { currentValue?: unknown; options?: Array<{ value: string }> }
 			| undefined;
 		expect(initialModeConfig?.currentValue).toBe("default");
-		expect(initialModeConfig?.options?.map(option => option.value)).toEqual(["default", "plan"]);
+		expect(initialModeConfig?.options?.map(option => option.value)).toEqual(["default", "plan", "vibe"]);
 
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
 

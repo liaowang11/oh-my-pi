@@ -73,7 +73,7 @@ import { CollabController } from "../collab/controller";
 import type { CollabHost } from "../collab/host";
 import { KeybindingsManager } from "@oh-my-pi/pi-tui/app-keybindings";
 import { appKey, editorKey, rawKeyHint } from "@oh-my-pi/pi-tui/chrome/keybinding-hints";
-import { formatModelString, type ResolvedModelRoleValue } from "../config/model-resolver";
+import type { ResolvedModelRoleValue } from "../config/model-resolver";
 import { isSettingsInitialized, Settings, settings } from "../config/settings";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import type {
@@ -233,6 +233,7 @@ import {
 	type VibeParentSession,
 	VibeSessionRegistry,
 } from "../vibe/runtime";
+import { enterVibeMode, exitVibeMode, vibeParentSessionOf } from "../vibe/mode";
 import { AssistantMessageComponent } from "@oh-my-pi/pi-tui/chat/assistant-message";
 import { setSvgFigureRendering } from "@oh-my-pi/pi-tui/chat/svg-figure";
 import { setTableCharts } from "@oh-my-pi/pi-tui/chat/table-chart";
@@ -4544,19 +4545,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	#vibeParentSession(): VibeParentSession {
-		return {
-			getAgentId: () => this.session.getAgentId() ?? null,
-			getSessionId: () => this.sessionManager.getSessionId(),
-			getSessionFile: () => this.sessionManager.getSessionFile() ?? null,
-			sessionManager: this.sessionManager,
-			asyncJobManager: this.session.asyncJobManager,
-			settings: this.session.settings,
-			// Resolve restored/switched-to workers against this session's active model
-			// (same as the spawn-path ToolSession), not the settings default. This is
-			// the primary fallback in resolveAgentModelPatterns, so the `good` worker's
-			// pi/task inheritance tracks the reopened session's model.
-			getActiveModelString: () => (this.session.model ? formatModelString(this.session.model) : undefined),
-		};
+		return vibeParentSessionOf(this.session);
 	}
 
 	async #quiesceVibeForSessionSwitch(): Promise<void> {
@@ -5965,35 +5954,21 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		const vibeRegistry = VibeSessionRegistry.global();
-		const ownerScope = vibeRegistry.ownerScope(this.#vibeParentSession());
-		vibeRegistry.activateScope(ownerScope);
-		// When a vibe session switches into another session that is also in vibe
-		// mode, the teardown keeps the live active set, which is by then the reduced
-		// vibe set, so re-snapshotting it here would make the snapshot useless. That
-		// path passes the pre-vibe toolset recorded on the target's own mode_change
-		// entry instead.
-		const previousTools = options?.previousTools ?? this.session.getEnabledToolNames();
-		const vibeBaseTools = ["read"];
-		if (this.session.hasBuiltInTool("todo")) vibeBaseTools.push("todo");
+		// A vibe -> vibe session switch passes `previousTools` from the target's own
+		// mode_change entry: the live set is by then the reduced vibe set.
 		// The entry runs as a stored promise so a concurrent /vibe joins it
 		// above instead of dispatching on the stale toolset. The first caller
 		// awaits it below, so a failure is always observed (no unhandled
 		// rejection) and propagates to every joiner, dropping their prompts.
 		const entry = (async () => {
-			await this.session.activateVibeTools(vibeBaseTools);
-			this.#vibeModePreviousTools = previousTools;
-			this.#vibeModeOwnerScope = ownerScope;
+			const handle = await enterVibeMode(this.session, options);
+			this.#vibeModePreviousTools = handle.previousTools;
+			this.#vibeModeOwnerScope = handle.ownerScope;
 			this.vibeModeEnabled = true;
 			// Suppress cache-miss marker on the next turn: vibe mode changes the
 			// injected context, which predictably invalidates the cache.
 			this.lastAssistantUsage = undefined;
-			this.session.setVibeModeState({ enabled: true });
-			if (this.session.isStreaming) {
-				await this.session.sendVibeModeContext({ deliverAs: "steer" });
-			}
 			this.#updateVibeModeStatus();
-			if (options?.persistModeChange !== false) this.sessionManager.appendModeChange("vibe", { previousTools });
 			this.showStatus(
 				"Vibe mode enabled. You direct fast/good worker sessions; toolset is read + optional parent Todo + vibe tools.",
 			);
@@ -6010,18 +5985,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		if (!this.vibeModeEnabled) {
 			return;
 		}
-		// Tear down with the queued-message drain suppressed: aborting the active
-		// turn would otherwise let a queued user steer/follow-up restart on the
-		// still-live Vibe tools before this teardown removes them (issue #8326).
-		let killed = 0;
-		await this.session.runModeExitTeardown(async () => {
-			if (this.session.isStreaming) {
-				await this.session.abort();
-			}
-			killed = await VibeSessionRegistry.global().killAll(this.#vibeParentSession(), this.#vibeModeOwnerScope);
-			await this.session.deactivateVibeTools(this.#vibeModePreviousTools ?? []);
-			this.session.setVibeModeState(undefined);
-		});
+		const ownerScope = this.#vibeModeOwnerScope;
+		const killed = await exitVibeMode(
+			this.session,
+			ownerScope ? { ownerScope, previousTools: this.#vibeModePreviousTools ?? [] } : undefined,
+		);
 		this.vibeModeEnabled = false;
 		this.#vibeModePreviousTools = undefined;
 		this.#vibeModeOwnerScope = undefined;
