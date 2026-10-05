@@ -104,6 +104,8 @@ import {
 	TTS_SPEED_OPTIONS,
 } from "../../tts/models";
 import type { EventBus } from "../../utils/event-bus";
+import { enterVibeMode, exitVibeMode, type VibeModeHandle, vibeParentSessionOf } from "../../vibe/mode";
+import { VibeSessionRegistry } from "../../vibe/runtime";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
@@ -132,6 +134,7 @@ import { cfgPlanEnabled } from "../../plan-mode/settings";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
+const ACP_VIBE_MODE_ID = "vibe";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
 const APPROVE_OPTION = "Approve and execute";
 const REFINE_OPTION = "Refine plan";
@@ -432,6 +435,9 @@ type ManagedSessionRecord = {
 	// turn that did no tool work, or repeated the previous one, stops the chain
 	// until the user speaks again.
 	goalContinuation: { pendingTurns: number; previousActivity: string | undefined; stalled: boolean };
+	// Present while vibe mode is active: the owner scope and pre-vibe toolset
+	// `exitVibeMode` needs to kill workers and restore tools.
+	vibeMode: VibeModeHandle | undefined;
 	closedError: PromptLifecycleError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -1080,7 +1086,7 @@ export class AcpAgent implements Agent {
 
 	async setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
-		this.#applyModeChange(record.session, params.modeId);
+		await this.#applyModeChange(record, params.modeId);
 		await this.#connection.sessionUpdate({
 			sessionId: record.session.sessionId,
 			update: this.#buildCurrentModeUpdate(record.session),
@@ -1103,7 +1109,7 @@ export class AcpAgent implements Agent {
 
 		switch (params.configId) {
 			case MODE_CONFIG_ID:
-				this.#applyModeChange(record.session, params.value);
+				await this.#applyModeChange(record, params.value);
 				break;
 			case MODEL_CONFIG_ID:
 				await this.#setModelById(record.session, params.value);
@@ -1874,6 +1880,10 @@ export class AcpAgent implements Agent {
 			await this.#restoreStoredGoal(session);
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
+			// After MCP: connected MCP tools join the active set, which would
+			// otherwise leak into the read-only vibe toolset and be missing from
+			// the snapshot exit restores.
+			await this.#restoreVibeMode(record);
 			this.#sessions.set(session.sessionId, record);
 			return record;
 		} catch (error) {
@@ -1888,6 +1898,16 @@ export class AcpAgent implements Agent {
 		if (restored?.enabled) {
 			await session.setActiveToolsByName([...new Set([...session.getEnabledToolNames(), "goal"])]);
 		}
+	}
+
+	async #restoreVibeMode(record: ManagedSessionRecord): Promise<void> {
+		// Same as the interactive resume path: a session persisted in vibe mode
+		// re-enters it (without re-recording the mode) and re-adopts its parked
+		// workers. The current toolset becomes the one exit restores.
+		const { session } = record;
+		if (!session.asyncJobManager || session.sessionManager.buildSessionContext().mode !== "vibe") return;
+		await VibeSessionRegistry.global().rehydrate(vibeParentSessionOf(session));
+		record.vibeMode = await enterVibeMode(session, { persistModeChange: false });
 	}
 
 	#createManagedSessionRecord(
@@ -1916,6 +1936,7 @@ export class AcpAgent implements Agent {
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
+			vibeMode: undefined,
 		};
 	}
 
@@ -2752,23 +2773,56 @@ export class AcpAgent implements Agent {
 				description: "Read-only planning mode that drafts a plan to a markdown file before any code changes",
 			});
 		}
-		void session;
+		// Vibe workers run as background jobs; secondary in-process sessions own
+		// no job manager (issue #1923), so they cannot direct workers.
+		if (session.asyncJobManager) {
+			modes.push({
+				id: ACP_VIBE_MODE_ID,
+				name: "Vibe",
+				description: "Direct persistent fast/good worker sessions with a read-only toolset",
+			});
+		}
 		return modes;
 	}
 
 	#getCurrentModeId(session: AgentSession): string {
+		if (session.getVibeModeState()?.enabled) return ACP_VIBE_MODE_ID;
 		return session.getPlanModeState()?.enabled ? ACP_PLAN_MODE_ID : ACP_DEFAULT_MODE_ID;
 	}
 
-	#applyModeChange(session: AgentSession, modeId: string): void {
+	/**
+	 * Switch the session's ACP mode. Mode-picker switches between plan and vibe
+	 * transition directly (exit one, enter the other) so the client's single
+	 * mode selector never sticks; an active goal still blocks both.
+	 */
+	async #applyModeChange(record: ManagedSessionRecord, modeId: string): Promise<void> {
+		const { session } = record;
 		const availableModes = this.#getAvailableModes(session);
 		if (!availableModes.some(mode => mode.id === modeId)) {
 			throw new Error(`Unsupported ACP mode: ${modeId}`);
 		}
+		const goalActive = session.getGoalModeState() !== undefined || isGoalInterviewActive(session);
+		const vibeActive = session.getVibeModeState()?.enabled === true;
+		if (modeId === ACP_VIBE_MODE_ID) {
+			if (vibeActive) return;
+			if (goalActive) throw new Error("Exit goal mode before entering vibe mode.");
+			// Enter first so a failed entry leaves plan mode intact.
+			record.vibeMode = await enterVibeMode(session);
+			session.setPlanProposalHandler?.(null);
+			session.setPlanModeState(undefined);
+			return;
+		}
+		if (modeId === ACP_PLAN_MODE_ID && goalActive) {
+			throw new Error("Exit goal mode before entering plan mode.");
+		}
+		if (vibeActive) {
+			// Exiting aborts the running turn; leave that to `session/cancel` so
+			// the prompt turn settles through the normal cancel path.
+			if (session.isStreaming) throw new Error("Cancel the running turn before exiting vibe mode.");
+			await exitVibeMode(session, record.vibeMode);
+			record.vibeMode = undefined;
+		}
 		if (modeId === ACP_PLAN_MODE_ID) {
-			if (session.getGoalModeState() || isGoalInterviewActive(session)) {
-				throw new Error("Exit goal mode before entering plan mode.");
-			}
 			const previous = session.getPlanModeState();
 			session.setPlanModeState({
 				enabled: true,
