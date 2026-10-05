@@ -136,7 +136,7 @@ export interface SlashCommandRuntime {
 	 */
 	mcpManager?: MCPManager | undefined;
 	/** ACP host mode switch; absent from the RPC text-command host. */
-	setAcpMode?: (modeId: "default" | "plan") => Promise<void>;
+	setAcpMode?: (modeId: "default" | "plan" | "vibe") => Promise<void>;
 	notifyTitleChanged?: () => Promise<void> | void;
 	/**
 	 * Push the host's view of the session config (model, thinking level, mode).
