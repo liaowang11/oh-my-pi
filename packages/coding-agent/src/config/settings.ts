@@ -2383,6 +2383,15 @@ export class Settings {
 		this.#fireIfChanged(cfgModelRoles, prev);
 	}
 
+	/**
+	 * Clear a single role's runtime-only override (set via {@link overrideModelRoles}),
+	 * reverting it to whatever the persisted project/global layers resolve to.
+	 * No-op if `role` has no active runtime override. Never touches persisted storage.
+	 */
+	clearModelRoleOverride(role: ModelRole | string): void {
+		this.#updateRuntimeModelRoleOverride(role, undefined);
+	}
+
 	// ─────────────────────────────────────────────────────────────────────────
 	// Loading
 	// ─────────────────────────────────────────────────────────────────────────

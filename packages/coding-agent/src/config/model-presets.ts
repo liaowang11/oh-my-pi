@@ -317,6 +317,35 @@ function resolvePresetDefault(
 	};
 }
 
+/**
+ * Session-only counterpart of `settings.replaceModelRoles`: the preset's roles go to the
+ * runtime override layer and nothing is persisted, `defaultThinkingLevel` included
+ * (the live session takes it instead). Roles the preset leaves out drop their
+ * session override but keep any persisted value — the override layer cannot mask one.
+ */
+function writeSessionPresetRoles(settings: Settings, preset: ModelPreset): void {
+	for (const role of Object.keys(settings.getModelRoles())) {
+		if (!Object.hasOwn(preset.modelRoles, role)) settings.clearModelRoleOverride(role);
+	}
+	settings.overrideModelRoles(preset.modelRoles);
+}
+
+/**
+ * Whether the session's effective setup still matches `preset`: every role the
+ * preset assigns resolves to the same selector, and the preset's thinking level
+ * (when it records one) equals the session's `thinkingLevel`. Roles the preset
+ * leaves out are ignored, matching what a session-only apply can guarantee.
+ */
+export function sessionMatchesModelPreset(
+	settings: Settings,
+	preset: ModelPreset,
+	thinkingLevel: string | undefined,
+): boolean {
+	if (preset.defaultThinkingLevel !== undefined && preset.defaultThinkingLevel !== thinkingLevel) return false;
+	const roles = settings.getModelRoles();
+	return Object.keys(preset.modelRoles).every(role => roles[role] === preset.modelRoles[role]);
+}
+
 function shadowedRoles(settings: Settings, preset: ModelPreset): ModelPresetShadowedRole[] {
 	const effective = settings.getModelRoles();
 	const roles = new Set([...Object.keys(effective), ...Object.keys(preset.modelRoles)]);
@@ -341,7 +370,8 @@ function shadowedThinking(settings: Settings, preset: ModelPreset): ModelPresetS
 
 /**
  * Apply preset `name`: persist its roles and thinking level, then switch the
- * live session to the resulting default model and thinking level.
+ * live session to the resulting default model and thinking level. With
+ * `sessionOnly`, the roles become runtime overrides and nothing is persisted.
  *
  * Both the preset's own default and the effective default are checked against
  * the prospective scope before anything is written. A live switch that still
@@ -351,10 +381,11 @@ export async function applyModelPreset(
 	settings: Settings,
 	session: ModelPresetSession,
 	name: string,
+	options?: { sessionOnly?: boolean },
 ): Promise<ModelPresetSwitchResult> {
 	const release = await acquireModelRoleMutation();
 	try {
-		return await applyModelPresetLocked(settings, session, name);
+		return await applyModelPresetLocked(settings, session, name, options?.sessionOnly === true);
 	} finally {
 		release();
 	}
@@ -364,6 +395,7 @@ async function applyModelPresetLocked(
 	settings: Settings,
 	session: ModelPresetSession,
 	name: string,
+	sessionOnly: boolean,
 ): Promise<ModelPresetSwitchResult> {
 	const lookup = getModelPreset(settings, name);
 	if (lookup.kind !== "found") return lookup;
@@ -388,13 +420,17 @@ async function applyModelPresetLocked(
 		return { kind: "unavailable", reason };
 	}
 
-	settings.replaceModelRoles(preset.modelRoles);
-	if (preset.defaultThinkingLevel !== undefined) {
-		cfgDefaultThinkingLevel.set(settings, preset.defaultThinkingLevel);
+	if (sessionOnly) {
+		writeSessionPresetRoles(settings, preset);
+	} else {
+		settings.replaceModelRoles(preset.modelRoles);
+		if (preset.defaultThinkingLevel !== undefined) {
+			cfgDefaultThinkingLevel.set(settings, preset.defaultThinkingLevel);
+		}
 	}
 	if (session.scopedModelsFromSettings) await session.refreshScopedModels();
 	const shadowed = shadowedRoles(settings, preset);
-	const thinkingShadow = shadowedThinking(settings, preset);
+	const thinkingShadow = sessionOnly ? undefined : shadowedThinking(settings, preset);
 	try {
 		await session.setModel(live.model, "default", { persist: false });
 	} catch (error) {

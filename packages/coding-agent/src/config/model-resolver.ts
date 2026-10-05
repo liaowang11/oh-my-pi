@@ -63,6 +63,7 @@ import {
 	MODEL_ROLE_ALIAS_PREFIX,
 	MODEL_ROLE_IDS,
 	type ModelRole,
+	roleCandidatePool,
 } from "./model-roles";
 import type { Settings } from "./settings";
 
@@ -1696,6 +1697,22 @@ export function resolveImplicitDefaultRole(
 		return { model: undefined, thinkingLevel: undefined, explicitThinkingLevel: false, warning: parsed.warning };
 	}
 	return toResolvedRoleValue(pin ? applyUpstreamRouting(parsed.model, pin) : parsed.model, parsed, 0);
+}
+
+/**
+ * Resolve a non-default role's configured value (runtime override, project, or
+ * global) against that role's own candidate pool. `model` is undefined when the
+ * role is unset or its value no longer resolves.
+ */
+export function resolveConfiguredRoleModel(
+	role: string,
+	settings: Settings,
+	registry: ModelRegistry,
+): ResolvedModelRoleValue {
+	return resolveModelRoleValue(settings.getModelRole(role), roleCandidatePool(role, settings, registry), {
+		settings,
+		matchPreferences: getModelMatchPreferences(settings),
+	});
 }
 
 export function resolveModelRoleValue(
