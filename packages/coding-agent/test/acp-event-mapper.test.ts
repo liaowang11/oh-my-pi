@@ -94,6 +94,22 @@ class ReplayTestSession {
 		return [];
 	}
 
+	isFastModeEnabled(): boolean {
+		return false;
+	}
+	isUltrafastModeEnabled(): boolean {
+		return false;
+	}
+	isAdvisorEnabled(): boolean {
+		return false;
+	}
+	getAdvisorStats(): { configured: boolean; active: boolean } {
+		return { configured: false, active: false };
+	}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
+
 	getPlanModeState(): undefined {
 		return undefined;
 	}
