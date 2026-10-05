@@ -1525,9 +1525,12 @@ export class AcpAgent implements Agent {
 		// so it shares the bootstrap race guard — see that comment for why.
 		try {
 			await this.#restoreStoredGoal(session);
-			await this.#restoreVibeMode(record);
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
+			// After MCP: connected MCP tools join the active set, which would
+			// otherwise leak into the read-only vibe toolset and be missing from
+			// the snapshot exit restores.
+			await this.#restoreVibeMode(record);
 			this.#sessions.set(session.sessionId, record);
 			return record;
 		} catch (error) {
@@ -1549,7 +1552,7 @@ export class AcpAgent implements Agent {
 		// re-enters it (without re-recording the mode) and re-adopts its parked
 		// workers. The current toolset becomes the one exit restores.
 		const { session } = record;
-		if (session.sessionManager.buildSessionContext().mode !== "vibe") return;
+		if (!session.asyncJobManager || session.sessionManager.buildSessionContext().mode !== "vibe") return;
 		await VibeSessionRegistry.global().rehydrate(vibeParentSessionOf(session));
 		record.vibeMode = await enterVibeMode(session, { persistModeChange: false });
 	}
@@ -2304,11 +2307,15 @@ export class AcpAgent implements Agent {
 				description: "Read-only planning mode that drafts a plan to a markdown file before any code changes",
 			});
 		}
-		modes.push({
-			id: ACP_VIBE_MODE_ID,
-			name: "Vibe",
-			description: "Direct persistent fast/good worker sessions with a read-only toolset",
-		});
+		// Vibe workers run as background jobs; secondary in-process sessions own
+		// no job manager (issue #1923), so they cannot direct workers.
+		if (session.asyncJobManager) {
+			modes.push({
+				id: ACP_VIBE_MODE_ID,
+				name: "Vibe",
+				description: "Direct persistent fast/good worker sessions with a read-only toolset",
+			});
+		}
 		return modes;
 	}
 
@@ -2333,9 +2340,10 @@ export class AcpAgent implements Agent {
 		if (modeId === ACP_VIBE_MODE_ID) {
 			if (vibeActive) return;
 			if (goalActive) throw new Error("Exit goal mode before entering vibe mode.");
+			// Enter first so a failed entry leaves plan mode intact.
+			record.vibeMode = await enterVibeMode(session);
 			session.setPlanProposalHandler?.(null);
 			session.setPlanModeState(undefined);
-			record.vibeMode = await enterVibeMode(session);
 			return;
 		}
 		if (modeId === ACP_PLAN_MODE_ID && goalActive) {

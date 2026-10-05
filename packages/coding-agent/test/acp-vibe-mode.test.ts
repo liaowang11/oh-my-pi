@@ -6,10 +6,12 @@
  * 2. Mode-picker switches between plan and vibe transition directly.
  * 3. `/vibe` toggles the same mode from a prompt.
  * 4. A session persisted in vibe mode comes back in vibe mode.
+ * 5. Sessions without a background job manager cannot enter vibe mode.
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "bun:test";
 import { type } from "@oh-my-pi/omptype";
 import { Agent, type AgentTool } from "@oh-my-pi/pi-agent-core";
+import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
@@ -73,7 +75,7 @@ describe("ACP vibe mode", () => {
 		tempDir.removeSync();
 	});
 
-	function createSession(sessionManager?: SessionManager): AgentSession {
+	function createSession(sessionManager?: SessionManager, options?: { withoutJobManager?: boolean }): AgentSession {
 		const model = modelRegistry.find("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected claude-sonnet-4-5 to exist in registry");
 		const registryTools = [stubTool("read"), stubTool("todo"), stubTool("edit")];
@@ -88,6 +90,7 @@ describe("ACP vibe mode", () => {
 			toolRegistry: new Map(registryTools.map(tool => [tool.name, tool])),
 			builtInToolNames: registryTools.map(tool => tool.name),
 			createVibeTools: () => VIBE_TOOL_NAMES.map(stubTool),
+			asyncJobManager: options?.withoutJobManager ? undefined : new AsyncJobManager({}),
 		});
 		sessions.push(session);
 		return session;
@@ -184,5 +187,18 @@ describe("ACP vibe mode", () => {
 		expect(
 			sessionManager.getEntries().filter(entry => entry.type === "mode_change" && entry.mode === "vibe"),
 		).toHaveLength(1);
+	});
+
+	it("does not offer vibe mode to a session without a background job manager", async () => {
+		const agent = createAgent(() => createSession(undefined, { withoutJobManager: true }));
+		const created = await agent.newSession({ cwd: tempDir.path(), mcpServers: [] });
+		expect(created.modes?.availableModes.map(mode => mode.id)).toEqual(["default", "plan"]);
+
+		await agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/vibe" }] });
+		expect(sessions[0].getVibeModeState()).toBeUndefined();
+		expect(textOutput(created.sessionId)).toContain("Vibe mode is unavailable in this session");
+		await expect(agent.setSessionMode({ sessionId: created.sessionId, modeId: "vibe" })).rejects.toThrow(
+			"Unsupported ACP mode: vibe",
+		);
 	});
 });

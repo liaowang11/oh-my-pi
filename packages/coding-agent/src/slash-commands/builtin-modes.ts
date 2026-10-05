@@ -567,6 +567,10 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 				await runtime.output("Vibe mode disabled.");
 				return;
 			}
+			if (!runtime.session.asyncJobManager) {
+				await runtime.output("Vibe mode is unavailable in this session: it has no background job manager.");
+				return;
+			}
 			if (runtime.session.getPlanModeState()?.enabled) {
 				await runtime.output("Exit plan mode first.");
 				return;
