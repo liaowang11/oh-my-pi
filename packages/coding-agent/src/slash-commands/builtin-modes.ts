@@ -794,6 +794,7 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 			const message = runFastCommand(command.args.trim().toLowerCase(), runtime.session);
 			if (message === undefined) return usage(FAST_USAGE, runtime);
 			await runtime.output(message);
+			await runtime.notifyConfigChanged?.();
 			return commandConsumed();
 		},
 		handleTui: (command, runtime) => {

@@ -150,6 +150,8 @@ export interface ClientCapabilities {
 	elicitation?: { form?: Record<string, unknown>; url?: Record<string, unknown> };
 	/** Draft subagent sessions: present (as an object) when the client renders child sessions. */
 	subagents?: Record<string, unknown>;
+	/** Session capabilities; `configOptions.boolean` opts in to `type: "boolean"` config options. */
+	session?: { configOptions?: { boolean?: Record<string, unknown> } };
 	_meta?: Record<string, unknown>;
 }
 /** Implementation identity sent during initialization. */

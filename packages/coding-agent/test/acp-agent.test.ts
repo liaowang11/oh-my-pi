@@ -459,8 +459,31 @@ class FakeAgentSession {
 		return this.fastMode;
 	}
 
+	ultrafast = false;
 	isUltrafastModeEnabled(): boolean {
-		return false;
+		return this.ultrafast;
+	}
+
+	setUltrafastMode(enabled: boolean): boolean {
+		if (enabled && this.model?.provider !== "openai") return false;
+		this.ultrafast = enabled;
+		if (enabled) this.fastMode = true;
+		return true;
+	}
+
+	advisorEnabled = false;
+	advisorHasModel = true;
+	isAdvisorEnabled(): boolean {
+		return this.advisorEnabled;
+	}
+
+	setAdvisorEnabled(enabled: boolean): boolean {
+		this.advisorEnabled = enabled;
+		return enabled && this.advisorHasModel;
+	}
+
+	getAdvisorStats(): { configured: boolean; active: boolean } {
+		return { configured: this.advisorEnabled, active: this.advisorEnabled && this.advisorHasModel };
 	}
 
 	setForcedToolChoice(toolName: string): void {
@@ -805,6 +828,90 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("exposes fast mode and advisor as config options", async () => {
+		const harness = await createHarness();
+		type Option = { id: string; type: string; currentValue?: unknown; options?: Array<{ value: string }> };
+		const find = (options: unknown[] | null | undefined, id: string) =>
+			(options as Option[] | undefined)?.find(option => option.id === id);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const session = harness.findSession(created.sessionId)!;
+
+		// Anthropic model: on/off only, no ultra.
+		const fast = find(created.configOptions, "fast_mode");
+		expect(fast?.currentValue).toBe("off");
+		expect(fast?.options?.map(option => option.value)).toEqual(["off", "on"]);
+		const set = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "fast_mode",
+			value: "on",
+		});
+		expect(session.fastMode).toBe(true);
+		expect(find(set.configOptions, "fast_mode")?.currentValue).toBe("on");
+		await expect(
+			harness.agent.setSessionConfigOption({ sessionId: created.sessionId, configId: "fast_mode", value: "ultra" }),
+		).rejects.toThrow("Ultrafast is unavailable");
+
+		// OpenAI model: ultra appears and is selectable.
+		await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+		});
+		const ultra = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "fast_mode",
+			value: "ultra",
+		});
+		expect(find(ultra.configOptions, "fast_mode")?.options?.map(option => option.value)).toEqual([
+			"off",
+			"on",
+			"ultra",
+		]);
+		expect(find(ultra.configOptions, "fast_mode")?.currentValue).toBe("ultra");
+
+		// No boolean capability: advisor is an on/off select.
+		const advisor = find(created.configOptions, "advisor");
+		expect(advisor?.type).toBe("select");
+		expect(advisor?.currentValue).toBe("off");
+		const on = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "advisor",
+			value: "on",
+		});
+		expect(session.advisorEnabled).toBe(true);
+		expect(find(on.configOptions, "advisor")?.currentValue).toBe("on");
+		await expect(
+			harness.agent.setSessionConfigOption({ sessionId: created.sessionId, configId: "advisor", value: true }),
+		).rejects.toThrow("Unsupported boolean ACP config option");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("exposes advisor as a boolean option when the client opts in", async () => {
+		const harness = await createHarness({ clientCapabilities: { session: { configOptions: { boolean: {} } } } });
+		type Option = { id: string; type: string; currentValue?: unknown };
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const session = harness.findSession(created.sessionId)!;
+		const advisor = (created.configOptions as Option[] | undefined)?.find(option => option.id === "advisor");
+		expect(advisor).toEqual(expect.objectContaining({ type: "boolean", currentValue: false }));
+
+		const set = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "advisor",
+			value: true,
+		});
+		expect(session.advisorEnabled).toBe(true);
+		expect((set.configOptions as Option[]).find(option => option.id === "advisor")?.currentValue).toBe(true);
+		expectAcpNotifications(harness.updates);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
