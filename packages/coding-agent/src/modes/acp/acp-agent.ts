@@ -45,9 +45,12 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
 import { disableProvider, enableProvider } from "../../capability";
-import { cfgAcpModelRoles } from "../../config/model-settings";
-import { getKnownRoleIds, getRoleInfo, roleCandidatePool } from "../../config/model-roles";
-import { resolveConfiguredRoleModel } from "../../config/model-resolver";
+import {
+	applyModelPreset,
+	getModelPreset,
+	getModelPresetNames,
+	sessionMatchesModelPreset,
+} from "../../config/model-presets";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -136,10 +139,9 @@ const REFINE_OPTION = "Refine plan";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
-/** Prefix of per-role model config option ids: `model_role:<role>`. */
-const MODEL_ROLE_CONFIG_PREFIX = "model_role:";
-/** Role option value that clears the session override. Never a model id (no `/`). */
-const MODEL_ROLE_INHERIT = "inherit";
+const MODEL_PRESET_CONFIG_ID = "model_preset";
+/** Preset value shown when no saved preset matches. Preset names start with a letter, so never a name. */
+const MODEL_PRESET_CUSTOM = "_custom";
 const THINKING_OFF = "off";
 const SESSION_PAGE_SIZE = 50;
 const SPEECH_MODELS_LIST_METHOD = "speech.models.list";
@@ -686,6 +688,9 @@ export class AcpAgent implements Agent {
 	#connection: AgentSideConnection;
 	#initialSession: AgentSession | undefined;
 	#createSession: CreateAcpSession;
+	// Preset each session last switched to, so the preset select keeps showing
+	// it (not an earlier-named preset with the same roles) while it still matches.
+	readonly #appliedModelPresets = new WeakMap<AgentSession, string>();
 	#sessions = new Map<string, ManagedSessionRecord>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
@@ -870,15 +875,11 @@ export class AcpAgent implements Agent {
 			case THINKING_CONFIG_ID:
 				this.#setThinkingLevelById(record.session, params.value);
 				break;
+			case MODEL_PRESET_CONFIG_ID:
+				await this.#applyModelPresetById(record.session, params.value);
+				break;
 			default:
-				if (!params.configId.startsWith(MODEL_ROLE_CONFIG_PREFIX)) {
-					throw new Error(`Unknown ACP config option: ${params.configId}`);
-				}
-				this.#setRoleModelById(
-					record.session,
-					params.configId.slice(MODEL_ROLE_CONFIG_PREFIX.length),
-					params.value,
-				);
+				throw new Error(`Unknown ACP config option: ${params.configId}`);
 		}
 
 		// When mode is changed via the generic config-option API, mirror the
@@ -2192,68 +2193,76 @@ export class AcpAgent implements Agent {
 			),
 			options: this.#buildThinkingOptions(session),
 		});
-		configOptions.push(...this.#buildRoleModelOptions(session));
+		const presetOption = this.#buildModelPresetOption(session);
+		if (presetOption) configOptions.push(presetOption);
 		return configOptions;
 	}
 
-	/** Roles exported as config options: configured, known, and never `default` (that is `model`). */
-	#getExportedModelRoles(session: AgentSession): string[] {
-		const known = new Set(getKnownRoleIds(session.settings));
-		return cfgAcpModelRoles.get(session.settings).filter(role => role !== "default" && known.has(role));
-	}
-
 	/**
-	 * One select per exported role, listing the role's candidate pool plus an
-	 * `inherit` entry that drops the session override. Uncategorized so clients
-	 * that treat the `model` category as the single model picker leave them be.
+	 * Saved model presets as one select. The current value is the preset last
+	 * applied in this session while the session still matches it, else the first
+	 * matching preset, else `_custom`. Uncategorized so clients keep treating the
+	 * `model` option as the single model picker.
 	 */
-	#buildRoleModelOptions(session: AgentSession): SessionConfigOption[] {
-		const { settings, modelRegistry } = session;
-		const options: SessionConfigOption[] = [];
-		for (const role of this.#getExportedModelRoles(session)) {
-			const pool = roleCandidatePool(role, settings, modelRegistry);
-			if (pool.length === 0) continue;
-			const current = resolveConfiguredRoleModel(role, settings, modelRegistry).model;
-			const roleName = getRoleInfo(role, settings).name;
+	#buildModelPresetOption(session: AgentSession): SessionConfigOption | undefined {
+		const { settings } = session;
+		const presets = getModelPresetNames(settings).flatMap(name => {
+			const lookup = getModelPreset(settings, name);
+			return lookup.kind === "found" ? [{ name, preset: lookup.preset }] : [];
+		});
+		if (presets.length === 0) return undefined;
+		const thinkingLevel = this.#getConfiguredThinkingLevel(session);
+		const matches = (entry: (typeof presets)[number]) =>
+			sessionMatchesModelPreset(settings, entry.preset, thinkingLevel);
+		const applied = this.#appliedModelPresets.get(session);
+		const current =
+			presets.find(entry => entry.name === applied && matches(entry))?.name ??
+			presets.find(matches)?.name ??
+			MODEL_PRESET_CUSTOM;
+		const options = presets.map(entry => ({
+			value: entry.name,
+			name: entry.name,
+			description: Object.entries(entry.preset.modelRoles)
+				.map(([role, selector]) => `${role}: ${selector}`)
+				.join(", "),
+		}));
+		if (current === MODEL_PRESET_CUSTOM) {
 			options.push({
-				id: `${MODEL_ROLE_CONFIG_PREFIX}${role}`,
-				name: `${roleName} model`,
-				description: `Model for the ${role} role in this session`,
-				type: "select",
-				currentValue: current ? this.#toModelId(current) : MODEL_ROLE_INHERIT,
-				options: [
-					{
-						value: MODEL_ROLE_INHERIT,
-						name: "Settings default",
-						description: "Drop the session override and use the configured role model",
-					},
-					...pool.map(model => ({
-						value: this.#toModelId(model),
-						name: model.name,
-						description: `${model.provider}/${model.id}`,
-					})),
-				],
+				value: MODEL_PRESET_CUSTOM,
+				name: "Custom",
+				description: "Roles differ from every saved preset",
 			});
 		}
-		return options;
+		return {
+			id: MODEL_PRESET_CONFIG_ID,
+			name: "Model preset",
+			description: "Switch every model role to a saved preset for this session",
+			type: "select",
+			currentValue: current,
+			options,
+		};
 	}
 
-	/** Session-scoped role assignment: writes only the runtime override layer, never persisted settings. */
-	#setRoleModelById(session: AgentSession, role: string, value: string): void {
-		if (!this.#getExportedModelRoles(session).includes(role)) {
-			throw new Error(`Unknown ACP model role: ${role}`);
+	/** Session-only preset switch: roles become runtime overrides; nothing is persisted. */
+	async #applyModelPresetById(session: AgentSession, name: string): Promise<void> {
+		if (name === MODEL_PRESET_CUSTOM) throw new Error("Custom is not a preset; pick a saved preset.");
+		const result = await applyModelPreset(session.settings, session, name, { sessionOnly: true });
+		switch (result.kind) {
+			case "switched":
+				this.#appliedModelPresets.set(session, name);
+				return;
+			case "missing":
+				throw new Error(`Unknown ACP model preset: ${name}`);
+			case "invalid":
+				throw new Error(`Model preset "${name}" is malformed: ${result.reason}`);
+			case "unavailable":
+				throw new Error(`Model preset "${name}" not applied: ${result.reason}`);
+			case "failed":
+				this.#appliedModelPresets.set(session, name);
+				throw new Error(
+					`Model preset "${name}" roles set for this session, but the model was not switched: ${result.reason}`,
+				);
 		}
-		if (value === MODEL_ROLE_INHERIT) {
-			session.settings.clearModelRoleOverride(role);
-			return;
-		}
-		const model = roleCandidatePool(role, session.settings, session.modelRegistry).find(
-			candidate => this.#toModelId(candidate) === value,
-		);
-		if (!model) {
-			throw new Error(`Unknown ACP model for role ${role}: ${value}`);
-		}
-		session.settings.overrideModelRoles({ [role]: this.#toModelId(model) });
 	}
 
 	#buildThinkingOptions(session: AgentSession): Array<{ value: string; name: string; description?: string }> {

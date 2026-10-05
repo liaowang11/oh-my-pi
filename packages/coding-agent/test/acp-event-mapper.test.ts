@@ -86,8 +86,6 @@ class ReplayTestSession {
 		this.sessionId = this.sessionManager.getSessionId();
 	}
 
-	modelRegistry = { getAvailable: (): Model[] => [TEST_MODEL] };
-
 	getAvailableModels(): Model[] {
 		return [TEST_MODEL];
 	}

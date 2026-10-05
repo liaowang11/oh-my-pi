@@ -5,8 +5,9 @@ import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
+import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
-import { cfgAcpModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
@@ -207,10 +208,12 @@ class FakeAgentSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; getAvailable: () => Model[] } {
+	scopedModels: Array<{ model: Model }> = [];
+
+	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; hasConfiguredAuth: (model: Model) => boolean } {
 		return {
 			getApiKey: async (_model: Model) => "test-key",
-			getAvailable: () => this.getAvailableModels(),
+			hasConfiguredAuth: (_model: Model) => true,
 		};
 	}
 
@@ -807,66 +810,67 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("exports configured model roles as session config options", async () => {
+	it("switches saved model presets for the session only", async () => {
 		const harness = await createHarness();
-		cfgAcpModelRoles.set(Settings.instance, ["smol", "plan"]);
 		type SelectOption = { id: string; currentValue?: unknown; options?: Array<{ value: string }> };
-		const roleOption = (options: unknown[] | null | undefined, id: string) =>
-			(options as SelectOption[] | undefined)?.find(option => option.id === id);
+		const presetOption = (options: unknown[] | null | undefined) =>
+			(options as SelectOption[] | undefined)?.find(option => option.id === "model_preset");
+		const claude = `${TEST_MODELS[0]!.provider}/${TEST_MODELS[0]!.id}`;
+		const gpt = `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`;
 
+		const bare = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expect(presetOption(bare.configOptions)).toBeUndefined();
+
+		cfgModelPresets.set(Settings.instance, {
+			fast: { modelRoles: { default: gpt, smol: claude } },
+			deep: { modelRoles: { default: claude, slow: gpt }, defaultThinkingLevel: Effort.High },
+		});
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		expectAcpStructure(zNewSessionResponse, created);
-		const smol = roleOption(created.configOptions, "model_role:smol");
-		expect(smol?.currentValue).toBe("inherit");
-		expect(smol?.options?.map(option => option.value)).toEqual([
-			"inherit",
-			...TEST_MODELS.map(model => `${model.provider}/${model.id}`),
-		]);
-		expect(roleOption(created.configOptions, "model_role:plan")).toBeDefined();
-		expect(roleOption(created.configOptions, "model_role:slow")).toBeUndefined();
-		expect(roleOption(created.configOptions, "model_role:default")).toBeUndefined();
+		const initial = presetOption(created.configOptions);
+		expect(initial?.currentValue).toBe("_custom");
+		expect(initial?.options?.map(option => option.value)).toEqual(["deep", "fast", "_custom"]);
+		const session = harness.findSession(created.sessionId)!;
 
-		const target = `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`;
-		const set = await harness.agent.setSessionConfigOption({
+		const fast = await harness.agent.setSessionConfigOption({
 			sessionId: created.sessionId,
-			configId: "model_role:smol",
-			value: target,
+			configId: "model_preset",
+			value: "fast",
 		});
-		expect(roleOption(set.configOptions, "model_role:smol")?.currentValue).toBe(target);
-		expect(Settings.instance.getModelRole("smol")).toBe(target);
-		const pushed = harness.updates.findLast(
-			n => n.sessionId === created.sessionId && n.update.sessionUpdate === "config_option_update",
-		);
-		expect(
-			pushed?.update.sessionUpdate === "config_option_update"
-				? roleOption(pushed.update.configOptions, "model_role:smol")?.currentValue
-				: undefined,
-		).toBe(target);
-		// The session model itself is untouched.
-		expect(harness.findSession(created.sessionId)?.model?.id).toBe(TEST_MODELS[0]!.id);
+		expect(presetOption(fast.configOptions)?.currentValue).toBe("fast");
+		expect(presetOption(fast.configOptions)?.options?.map(option => option.value)).toEqual(["deep", "fast"]);
+		expect(session.model?.id).toBe(TEST_MODELS[1]!.id);
+		expect(Settings.instance.getModelRole("smol")).toBe(claude);
+		// Session-only: nothing reaches the persisted global layer.
+		expect(Settings.instance.getGlobalModelRole("smol")).toBeUndefined();
 
-		const cleared = await harness.agent.setSessionConfigOption({
+		const deep = await harness.agent.setSessionConfigOption({
 			sessionId: created.sessionId,
-			configId: "model_role:smol",
-			value: "inherit",
+			configId: "model_preset",
+			value: "deep",
 		});
-		expect(roleOption(cleared.configOptions, "model_role:smol")?.currentValue).toBe("inherit");
+		expect(presetOption(deep.configOptions)?.currentValue).toBe("deep");
+		expect(session.model?.id).toBe(TEST_MODELS[0]!.id);
+		expect(session.thinkingLevel).toBe("high");
+		expect(Settings.instance.getModelRole("slow")).toBe(gpt);
+		// Roles the new preset leaves out lose the previous preset's session override.
 		expect(Settings.instance.getModelRole("smol")).toBeUndefined();
 
+		// Diverging from the preset (another thinking level) shows Custom again.
+		const diverged = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "thinking",
+			value: "low",
+		});
+		expect(presetOption(diverged.configOptions)?.currentValue).toBe("_custom");
+
 		await expect(
 			harness.agent.setSessionConfigOption({
 				sessionId: created.sessionId,
-				configId: "model_role:slow",
-				value: target,
+				configId: "model_preset",
+				value: "nope",
 			}),
-		).rejects.toThrow("Unknown ACP model role: slow");
-		await expect(
-			harness.agent.setSessionConfigOption({
-				sessionId: created.sessionId,
-				configId: "model_role:smol",
-				value: "openai/missing",
-			}),
-		).rejects.toThrow("Unknown ACP model for role smol");
+		).rejects.toThrow("Unknown ACP model preset: nope");
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

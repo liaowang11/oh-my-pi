@@ -257,6 +257,35 @@ function resolveLiveDefault(
 	};
 }
 
+/**
+ * Session-only counterpart of {@link writePresetRoles}: the preset's roles go to the
+ * runtime override layer and nothing is persisted, `defaultThinkingLevel` included
+ * (the live session takes it instead). Roles the preset leaves out drop their
+ * session override but keep any persisted value — the override layer cannot mask one.
+ */
+function writeSessionPresetRoles(settings: Settings, preset: ModelPreset): void {
+	for (const role of Object.keys(settings.getModelRoles())) {
+		if (!Object.hasOwn(preset.modelRoles, role)) settings.clearModelRoleOverride(role);
+	}
+	settings.overrideModelRoles(preset.modelRoles);
+}
+
+/**
+ * Whether the session's effective setup still matches `preset`: every role the
+ * preset assigns resolves to the same selector, and the preset's thinking level
+ * (when it records one) equals the session's `thinkingLevel`. Roles the preset
+ * leaves out are ignored, matching what a session-only apply can guarantee.
+ */
+export function sessionMatchesModelPreset(
+	settings: Settings,
+	preset: ModelPreset,
+	thinkingLevel: string | undefined,
+): boolean {
+	if (preset.defaultThinkingLevel !== undefined && preset.defaultThinkingLevel !== thinkingLevel) return false;
+	const roles = settings.getModelRoles();
+	return Object.keys(preset.modelRoles).every(role => roles[role] === preset.modelRoles[role]);
+}
+
 /** Write the preset's roles into the model hub's storage scope, clearing roles it leaves out. */
 function writePresetRoles(settings: Settings, preset: ModelPreset): void {
 	const project = cfgModelRoleStorage.get(settings) === "project";
@@ -312,7 +341,8 @@ function shadowedThinking(settings: Settings, preset: ModelPreset): ModelPresetS
 
 /**
  * Apply preset `name`: persist its roles and thinking level, then switch the
- * live session to the resulting default model and thinking level.
+ * live session to the resulting default model and thinking level. With
+ * `sessionOnly`, the roles become runtime overrides and nothing is persisted.
  *
  * The preset's own default is checked before anything is written, so a preset
  * whose model is gone leaves settings untouched. A live switch that still fails
@@ -322,10 +352,11 @@ export async function applyModelPreset(
 	settings: Settings,
 	session: ModelPresetSession,
 	name: string,
+	options?: { sessionOnly?: boolean },
 ): Promise<ModelPresetSwitchResult> {
 	const release = await acquireModelRoleMutation();
 	try {
-		return await applyModelPresetLocked(settings, session, name);
+		return await applyModelPresetLocked(settings, session, name, options?.sessionOnly === true);
 	} finally {
 		release();
 	}
@@ -335,6 +366,7 @@ async function applyModelPresetLocked(
 	settings: Settings,
 	session: ModelPresetSession,
 	name: string,
+	sessionOnly: boolean,
 ): Promise<ModelPresetSwitchResult> {
 	const lookup = getModelPreset(settings, name);
 	if (lookup.kind !== "found") return lookup;
@@ -364,9 +396,10 @@ async function applyModelPresetLocked(
 		return { kind: "unavailable", reason: "no model with configured credentials is available" };
 	}
 
-	writePresetRoles(settings, preset);
+	if (sessionOnly) writeSessionPresetRoles(settings, preset);
+	else writePresetRoles(settings, preset);
 	const shadowed = shadowedRoles(settings, preset);
-	const thinkingShadow = shadowedThinking(settings, preset);
+	const thinkingShadow = sessionOnly ? undefined : shadowedThinking(settings, preset);
 
 	const live = resolveLiveDefault(settings, session, candidates, preset);
 	if (typeof live === "string") return { kind: "failed", reason: live, shadowed };

@@ -97,8 +97,8 @@ class LazyFakeSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; getAvailable: () => Model[] } {
-		return { getApiKey: async (_model: Model) => "test-key", getAvailable: () => this.getAvailableModels() };
+	get modelRegistry(): { getApiKey: (model: Model) => Promise<string> } {
+		return { getApiKey: async (_model: Model) => "test-key" };
 	}
 
 	getAvailableModels(): Model[] {

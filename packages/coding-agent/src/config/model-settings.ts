@@ -120,28 +120,3 @@ export const cfgModelTags = register({ id: "modelTags", type: "record", default:
 export const cfgModelProviderOrder = register({ id: "modelProviderOrder", type: "array", default: EMPTY_STRING_ARRAY });
 
 export const cfgCycleOrder = register({ id: "cycleOrder", type: "array", default: DEFAULT_CYCLE_ORDER });
-
-const DEFAULT_ACP_MODEL_ROLES: string[] = [
-	"smol",
-	"slow",
-	"vision",
-	"plan",
-	"commit",
-	"tiny",
-	"memory",
-	"task",
-	"advisor",
-];
-
-/** Roles ACP sessions expose as per-role model config options; `default` is always the `model` option. */
-export const cfgAcpModelRoles = register({
-	id: "acp.modelRoles",
-	type: "array",
-	default: DEFAULT_ACP_MODEL_ROLES,
-	ui: {
-		tab: "model",
-		group: "Prompt",
-		label: "ACP Model Roles",
-		description: "Model roles ACP clients can switch per session from their config options",
-	},
-});
