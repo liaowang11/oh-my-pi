@@ -15,7 +15,7 @@ import {
 	formatModelString,
 	getModelMatchPreferences,
 	resolveCliModel,
-	resolveModelRoleValue,
+	resolveConfiguredRoleModel,
 	type ResolveCliModelResult,
 } from "../config/model-resolver";
 import type { Settings } from "../config/settings";
@@ -121,10 +121,7 @@ function effectiveRoleModelLabel(role: string, session: AgentSession, settings: 
 	}
 	const raw = settings.getModelRole(role);
 	if (!raw) return "(unset)";
-	const resolved = resolveModelRoleValue(raw, roleModelPool(role, session, settings), {
-		settings,
-		matchPreferences: getModelMatchPreferences(settings),
-	});
+	const resolved = resolveConfiguredRoleModel(role, settings, session.modelRegistry);
 	return resolved.model ? formatModelString(resolved.model) : `${raw} (unresolved)`;
 }
 

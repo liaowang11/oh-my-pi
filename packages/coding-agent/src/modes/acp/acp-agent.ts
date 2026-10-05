@@ -45,6 +45,9 @@ import {
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
 import { disableProvider, enableProvider } from "../../capability";
+import { cfgAcpModelRoles } from "../../config/model-settings";
+import { getKnownRoleIds, getRoleInfo, roleCandidatePool } from "../../config/model-roles";
+import { resolveConfiguredRoleModel } from "../../config/model-resolver";
 import { Settings } from "../../config/settings";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
@@ -133,6 +136,10 @@ const REFINE_OPTION = "Refine plan";
 const MODE_CONFIG_ID = "mode";
 const MODEL_CONFIG_ID = "model";
 const THINKING_CONFIG_ID = "thinking";
+/** Prefix of per-role model config option ids: `model_role:<role>`. */
+const MODEL_ROLE_CONFIG_PREFIX = "model_role:";
+/** Role option value that clears the session override. Never a model id (no `/`). */
+const MODEL_ROLE_INHERIT = "inherit";
 const THINKING_OFF = "off";
 const SESSION_PAGE_SIZE = 50;
 const SPEECH_MODELS_LIST_METHOD = "speech.models.list";
@@ -864,7 +871,14 @@ export class AcpAgent implements Agent {
 				this.#setThinkingLevelById(record.session, params.value);
 				break;
 			default:
-				throw new Error(`Unknown ACP config option: ${params.configId}`);
+				if (!params.configId.startsWith(MODEL_ROLE_CONFIG_PREFIX)) {
+					throw new Error(`Unknown ACP config option: ${params.configId}`);
+				}
+				this.#setRoleModelById(
+					record.session,
+					params.configId.slice(MODEL_ROLE_CONFIG_PREFIX.length),
+					params.value,
+				);
 		}
 
 		// When mode is changed via the generic config-option API, mirror the
@@ -2175,7 +2189,68 @@ export class AcpAgent implements Agent {
 			),
 			options: this.#buildThinkingOptions(session),
 		});
+		configOptions.push(...this.#buildRoleModelOptions(session));
 		return configOptions;
+	}
+
+	/** Roles exported as config options: configured, known, and never `default` (that is `model`). */
+	#getExportedModelRoles(session: AgentSession): string[] {
+		const known = new Set(getKnownRoleIds(session.settings));
+		return cfgAcpModelRoles.get(session.settings).filter(role => role !== "default" && known.has(role));
+	}
+
+	/**
+	 * One select per exported role, listing the role's candidate pool plus an
+	 * `inherit` entry that drops the session override. Uncategorized so clients
+	 * that treat the `model` category as the single model picker leave them be.
+	 */
+	#buildRoleModelOptions(session: AgentSession): SessionConfigOption[] {
+		const { settings, modelRegistry } = session;
+		const options: SessionConfigOption[] = [];
+		for (const role of this.#getExportedModelRoles(session)) {
+			const pool = roleCandidatePool(role, settings, modelRegistry);
+			if (pool.length === 0) continue;
+			const current = resolveConfiguredRoleModel(role, settings, modelRegistry).model;
+			const roleName = getRoleInfo(role, settings).name;
+			options.push({
+				id: `${MODEL_ROLE_CONFIG_PREFIX}${role}`,
+				name: `${roleName} model`,
+				description: `Model for the ${role} role in this session`,
+				type: "select",
+				currentValue: current ? this.#toModelId(current) : MODEL_ROLE_INHERIT,
+				options: [
+					{
+						value: MODEL_ROLE_INHERIT,
+						name: "Settings default",
+						description: "Drop the session override and use the configured role model",
+					},
+					...pool.map(model => ({
+						value: this.#toModelId(model),
+						name: model.name,
+						description: `${model.provider}/${model.id}`,
+					})),
+				],
+			});
+		}
+		return options;
+	}
+
+	/** Session-scoped role assignment: writes only the runtime override layer, never persisted settings. */
+	#setRoleModelById(session: AgentSession, role: string, value: string): void {
+		if (!this.#getExportedModelRoles(session).includes(role)) {
+			throw new Error(`Unknown ACP model role: ${role}`);
+		}
+		if (value === MODEL_ROLE_INHERIT) {
+			session.settings.clearModelRoleOverride(role);
+			return;
+		}
+		const model = roleCandidatePool(role, session.settings, session.modelRegistry).find(
+			candidate => this.#toModelId(candidate) === value,
+		);
+		if (!model) {
+			throw new Error(`Unknown ACP model for role ${role}: ${value}`);
+		}
+		session.settings.overrideModelRoles({ [role]: this.#toModelId(model) });
 	}
 
 	#buildThinkingOptions(session: AgentSession): Array<{ value: string; name: string; description?: string }> {

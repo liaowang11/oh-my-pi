@@ -86,12 +86,18 @@ class ReplayTestSession {
 		this.sessionId = this.sessionManager.getSessionId();
 	}
 
+	modelRegistry = { getAvailable: (): Model[] => [TEST_MODEL] };
+
 	getAvailableModels(): Model[] {
 		return [TEST_MODEL];
 	}
 
 	getAvailableThinkingLevels(): ReadonlyArray<string> {
 		return [];
+	}
+
+	getVibeModeState(): undefined {
+		return undefined;
 	}
 
 	getPlanModeState(): undefined {

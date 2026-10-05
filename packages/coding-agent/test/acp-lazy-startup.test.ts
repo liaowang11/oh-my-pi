@@ -97,8 +97,8 @@ class LazyFakeSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string> } {
-		return { getApiKey: async (_model: Model) => "test-key" };
+	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; getAvailable: () => Model[] } {
+		return { getApiKey: async (_model: Model) => "test-key", getAvailable: () => this.getAvailableModels() };
 	}
 
 	getAvailableModels(): Model[] {
@@ -148,6 +148,10 @@ class LazyFakeSession {
 	}
 	setActiveToolsByName(): void {}
 	setClientBridge(): void {}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
+
 	getPlanModeState(): undefined {
 		return undefined;
 	}

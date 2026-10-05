@@ -114,6 +114,10 @@ class FakeAgentSession {
 	}
 	setActiveToolsByName(): void {}
 	setClientBridge(): void {}
+	getVibeModeState(): undefined {
+		return undefined;
+	}
+
 	getPlanModeState(): undefined {
 		return undefined;
 	}

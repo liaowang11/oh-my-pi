@@ -6,6 +6,7 @@ import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
+import { cfgAcpModelRoles } from "@oh-my-pi/pi-coding-agent/config/model-settings";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import { GoalRuntime } from "@oh-my-pi/pi-coding-agent/goals/runtime";
@@ -206,9 +207,10 @@ class FakeAgentSession {
 		return this.sessionManager.getHeader()?.title ?? `Session ${this.sessionId}`;
 	}
 
-	get modelRegistry(): { getApiKey: (model: Model) => Promise<string> } {
+	get modelRegistry(): { getApiKey: (model: Model) => Promise<string>; getAvailable: () => Model[] } {
 		return {
 			getApiKey: async (_model: Model) => "test-key",
+			getAvailable: () => this.getAvailableModels(),
 		};
 	}
 
@@ -800,6 +802,71 @@ describe("ACP agent", () => {
 		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "default" });
 		expect(session.planModeState).toBeUndefined();
 		expect(session.planProposalHandler).toBeUndefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("exports configured model roles as session config options", async () => {
+		const harness = await createHarness();
+		cfgAcpModelRoles.set(Settings.instance, ["smol", "plan"]);
+		type SelectOption = { id: string; currentValue?: unknown; options?: Array<{ value: string }> };
+		const roleOption = (options: unknown[] | null | undefined, id: string) =>
+			(options as SelectOption[] | undefined)?.find(option => option.id === id);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		expectAcpStructure(zNewSessionResponse, created);
+		const smol = roleOption(created.configOptions, "model_role:smol");
+		expect(smol?.currentValue).toBe("inherit");
+		expect(smol?.options?.map(option => option.value)).toEqual([
+			"inherit",
+			...TEST_MODELS.map(model => `${model.provider}/${model.id}`),
+		]);
+		expect(roleOption(created.configOptions, "model_role:plan")).toBeDefined();
+		expect(roleOption(created.configOptions, "model_role:slow")).toBeUndefined();
+		expect(roleOption(created.configOptions, "model_role:default")).toBeUndefined();
+
+		const target = `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`;
+		const set = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model_role:smol",
+			value: target,
+		});
+		expect(roleOption(set.configOptions, "model_role:smol")?.currentValue).toBe(target);
+		expect(Settings.instance.getModelRole("smol")).toBe(target);
+		const pushed = harness.updates.findLast(
+			n => n.sessionId === created.sessionId && n.update.sessionUpdate === "config_option_update",
+		);
+		expect(
+			pushed?.update.sessionUpdate === "config_option_update"
+				? roleOption(pushed.update.configOptions, "model_role:smol")?.currentValue
+				: undefined,
+		).toBe(target);
+		// The session model itself is untouched.
+		expect(harness.findSession(created.sessionId)?.model?.id).toBe(TEST_MODELS[0]!.id);
+
+		const cleared = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model_role:smol",
+			value: "inherit",
+		});
+		expect(roleOption(cleared.configOptions, "model_role:smol")?.currentValue).toBe("inherit");
+		expect(Settings.instance.getModelRole("smol")).toBeUndefined();
+
+		await expect(
+			harness.agent.setSessionConfigOption({
+				sessionId: created.sessionId,
+				configId: "model_role:slow",
+				value: target,
+			}),
+		).rejects.toThrow("Unknown ACP model role: slow");
+		await expect(
+			harness.agent.setSessionConfigOption({
+				sessionId: created.sessionId,
+				configId: "model_role:smol",
+				value: "openai/missing",
+			}),
+		).rejects.toThrow("Unknown ACP model for role smol");
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
