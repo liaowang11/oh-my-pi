@@ -575,6 +575,22 @@ class FakeAgentSession {
 		return [];
 	}
 
+	// `/session info` renders the per-model usage report from these stats.
+	getSessionStats() {
+		return {
+			sessionFile: undefined,
+			sessionId: this.sessionId,
+			userMessages: 0,
+			assistantMessages: 0,
+			toolCalls: 0,
+			toolResults: 0,
+			totalMessages: 0,
+			tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+			premiumRequests: 0,
+			cost: 0,
+		};
+	}
+
 	setForcedToolChoice(toolName: string): void {
 		this.forcedToolChoice = toolName;
 	}

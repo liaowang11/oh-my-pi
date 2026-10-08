@@ -75,6 +75,7 @@ import {
 } from "../../slash-commands/helpers/active-oauth-account";
 import { formatProviderName } from "../view-model/chrome/format";
 import { formatCompactQuota } from "../../advisor/advisor-config-types";
+import { formatCreditValue, formatSessionModelBreakdown } from "../../slash-commands/helpers/session-report";
 import { resolveTernPane, type TernPane } from "../../tools/browser/tern/kind";
 import { TernError, type TernErrorKind, type TernForked, TernSocketClient } from "../../tools/browser/tern/wire";
 import { outputMeta } from "../../tools/output-meta";
@@ -141,11 +142,6 @@ const TERN_FORK_UNCONFIRMED: Partial<Record<TernErrorKind, true>> = { closed: tr
 
 /** Rows `/session` spends on the builds that wrote the session, including the elision row. */
 const MAX_LISTED_BUILDS = 5;
-
-function formatCreditValue(value: number): string {
-	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
-}
-
 interface ForkTerminalDependencies {
 	classifyMultiplexer: (env: NodeJS.ProcessEnv) => MultiplexerId | null;
 	environment: () => NodeJS.ProcessEnv;
@@ -701,6 +697,12 @@ export class CommandController {
 				const value = row.tone === "warning" ? currentTheme().fg("warning", row.value) : row.value;
 				info += `${currentTheme().fg("dim", `${row.label}:`)} ${value}\n`;
 			}
+		}
+
+		const modelLines = formatSessionModelBreakdown(stats);
+		if (modelLines.length > 0) {
+			info += `\n${bold("Models")}\n`;
+			for (const line of modelLines) info += `${replaceTabs(sanitizeText(line))}\n`;
 		}
 
 		if (stats.cost > 0 || normalizedPremiumRequests > 0 || stats.credits !== undefined || stats.aiu !== undefined) {
