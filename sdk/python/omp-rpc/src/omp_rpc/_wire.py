@@ -809,6 +809,22 @@ class SessionCredits:
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
+class SessionUsageSlice:
+    tokens: TokenUsage
+    cost: float
+    calls: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
+class SessionModelStats:
+    provider: str
+    model: str
+    tokens: TokenUsage
+    cost: float
+    calls: int
+
+
+@dataclass(slots=True, frozen=True, kw_only=True)
 class SessionStats:
     session_id: str
     user_messages: int
@@ -824,6 +840,8 @@ class SessionStats:
     routed_models: dict[str, float] | None = None
     edit_rejections: dict[str, float] | None = None
     """Failed edits by the engine's `errorKind`."""
+    models: tuple[SessionModelStats, ...] | None = None
+    subagents: SessionUsageSlice | None = None
     context_usage: ContextUsage | None = None
 
 
@@ -2180,6 +2198,26 @@ def parse_session_credits(value: object, path: str = "SessionCredits") -> Sessio
     )
 
 
+def parse_session_usage_slice(value: object, path: str = "SessionUsageSlice") -> SessionUsageSlice:
+    payload = expect_object(value, path)
+    return SessionUsageSlice(
+        tokens=required(payload, "tokens", parse_token_usage, path),
+        cost=required(payload, "cost", decode_float, path),
+        calls=required(payload, "calls", decode_int, path),
+    )
+
+
+def parse_session_model_stats(value: object, path: str = "SessionModelStats") -> SessionModelStats:
+    payload = expect_object(value, path)
+    return SessionModelStats(
+        provider=required(payload, "provider", decode_str, path),
+        model=required(payload, "model", decode_str, path),
+        tokens=required(payload, "tokens", parse_token_usage, path),
+        cost=required(payload, "cost", decode_float, path),
+        calls=required(payload, "calls", decode_int, path),
+    )
+
+
 def parse_session_stats(value: object, path: str = "SessionStats") -> SessionStats:
     payload = expect_object(value, path)
     return SessionStats(
@@ -2196,6 +2234,8 @@ def parse_session_stats(value: object, path: str = "SessionStats") -> SessionSta
         credits=optional(payload, "credits", parse_session_credits, path),
         routed_models=optional(payload, "routedModels", record(decode_float), path),
         edit_rejections=optional(payload, "editRejections", record(decode_float), path),
+        models=optional(payload, "models", array(parse_session_model_stats), path),
+        subagents=optional(payload, "subagents", parse_session_usage_slice, path),
         context_usage=optional(payload, "contextUsage", parse_context_usage, path),
     )
 
@@ -4074,10 +4114,12 @@ __all__ = [
     "SessionCredits",
     "SessionEntries",
     "SessionInfoUpdateEvent",
+    "SessionModelStats",
     "SessionSettledEvent",
     "SessionState",
     "SessionStats",
     "SessionTree",
+    "SessionUsageSlice",
     "SetEditorTextUiRequest",
     "SetStatusUiRequest",
     "SetTitleUiRequest",
@@ -4251,10 +4293,12 @@ __all__ = [
     "parse_session_credits",
     "parse_session_entries",
     "parse_session_info_update_event",
+    "parse_session_model_stats",
     "parse_session_settled_event",
     "parse_session_state",
     "parse_session_stats",
     "parse_session_tree",
+    "parse_session_usage_slice",
     "parse_set_editor_text_ui_request",
     "parse_set_status_ui_request",
     "parse_set_title_ui_request",

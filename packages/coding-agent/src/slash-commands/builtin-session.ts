@@ -30,6 +30,7 @@ import {
 	toResetUsageAccounts,
 } from "./helpers/reset-usage";
 import type { ResetUsageAccount } from "@oh-my-pi/pi-tui/overlays/reset-usage-selector";
+import { buildSessionReportText } from "./helpers/session-report";
 import { matchSessionPinAccounts, toSessionPinAccounts } from "./helpers/session-pin";
 import {
 	launchStatsDashboard,
@@ -262,12 +263,13 @@ export const BUILTIN_SESSION_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		handle: async (command, runtime) => {
 			const { verb, rest } = parseSubcommand(command.args);
 			if (!verb || (verb === "info" && !rest)) {
+				const model = runtime.session.model;
 				await runtime.output(
-					[
-						`Session: ${runtime.session.sessionId}`,
-						`Title: ${runtime.session.sessionName}`,
-						`CWD: ${runtime.cwd}`,
-					].join("\n"),
+					buildSessionReportText(runtime.session.getSessionStats(), {
+						title: runtime.session.sessionName,
+						cwd: runtime.cwd,
+						model: model ? `${model.provider}/${model.id}` : undefined,
+					}),
 				);
 				return commandConsumed();
 			}
