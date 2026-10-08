@@ -625,6 +625,20 @@ export interface SessionCredits {
 	acuCost: number;
 }
 
+export interface SessionUsageSlice {
+	tokens: TokenUsage;
+	cost: number;
+	calls: number;
+}
+
+export interface SessionModelStats {
+	provider: string;
+	model: string;
+	tokens: TokenUsage;
+	cost: number;
+	calls: number;
+}
+
 export interface SessionStats {
 	sessionId: string;
 	userMessages: number;
@@ -638,6 +652,8 @@ export interface SessionStats {
 	sessionFile?: string;
 	credits?: SessionCredits;
 	routedModels?: Record<string, number>;
+	models?: SessionModelStats[];
+	subagents?: SessionUsageSlice;
 	contextUsage?: ContextUsage;
 }
 
