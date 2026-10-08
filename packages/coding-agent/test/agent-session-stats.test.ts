@@ -416,6 +416,65 @@ describe("AgentSession session stats", () => {
 		}
 	});
 
+	it("splits usage per provider/model and keeps unattributed subagent usage apart", () => {
+		const target = model();
+		const makeUsage = (input: number, output: number, cost: number): Usage => ({
+			input,
+			output,
+			cacheRead: 0,
+			cacheWrite: 0,
+			totalTokens: input + output,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: cost },
+		});
+		const assistant = (modelId: string, usage: Usage, timestamp: number): AssistantMessage => ({
+			role: "assistant",
+			content: [{ type: "text", text: "reply" }],
+			api: target.api,
+			provider: target.provider,
+			model: modelId,
+			usage,
+			stopReason: "stop",
+			timestamp,
+		});
+		const manager = SessionManager.inMemory();
+		// A journaled role-model call (judge, auto-thinking, ...) lands on `target` too.
+		appendUsage(manager, target, 7, { totalTokens: 7 });
+		const messages: Message[] = [
+			assistant("model-a", makeUsage(10, 5, 1), 1),
+			assistant("model-b", makeUsage(100, 50, 10), 2),
+			assistant("model-a", makeUsage(20, 5, 2), 3),
+			{
+				role: "toolResult",
+				toolCallId: "call-1",
+				toolName: "task",
+				content: [{ type: "text", text: "done" }],
+				details: { usage: makeUsage(1000, 500, 100) },
+				isError: false,
+				timestamp: 4,
+			},
+		];
+		session = new AgentSession({
+			agent: new Agent({ initialState: { model: target, systemPrompt: ["Test"], tools: [], messages } }),
+			sessionManager: manager,
+			settings: Settings.isolated({ "compaction.enabled": false }),
+			modelRegistry,
+		});
+
+		const stats = session.getSessionStats();
+
+		expect(
+			stats.models?.map(entry => [entry.provider, entry.model, entry.calls, entry.tokens.total, entry.cost]),
+		).toEqual([
+			[target.provider, "model-b", 1, 150, 10],
+			[target.provider, "model-a", 2, 40, 3],
+			[target.provider, target.id, 1, 7, 7],
+		]);
+		expect(stats.subagents).toMatchObject({ calls: 1, tokens: { input: 1000, output: 500, total: 1500 }, cost: 100 });
+		// Per-model rows plus subagents account for every token in the session total.
+		const attributed = (stats.models ?? []).reduce((sum, entry) => sum + entry.tokens.total, 0);
+		expect(attributed + (stats.subagents?.tokens.total ?? 0)).toBe(stats.tokens.total);
+	});
+
 	it("aggregates provider credits and concrete routed models", () => {
 		const model = modelRegistry.getAll().find(candidate => candidate.contextWindow && candidate.contextWindow > 0);
 		if (!model) throw new Error("Expected a bundled model");

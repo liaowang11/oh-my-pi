@@ -13,6 +13,7 @@ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import { PluginManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins";
 import { MarketplaceManager } from "@oh-my-pi/pi-coding-agent/extensibility/plugins/marketplace";
 import type { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import type { SessionStats } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 import type { SessionDumpArchive } from "@oh-my-pi/pi-coding-agent/session/session-dump-format";
 import type { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "@oh-my-pi/pi-coding-agent/slash-commands/acp-builtins";
@@ -46,6 +47,7 @@ interface FakeAcpBuiltinSession {
 	isUltrafastModeEnabled(): boolean;
 	setForcedToolChoice(toolName: string): void;
 	fetchUsageReports?: () => Promise<unknown>;
+	getSessionStats: () => SessionStats;
 	getAsyncJobSnapshot: (opts?: { recentLimit?: number }) => { running: unknown[]; recent: unknown[] } | null;
 	cancelAsyncJob: (id: string) => boolean;
 	formatSessionAsText: () => string;
@@ -85,6 +87,21 @@ interface FakeAcpBuiltinSession {
 	setModelTemporary(model: unknown, thinkingLevel?: string): Promise<void>;
 	listResetCredits: () => Promise<ResetCreditAccountStatus[]>;
 	redeemResetCredit: (target: ResetCreditTarget) => Promise<ResetCreditRedeemOutcome>;
+}
+
+function emptySessionStats(sessionId: string): SessionStats {
+	return {
+		sessionFile: undefined,
+		sessionId,
+		userMessages: 0,
+		assistantMessages: 0,
+		toolCalls: 0,
+		toolResults: 0,
+		totalMessages: 0,
+		tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		premiumRequests: 0,
+		cost: 0,
+	};
 }
 
 function createRuntime() {
@@ -170,6 +187,7 @@ function createRuntime() {
 		// Headless `/move` and `/wt` rebind memory for the destination project.
 		getHindsightSessionState: () => undefined,
 		async applyMemoryBackend() {},
+		getSessionStats: () => emptySessionStats(session.sessionId),
 		getAsyncJobSnapshot: () => null,
 		cancelAsyncJob: () => false,
 		formatSessionAsText: () => "",
@@ -875,6 +893,49 @@ describe("ACP builtin slash commands", () => {
 });
 
 describe("session lifecycle commands", () => {
+	it("/session: reports tokens, cost, and a per-model breakdown in ACP text mode", async () => {
+		const { output, session, runtime } = createRuntime();
+		const slice = (input: number, output: number, total: number, cost: number) => ({
+			tokens: { input, output, reasoning: 0, cacheRead: 2_000, cacheWrite: 300, total },
+			cost,
+		});
+		session.getSessionStats = () => ({
+			...emptySessionStats(session.sessionId),
+			sessionFile: "/tmp/sessions/fake.jsonl",
+			userMessages: 2,
+			assistantMessages: 3,
+			toolCalls: 4,
+			toolResults: 4,
+			totalMessages: 9,
+			tokens: { input: 1_130, output: 265, reasoning: 0, cacheRead: 4_000, cacheWrite: 600, total: 1_995 },
+			cost: 1.5,
+			routedModels: { "claude-opus-4-6": 2 },
+			models: [
+				{ provider: "anthropic", model: "claude-opus-4-6", calls: 2, ...slice(1_100, 250, 1_350, 1.25) },
+				{ provider: "typesafe", model: "jev-latest", calls: 1, ...slice(30, 15, 45, 0.25) },
+			],
+			subagents: { calls: 1, ...slice(0, 0, 600, 0) },
+		});
+
+		const result = await executeAcpBuiltinSlashCommand("/session", runtime);
+
+		expect(result).toEqual({ consumed: true });
+		const text = output.join("\n");
+		expect(text).toContain("Session: fake-session-id");
+		expect(text).toContain("File: /tmp/sessions/fake.jsonl");
+		expect(text).toMatch(/Input:\s+1,130/);
+		expect(text).toMatch(/Total:\s+1,995/);
+		expect(text).toContain("Cost: 1.5000");
+		expect(text).toContain("claude-opus-4-6 ×2");
+		const modelLines = text.split("\n").filter(line => /^\s*(anthropic|typesafe)\//.test(line));
+		expect(modelLines).toHaveLength(2);
+		expect(modelLines[0]).toContain("anthropic/claude-opus-4-6");
+		expect(modelLines[0]).toContain("1,350");
+		expect(modelLines[0]).toContain("$1.2500");
+		expect(modelLines[1]).toContain("typesafe/jev-latest");
+		expect(text).toMatch(/subagents.*600/i);
+	});
+
 	it("/session delete: returns in-memory usage when no sessionFile", async () => {
 		const { output, runtime } = createRuntime();
 		const result = await executeAcpBuiltinSlashCommand("/session delete", runtime);

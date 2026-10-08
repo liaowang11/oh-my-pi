@@ -206,6 +206,14 @@ export const stateDefs = {
 		total: "number.integer",
 	},
 	SessionCredits: { cost: "number", committedCost: "number", acuCost: "number" },
+	SessionUsageSlice: { tokens: "TokenUsage", cost: "number", calls: "number.integer" },
+	SessionModelStats: {
+		provider: "string",
+		model: "string",
+		tokens: "TokenUsage",
+		cost: "number",
+		calls: "number.integer",
+	},
 	SessionStats: {
 		"sessionFile?": "string",
 		sessionId: "string",
@@ -219,6 +227,8 @@ export const stateDefs = {
 		cost: "number",
 		"credits?": "SessionCredits",
 		"routedModels?": "Record<string, number>",
+		"models?": "SessionModelStats[]",
+		"subagents?": "SessionUsageSlice",
 		"contextUsage?": "ContextUsage",
 	},
 	MessagesPage: {

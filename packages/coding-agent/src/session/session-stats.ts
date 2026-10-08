@@ -16,9 +16,9 @@ import {
 	computeNonMessageTokens,
 	type NonMessageTokenSource,
 } from "@oh-my-pi/pi-tui/status-line/context-usage";
-import type { ContextUsageBreakdown, SessionStats } from "./agent-session-types";
+import type { ContextUsageBreakdown, SessionModelStats, SessionStats, SessionUsageSlice } from "./agent-session-types";
 import { getLatestCompactionEntry } from "./session-context";
-import type { SessionEntry } from "./session-entries";
+import type { ModelUsageEntry, SessionEntry } from "./session-entries";
 import type { SessionManager } from "./session-manager";
 import { cfgSkillful } from "./settings";
 
@@ -60,7 +60,10 @@ function isUsageWindowBoundary(entry: SessionEntry): boolean {
 }
 
 /** Model calls belonging to the same active transcript window as `agent.state.messages`. */
-function forEachActiveModelUsage(branch: readonly SessionEntry[], visit: (usage: Usage) => void): void {
+function forEachActiveModelUsage(
+	branch: readonly SessionEntry[],
+	visit: (usage: Usage, entry: ModelUsageEntry) => void,
+): void {
 	const latestCompaction = getLatestCompactionEntry(branch);
 	const compactionIndex = latestCompaction ? branch.lastIndexOf(latestCompaction) : -1;
 	let resetIndex = -1;
@@ -80,8 +83,23 @@ function forEachActiveModelUsage(branch: readonly SessionEntry[], visit: (usage:
 	}
 	for (let index = startIndex; index < branch.length; index++) {
 		const entry = branch[index];
-		if (entry.type === "model_usage") visit(entry.usage);
+		if (entry.type === "model_usage") visit(entry.usage, entry);
 	}
+}
+
+function emptySlice(): SessionUsageSlice {
+	return { tokens: { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, total: 0 }, cost: 0, calls: 0 };
+}
+
+function addToSlice(slice: SessionUsageSlice, usage: Usage): void {
+	slice.tokens.input += usage.input;
+	slice.tokens.output += usage.output;
+	slice.tokens.reasoning += usage.reasoningTokens ?? 0;
+	slice.tokens.cacheRead += usage.cacheRead;
+	slice.tokens.cacheWrite += usage.cacheWrite;
+	slice.tokens.total += usage.totalTokens;
+	slice.cost += usage.cost.total;
+	slice.calls++;
 }
 
 /** Computes session totals and tracks the in-flight context estimate. */
@@ -166,6 +184,17 @@ export class SessionStatsTracker {
 		let committedAcuCost = 0;
 		let hasCredits = false;
 		const routedModels: Record<string, number> = {};
+		const modelSlices = new Map<string, SessionModelStats>();
+		let subagents: SessionUsageSlice | undefined;
+		const addModelUsage = (provider: string, model: string, usage: Usage): void => {
+			const key = `${provider}\0${model}`;
+			let slice = modelSlices.get(key);
+			if (!slice) {
+				slice = { provider, model, ...emptySlice() };
+				modelSlices.set(key, slice);
+			}
+			addToSlice(slice, usage);
+		};
 		const addUsage = (usage: Usage): void => {
 			totalInput += usage.input;
 			totalOutput += usage.output;
@@ -190,7 +219,11 @@ export class SessionStatsTracker {
 				toolResults++;
 				if (message.toolName === "task") {
 					const usage = taskToolUsage(message.details);
-					if (usage) addUsage(usage);
+					if (usage) {
+						addUsage(usage);
+						subagents ??= emptySlice();
+						addToSlice(subagents, usage);
+					}
 				}
 			} else if (message.role === "assistant") {
 				assistantMessages++;
@@ -201,12 +234,20 @@ export class SessionStatsTracker {
 				const usage = message.usage;
 				if (!usage) continue;
 				addUsage(usage);
+				addModelUsage(message.provider, message.model, usage);
 				if (message.upstreamModel !== undefined) {
 					routedModels[message.upstreamModel] = (routedModels[message.upstreamModel] ?? 0) + 1;
 				}
 			}
 		}
-		forEachActiveModelUsage(this.#host.sessionManager.getBranchView(), addUsage);
+		forEachActiveModelUsage(this.#host.sessionManager.getBranchView(), (usage, entry) => {
+			addUsage(usage);
+			addModelUsage(entry.provider, entry.model, usage);
+		});
+		const models = [...modelSlices.values()].sort(
+			(a, b) =>
+				b.tokens.total - a.tokens.total || a.provider.localeCompare(b.provider) || a.model.localeCompare(b.model),
+		);
 		return {
 			sessionFile: this.#host.sessionManager.getSessionFile(),
 			sessionId: this.#host.sessionId(),
@@ -235,6 +276,8 @@ export class SessionStatsTracker {
 					}
 				: undefined),
 			...(Object.keys(routedModels).length > 0 ? { routedModels } : undefined),
+			...(models.length > 0 ? { models } : undefined),
+			...(subagents ? { subagents } : undefined),
 			contextUsage: this.getContextUsage(),
 		};
 	}

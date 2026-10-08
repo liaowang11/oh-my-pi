@@ -3256,6 +3256,22 @@ pub struct SessionCredits {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionUsageSlice {
+	pub tokens: TokenUsage,
+	pub cost: f64,
+	pub calls: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionModelStats {
+	pub provider: String,
+	pub model: String,
+	pub tokens: TokenUsage,
+	pub cost: f64,
+	pub calls: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SessionStats {
 	#[serde(rename = "sessionId")]
 	pub session_id: String,
@@ -3279,6 +3295,10 @@ pub struct SessionStats {
 	pub credits: Option<SessionCredits>,
 	#[serde(rename = "routedModels", default, skip_serializing_if = "Option::is_none")]
 	pub routed_models: Option<BTreeMap<String, f64>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub models: Option<Vec<SessionModelStats>>,
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub subagents: Option<SessionUsageSlice>,
 	#[serde(rename = "contextUsage", default, skip_serializing_if = "Option::is_none")]
 	pub context_usage: Option<ContextUsage>,
 }

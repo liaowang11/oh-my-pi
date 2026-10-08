@@ -515,6 +515,27 @@ export interface ContextUsageBreakdown {
 	messagesTokens: number;
 }
 
+/** Token and cost totals for one slice of a session's model usage. */
+export interface SessionUsageSlice {
+	tokens: {
+		input: number;
+		output: number;
+		reasoning: number;
+		cacheRead: number;
+		cacheWrite: number;
+		total: number;
+	};
+	cost: number;
+	/** Number of model calls (or subagent runs) in this slice. */
+	calls: number;
+}
+
+/** Usage of one provider/model pair in a session. */
+export interface SessionModelStats extends SessionUsageSlice {
+	provider: string;
+	model: string;
+}
+
 /** Session statistics for the `/session` command. */
 export interface SessionStats {
 	sessionFile: string | undefined;
@@ -541,6 +562,10 @@ export interface SessionStats {
 	};
 	/** Concrete provider-routed model ids with finalized turn counts. */
 	routedModels?: Record<string, number>;
+	/** Usage per provider/model, largest token total first. Excludes subagent runs. */
+	models?: SessionModelStats[];
+	/** Usage reported by completed `task` subagents; their models are not recorded. */
+	subagents?: SessionUsageSlice;
 	contextUsage?: ContextUsage;
 }
 

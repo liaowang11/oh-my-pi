@@ -2995,6 +2995,52 @@
 				"acuCost"
 			]
 		},
+		"SessionUsageSlice": {
+			"type": "object",
+			"properties": {
+				"tokens": {
+					"$ref": "#/$defs/TokenUsage"
+				},
+				"cost": {
+					"type": "number"
+				},
+				"calls": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"tokens",
+				"cost",
+				"calls"
+			]
+		},
+		"SessionModelStats": {
+			"type": "object",
+			"properties": {
+				"provider": {
+					"type": "string"
+				},
+				"model": {
+					"type": "string"
+				},
+				"tokens": {
+					"$ref": "#/$defs/TokenUsage"
+				},
+				"cost": {
+					"type": "number"
+				},
+				"calls": {
+					"type": "integer"
+				}
+			},
+			"required": [
+				"provider",
+				"model",
+				"tokens",
+				"cost",
+				"calls"
+			]
+		},
 		"SessionStats": {
 			"type": "object",
 			"properties": {
@@ -3037,6 +3083,15 @@
 					"additionalProperties": {
 						"type": "number"
 					}
+				},
+				"models": {
+					"type": "array",
+					"items": {
+						"$ref": "#/$defs/SessionModelStats"
+					}
+				},
+				"subagents": {
+					"$ref": "#/$defs/SessionUsageSlice"
 				},
 				"contextUsage": {
 					"$ref": "#/$defs/ContextUsage"
