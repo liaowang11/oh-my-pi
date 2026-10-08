@@ -2978,6 +2978,56 @@ func (v *SessionCredits) decodeFrom(raw map[string]json.RawMessage) error {
 	return nil
 }
 
+type SessionUsageSlice struct {
+	Tokens TokenUsage `json:"tokens"`
+	Cost   float64    `json:"cost"`
+	Calls  int64      `json:"calls"`
+}
+
+func (v *SessionUsageSlice) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionUsageSlice", v.decodeFrom)
+}
+
+func (v *SessionUsageSlice) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionUsageSlice
+	d := fieldDecoder{raw: raw, owner: "SessionUsageSlice"}
+	d.required("tokens", &out.Tokens)
+	d.required("cost", &out.Cost)
+	d.required("calls", &out.Calls)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
+type SessionModelStats struct {
+	Provider string     `json:"provider"`
+	Model    string     `json:"model"`
+	Tokens   TokenUsage `json:"tokens"`
+	Cost     float64    `json:"cost"`
+	Calls    int64      `json:"calls"`
+}
+
+func (v *SessionModelStats) UnmarshalJSON(data []byte) error {
+	return decodeWith(data, "SessionModelStats", v.decodeFrom)
+}
+
+func (v *SessionModelStats) decodeFrom(raw map[string]json.RawMessage) error {
+	var out SessionModelStats
+	d := fieldDecoder{raw: raw, owner: "SessionModelStats"}
+	d.required("provider", &out.Provider)
+	d.required("model", &out.Model)
+	d.required("tokens", &out.Tokens)
+	d.required("cost", &out.Cost)
+	d.required("calls", &out.Calls)
+	if d.err != nil {
+		return d.err
+	}
+	*v = out
+	return nil
+}
+
 type SessionStats struct {
 	SessionID         string             `json:"sessionId"`
 	UserMessages      int64              `json:"userMessages"`
@@ -2992,8 +3042,10 @@ type SessionStats struct {
 	Credits           *SessionCredits    `json:"credits,omitempty"`
 	RoutedModels      map[string]float64 `json:"routedModels,omitempty"`
 	// Failed edits by the engine's `errorKind`.
-	EditRejections map[string]float64 `json:"editRejections,omitempty"`
-	ContextUsage   *ContextUsage      `json:"contextUsage,omitempty"`
+	EditRejections map[string]float64  `json:"editRejections,omitempty"`
+	Models         []SessionModelStats `json:"models,omitempty"`
+	Subagents      *SessionUsageSlice  `json:"subagents,omitempty"`
+	ContextUsage   *ContextUsage       `json:"contextUsage,omitempty"`
 }
 
 func (v *SessionStats) UnmarshalJSON(data []byte) error {
@@ -3016,6 +3068,8 @@ func (v *SessionStats) decodeFrom(raw map[string]json.RawMessage) error {
 	d.optional("credits", &out.Credits)
 	d.optional("routedModels", &out.RoutedModels)
 	d.optional("editRejections", &out.EditRejections)
+	d.optional("models", &out.Models)
+	d.optional("subagents", &out.Subagents)
 	d.optional("contextUsage", &out.ContextUsage)
 	if d.err != nil {
 		return d.err
