@@ -86,6 +86,7 @@ import {
 	formatCodexUsageReportLabel,
 	limitMatchesActiveAccount,
 } from "../../slash-commands/helpers/active-oauth-account";
+import { formatCreditValue, formatSessionModelBreakdown } from "../../slash-commands/helpers/session-report";
 import { formatProviderName } from "@oh-my-pi/pi-tui/chrome/format";
 import { formatCompactQuota } from "@oh-my-pi/pi-tui/overlays/advisor-config";
 import { resolveTernPane } from "../../tools/browser/tern/kind";
@@ -135,11 +136,6 @@ const TERN_FORK_UNCONFIRMED: Partial<Record<TernErrorKind, true>> = { closed: tr
 
 /** Rows `/session` spends on the builds that wrote the session, including the elision row. */
 const MAX_LISTED_BUILDS = 5;
-
-function formatCreditValue(value: number): string {
-	return value.toLocaleString(undefined, { maximumFractionDigits: 4 });
-}
-
 interface ForkTerminalDependencies {
 	classifyTerminalMultiplexer: typeof classifyTerminalMultiplexer;
 	environment: () => NodeJS.ProcessEnv;
@@ -671,6 +667,12 @@ export class CommandController {
 				const value = row.tone === "warning" ? theme.fg("warning", row.value) : row.value;
 				info += `${theme.fg("dim", `${row.label}:`)} ${value}\n`;
 			}
+		}
+
+		const modelLines = formatSessionModelBreakdown(stats);
+		if (modelLines.length > 0) {
+			info += `\n${theme.bold("Models")}\n`;
+			for (const line of modelLines) info += `${replaceTabs(sanitizeText(line))}\n`;
 		}
 
 		if (stats.cost > 0 || normalizedPremiumRequests > 0 || stats.credits !== undefined) {
