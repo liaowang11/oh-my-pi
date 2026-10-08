@@ -3603,19 +3603,21 @@ describe("ACP agent", () => {
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(request.message).toBe("Which approach?");
 			expect(request.requestedSchema.required).toBeUndefined();
+			// The question rides in `message`; repeating it on the field renders it twice.
 			expect(request.requestedSchema.properties.q0).toEqual({
 				type: "string",
-				title: "Which approach?",
-				description: "Choose one",
+				title: "Choose one",
 				oneOf: [
 					{ const: "Approach A", title: "Approach A", description: "Faster" },
 					{ const: "Approach B", title: "Approach B", description: "Safer" },
 				],
 				default: "Approach A",
 			});
+			// The marker lets clients fold the free-text field into the select as one more option.
 			expect(request.requestedSchema.properties.q0__other).toEqual({
 				type: "string",
 				title: "Other (type your own)",
+				_meta: { _askUserQuestionCustomAnswer: { questionId: "q0", isCustomAnswer: true } },
 			});
 			expect(result).toEqual({
 				kind: "submit",
@@ -3706,7 +3708,7 @@ describe("ACP agent", () => {
 			const ctx = createAcpExtensionUiContext(connection, () => "session-ask-no-options", FORM_CAPABILITIES);
 
 			const result = await ctx.askDialog!([
-				{ id: "single", question: "Single?", options: [] },
+				{ id: "single", question: "Single?", header: "One", options: [] },
 				{ id: "multi", question: "Multi?", options: [], multi: true },
 			]);
 
@@ -3714,6 +3716,14 @@ describe("ACP agent", () => {
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0__other", "q1__other"]);
+			// The free-text field is the whole question, so it is labelled as one;
+			// no select to fold into, so no companion marker either.
+			expect(request.requestedSchema.properties.q0__other).toEqual({
+				type: "string",
+				title: "One",
+				description: "Single?",
+			});
+			expect(request.requestedSchema.properties.q1__other).toEqual({ type: "string", title: "Multi?" });
 			expect(result?.kind === "submit" ? result.results : undefined).toMatchObject([
 				{ id: "single", selectedOptions: [], customInput: "single answer" },
 				{ id: "multi", selectedOptions: [], customInput: "multi answer" },
@@ -3743,6 +3753,7 @@ describe("ACP agent", () => {
 				{
 					id: "storage",
 					question: "Storage?",
+					header: "Storage",
 					options: [{ label: "SQLite" }, { label: "PostgreSQL" }],
 				},
 				{
@@ -3758,6 +3769,13 @@ describe("ACP agent", () => {
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(request.message).toBe("Answer 2 questions");
 			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0", "q0__other", "q1", "q1__other"]);
+			// `message` names no question here, so each field carries its own text.
+			expect(request.requestedSchema.properties.q0).toMatchObject({ title: "Storage", description: "Storage?" });
+			expect(request.requestedSchema.properties.q1).toMatchObject({ title: "Features?" });
+			expect(request.requestedSchema.properties.q1).not.toHaveProperty("description");
+			expect(request.requestedSchema.properties.q1__other).toMatchObject({
+				_meta: { _askUserQuestionCustomAnswer: { questionId: "q1", isCustomAnswer: true } },
+			});
 			expect(result?.kind === "submit" ? result.results.map(item => item.id) : undefined).toEqual([
 				"storage",
 				"features",

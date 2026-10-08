@@ -580,12 +580,16 @@ export function createAcpExtensionUiContext(
 					title: option.label,
 					...(option.description?.trim() ? { description: option.description.trim() } : {}),
 				}));
-				const description = question.header?.trim();
+				// A single question already travels as the elicitation `message`, so the
+				// field carries only the header; repeating the question renders it twice.
+				const header = question.header?.trim();
+				const title = header || question.question;
+				const description = header && questions.length > 1 ? question.question : undefined;
 				if (entries.length > 0) {
 					if (question.multi === true) {
 						properties[key] = {
 							type: "array",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							items: { anyOf: entries },
 						};
@@ -593,7 +597,7 @@ export function createAcpExtensionUiContext(
 						const recommended = question.recommended;
 						properties[key] = {
 							type: "string",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							oneOf: entries,
 							...(recommended !== undefined && recommended >= 0 && recommended < question.options.length
@@ -602,7 +606,18 @@ export function createAcpExtensionUiContext(
 						};
 					}
 				}
-				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
+				// Marks the free-text field as the select's companion so clients
+				// (agent-shell, JetBrains AIR) offer it as one more option of that
+				// select instead of a separate field. Same key claude-agent-acp sends.
+				// Without options the free-text field is the whole question.
+				properties[`${key}__other`] =
+					entries.length > 0
+						? {
+								type: "string",
+								title: OTHER_OPTION,
+								_meta: { _askUserQuestionCustomAnswer: { questionId: key, isCustomAnswer: true } },
+							}
+						: { type: "string", title, ...(description ? { description } : {}) };
 			}
 
 			let timedOut = false;
