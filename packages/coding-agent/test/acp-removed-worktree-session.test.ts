@@ -15,6 +15,7 @@ import { AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { resetSessionIndexForTests } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createSessionWorktree } from "@oh-my-pi/pi-coding-agent/session/session-worktree";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -72,6 +73,8 @@ describe.skipIf(process.platform === "win32")("ACP sessions from removed git wor
 		for (const session of sessions) await session.dispose();
 		authStorage.close();
 		resetSettingsForTest();
+		// The process-wide `<agentDir>/history.db` handle must not outlive the temp agent dir.
+		resetSessionIndexForTests();
 		if (originalAgentDir) {
 			setAgentDir(originalAgentDir);
 		} else {
@@ -154,4 +157,21 @@ describe.skipIf(process.platform === "win32")("ACP sessions from removed git wor
 			expect(fs.existsSync(gone.file)).toBe(false);
 		});
 	}
+
+	it("unstable_forkSession forks a removed worktree's session into the request cwd and leaves the source in place", async () => {
+		const gone = await sessionMovedByWt("wt/fork");
+		await removeWorktree(gone.worktree);
+
+		const forked = await createAgent().unstable_forkSession({ sessionId: gone.id, cwd: repo, mcpServers: [] });
+
+		const fork = sessions.find(s => s.sessionId === forked.sessionId);
+		expect(forked.sessionId).not.toBe(gone.id);
+		expect(fork?.sessionManager.getCwd()).toBe(repo);
+		expect(fork?.sessionManager.getHeader()?.parentSession).toBe(gone.id);
+		expect(fork?.sessionManager.buildSessionContext().messages.map(m => m.role)).toEqual(["user", "assistant"]);
+		// Forking copies, like `omp --fork`: the source keeps its file and recorded cwd.
+		const source = await SessionManager.open(gone.file);
+		expect(source.getHeader()?.cwd).toBe(gone.worktree);
+		await source.close();
+	});
 });

@@ -81,7 +81,7 @@ import type { AgentSession, AgentSessionEvent } from "../../session/agent-sessio
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
-import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
+import { readSessionInfo, type SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
@@ -1495,11 +1495,13 @@ export class AcpAgent implements Agent {
 			}),
 		);
 		try {
-			const success = await session.switchSession(sourcePath);
+			const copied = await this.#forkFromRemovedWorktree(sourcePath, session.sessionManager);
+			const success = await session.switchSession(copied ?? sourcePath);
 			if (!success) {
 				throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
 			}
-			const forked = await session.fork();
+			// A copy out of a removed worktree already is the fork.
+			const forked = copied !== undefined || (await session.fork());
 			if (!forked) {
 				throw new Error(`ACP session fork failed: ${params.sessionId}`);
 			}
@@ -1554,6 +1556,23 @@ export class AcpAgent implements Agent {
 				`Cannot resume ACP session ${stored.id} from removed worktree ${stored.cwd}: ${error.message} Close the session in the other omp process, then load it again.`,
 			);
 		}
+	}
+
+	/**
+	 * Fork a session recorded in a removed worktree of the request cwd's
+	 * repository into that cwd, as `omp --fork` does: the source cannot be
+	 * entered, and forking copies it, so the source stays where it is.
+	 * Returns the fork's session file, or undefined for any other source.
+	 */
+	async #forkFromRemovedWorktree(sourcePath: string, target: SessionManager): Promise<string | undefined> {
+		const cwd = target.getCwd();
+		const sessionDir = target.getSessionDir();
+		const source = await readSessionInfo(sourcePath);
+		if (!source || !(await SessionManager.isFromRemovedWorktree(source, cwd, sessionDir))) return undefined;
+		const fork = await SessionManager.forkFrom(sourcePath, cwd, sessionDir);
+		const forkPath = fork.getSessionFile();
+		await fork.close();
+		return forkPath;
 	}
 
 	async #registerPreparedSession(
