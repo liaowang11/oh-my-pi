@@ -245,10 +245,6 @@ class FakeAgentSession {
 	setSlashCommands(_commands: unknown[]): void {
 		// no-op for tests
 	}
-	titleInputs: string[] = [];
-	maybeStartTitleGeneration(firstMessage: string, _onStart?: () => (() => void) | void): void {
-		this.titleInputs.push(firstMessage);
-	}
 	setUsageFallbackConfirmer(
 		confirmer: ((confirmation: UsageFallbackConfirmation) => Promise<boolean>) | undefined,
 	): void {
@@ -2502,27 +2498,6 @@ describe("ACP agent", () => {
 		expect(response.stopReason).toBe("end_turn");
 		expect(session.promptCalls).toEqual(["Ship the release"]);
 		expect(session.customMessages).toEqual([]);
-		harness.abortController.abort();
-	});
-
-	it("titles the session from model-bound text, never from builtin command text", async () => {
-		const harness = await createHarness();
-		cfgGoalContinuationModes.set(Settings.instance, ["interactive"]);
-		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
-		const session = harness.findSession(created.sessionId)!;
-		const send = async (text: string) =>
-			await harness.agent.prompt({
-				sessionId: created.sessionId,
-				prompt: [{ type: "text", text }],
-			} as PromptRequest);
-
-		await send("/goal show");
-		await send("/guided-goal ship something");
-		expect(session.titleInputs).toEqual([]);
-		await send("/goal drop");
-		await send("/goal set Ship the release");
-		await send("plain follow-up");
-		expect(session.titleInputs).toEqual(["Ship the release", "plain follow-up"]);
 		harness.abortController.abort();
 	});
 

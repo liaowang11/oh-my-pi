@@ -1137,10 +1137,6 @@ export class AcpAgent implements Agent {
 		if (promptTurn?.cancelRequested) return;
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
-				// Titling follows the TUI input controller: builtins are dispatched
-				// first, and only text headed for the model can name the session. A
-				// synthetic residual (the /guided-goal kickoff) is not user text.
-				if (!builtinResult.synthetic) record.session.maybeStartTitleGeneration(builtinResult.prompt);
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
 				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, {
 					images,
@@ -1169,9 +1165,6 @@ export class AcpAgent implements Agent {
 			return;
 		}
 
-		// `maybeStartTitleGeneration` is a no-op past the first message and skips
-		// local extension commands itself; skills title through `promptCustomMessage`.
-		record.session.maybeStartTitleGeneration(text);
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
 		const agentInvoked = await record.session.prompt(text, { images });
 		// Extension and custom-TS commands are handled locally inside session.prompt().

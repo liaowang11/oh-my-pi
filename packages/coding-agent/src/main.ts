@@ -566,6 +566,8 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			// client capabilities are known, without enabling other UI-only behavior.
 			interactivePrompts: factoryOptions?.interactivePrompts,
 			deferUsageReserveConfirmation: true,
+			// ACP clients show the session title, so name sessions like the TUI does.
+			autoTitle: true,
 			enableMCP: false,
 			titleSystemPrompt,
 			eventBus,
