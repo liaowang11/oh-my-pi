@@ -1752,6 +1752,38 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("pushes each session title once and never an empty one", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const infoUpdates = (from: number) =>
+			harness.updates
+				.slice(from)
+				.filter(
+					update =>
+						update.sessionId === created.sessionId && update.update.sessionUpdate === "session_info_update",
+				)
+				.map(update => (update.update as { title?: unknown }).title ?? null);
+
+		const name: { title: string | undefined } = { title: undefined };
+		Object.defineProperty(session, "sessionName", { get: () => name.title, configurable: true });
+		const untitled = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "one" }] });
+		expect(infoUpdates(untitled)).toEqual([]);
+
+		name.title = "Usage parity";
+		const titled = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "two" }] });
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "three" }] });
+		expect(infoUpdates(titled)).toEqual(["Usage parity"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("loads a session stored under a legacy/hashed project directory (#7779)", async () => {
 		const harness = await createHarness();
 		const stored = new FakeAgentSession(harness.cwdA);
