@@ -199,6 +199,15 @@ type ManagedSessionRecord = {
 	// Installed inside `#scheduleBootstrapUpdates` (post-race-guard); released
 	// in `#disposeSessionRecord`. Lives independent of any prompt turn.
 	lifetimeUnsubscribe: (() => void) | undefined;
+	// Pushes `session_info_update` as soon as a title resolves, instead of only
+	// at bootstrap/end-of-turn: auto title generation runs async and can settle
+	// after `agent_end` already fired, or after a turn with no `agent_end` at
+	// all (a fully local slash command). Installed alongside
+	// `lifetimeUnsubscribe` so it shares the same bootstrap race guard.
+	titleUnsubscribe: (() => void) | undefined;
+	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
+	// re-sent at every turn end or by the rename that already pushed it.
+	sentTitle: string | undefined;
 	closedError: PromptLifecycleError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -1007,14 +1016,7 @@ export class AcpAgent implements Agent {
 				await this.#waitForPromptEventHandlers(record);
 			},
 			notifyTitleChanged: async () => {
-				await this.#connection.sessionUpdate({
-					sessionId: record.session.sessionId,
-					update: {
-						sessionUpdate: "session_info_update",
-						title: record.session.sessionName,
-						updatedAt: new Date().toISOString(),
-					},
-				});
+				await this.#pushSessionInfoUpdate(record);
 			},
 			notifyConfigChanged: async options => {
 				// Mirrors `setSessionConfigOption`: once the session-lifetime
@@ -1450,6 +1452,8 @@ export class AcpAgent implements Agent {
 			promptEventHandlers: new Set(),
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
+			titleUnsubscribe: undefined,
+			sentTitle: undefined,
 		};
 	}
 
@@ -2247,6 +2251,11 @@ export class AcpAgent implements Agent {
 					unsubscribeCommands();
 				};
 			}
+			if (!record.titleUnsubscribe) {
+				record.titleUnsubscribe = record.session.sessionManager.onSessionNameChanged(() => {
+					void this.#pushSessionInfoUpdate(record);
+				});
+			}
 			void this.#emitBootstrapUpdates(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
@@ -2315,13 +2324,17 @@ export class AcpAgent implements Agent {
 			});
 		}
 
+		await this.#pushSessionInfoUpdate(record);
+	}
+
+	/** Sends the session's title, unless it has none or the client already has it. */
+	async #pushSessionInfoUpdate(record: ManagedSessionRecord, updatedAt = new Date().toISOString()): Promise<void> {
+		const title = record.session.sessionName;
+		if (!title || title === record.sentTitle) return;
+		record.sentTitle = title;
 		await this.#connection.sessionUpdate({
-			sessionId,
-			update: {
-				sessionUpdate: "session_info_update",
-				title: record.session.sessionName,
-				updatedAt: new Date().toISOString(),
-			},
+			sessionId: record.session.sessionId,
+			update: { sessionUpdate: "session_info_update", title, updatedAt },
 		});
 	}
 
@@ -2902,6 +2915,7 @@ export class AcpAgent implements Agent {
 
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
+		record.titleUnsubscribe?.();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();
