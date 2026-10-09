@@ -388,6 +388,15 @@ type ManagedSessionRecord = {
 	commandMetadataUnsubscribe: (() => void) | undefined;
 	lifetimeUpdatesReady: boolean;
 	pendingCompactionNotifications: AcpCompactionNotification[] | undefined;
+	// Pushes `session_info_update` as soon as a title resolves, instead of only
+	// at bootstrap/end-of-turn: auto title generation runs async and can settle
+	// after `agent_end` already fired, or after a turn with no `agent_end` at
+	// all (a fully local slash command). Installed alongside
+	// `lifetimeUnsubscribe` so it shares the same bootstrap race guard.
+	titleUnsubscribe: (() => void) | undefined;
+	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
+	// re-sent at every turn end or by the rename that already pushed it.
+	sentTitle: string | undefined;
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -1251,14 +1260,7 @@ export class AcpAgent implements Agent {
 				await this.#waitForPromptEventHandlers(record);
 			},
 			notifyTitleChanged: async () => {
-				await this.#connection.sessionUpdate({
-					sessionId: record.protocolSessionId,
-					update: {
-						sessionUpdate: "session_info_update",
-						title: record.session.sessionName,
-						updatedAt: new Date().toISOString(),
-					},
-				});
+				await this.#pushSessionInfoUpdate(record);
 			},
 			notifyConfigChanged: async options => {
 				// Once lifetime delivery is ready, model/thinking events already
@@ -1706,9 +1708,6 @@ export class AcpAgent implements Agent {
 		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext);
 	}
 
-	/**
-	 * The entry `session/fork`'s fork point names in `sessionManager`, the fork
-
 	async #openStoredSession(
 		sessionPath: string,
 		cwd: string,
@@ -1789,6 +1788,8 @@ export class AcpAgent implements Agent {
 			commandMetadataUnsubscribe: undefined,
 			lifetimeUpdatesReady: false,
 			pendingCompactionNotifications: undefined,
+			titleUnsubscribe: undefined,
+			sentTitle: undefined,
 		};
 	}
 
@@ -2633,6 +2634,11 @@ export class AcpAgent implements Agent {
 					});
 				});
 			}
+			if (!record.titleUnsubscribe) {
+				record.titleUnsubscribe = record.session.sessionManager.onSessionNameChanged(() => {
+					void this.#pushSessionInfoUpdate(record);
+				});
+			}
 			void this.#emitBootstrapUpdates(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
 	}
@@ -2719,13 +2725,17 @@ export class AcpAgent implements Agent {
 			});
 		}
 
+		await this.#pushSessionInfoUpdate(record);
+	}
+
+	/** Sends the session's title, unless it has none or the client already has it. */
+	async #pushSessionInfoUpdate(record: ManagedSessionRecord, updatedAt = new Date().toISOString()): Promise<void> {
+		const title = record.session.sessionName;
+		if (!title || title === record.sentTitle) return;
+		record.sentTitle = title;
 		await this.#connection.sessionUpdate({
-			sessionId,
-			update: {
-				sessionUpdate: "session_info_update",
-				title: record.session.sessionName,
-				updatedAt: new Date().toISOString(),
-			},
+			sessionId: record.protocolSessionId,
+			update: { sessionUpdate: "session_info_update", title, updatedAt },
 		});
 	}
 
@@ -3322,6 +3332,7 @@ export class AcpAgent implements Agent {
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
 		record.pendingCompactionNotifications = undefined;
+		record.titleUnsubscribe?.();
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();
