@@ -579,6 +579,8 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			// client capabilities are known, without enabling other UI-only behavior.
 			interactivePrompts: factoryOptions?.interactivePrompts,
 			deferUsageReserveConfirmation: true,
+			// ACP clients show the session title, so name sessions like the TUI does.
+			autoTitle: true,
 			enableMCP: false,
 			titleSystemPrompt,
 			eventBus,
@@ -1965,12 +1967,7 @@ export async function runRootCommand(
 		if (parsedArgs.noPty || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_PTY = "1";
 		}
-		if (
-			parsedArgs.noTitle ||
-			parsedArgs.mode === "rpc" ||
-			parsedArgs.mode === "rpc-ui" ||
-			parsedArgs.mode === "acp"
-		) {
+		if (parsedArgs.noTitle || parsedArgs.mode === "rpc" || parsedArgs.mode === "rpc-ui") {
 			Bun.env.PI_NO_TITLE = "1";
 		}
 
