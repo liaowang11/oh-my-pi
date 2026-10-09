@@ -82,7 +82,7 @@ import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { UsageStatistics } from "../../session/session-entries";
 import type { SessionInfo as StoredSessionInfo } from "../../session/session-listing";
-import { SessionManager } from "../../session/session-manager";
+import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -832,8 +832,19 @@ export class AcpAgent implements Agent {
 		const offset = this.#parseCursor(params.cursor ?? undefined);
 		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
 		const nextOffset = offset + paged.length;
+		const requestCwd = params.cwd;
 		return {
-			sessions: paged.map(session => this.#toSessionInfo(session)),
+			// A removed worktree's session is loaded by moving it into the request
+			// cwd, so report that cwd: its recorded directory no longer exists.
+			sessions: await Promise.all(
+				paged.map(async session =>
+					this.#toSessionInfo(
+						requestCwd && (await SessionManager.isFromRemovedWorktree(session, requestCwd))
+							? { ...session, cwd: requestCwd }
+							: session,
+					),
+				),
+			),
 			nextCursor: nextOffset < sessions.length ? String(nextOffset) : undefined,
 		};
 	}
@@ -1458,7 +1469,7 @@ export class AcpAgent implements Agent {
 		if (!storedSession) {
 			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession, cwd, mcpServers, sessionId);
 	}
 
 	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
@@ -1473,7 +1484,7 @@ export class AcpAgent implements Agent {
 		if (!storedSession) {
 			throw new Error(`ACP session not found: ${sessionId}`);
 		}
-		return await this.#openStoredSession(storedSession.path, cwd, mcpServers, sessionId);
+		return await this.#openStoredSession(storedSession, cwd, mcpServers, sessionId);
 	}
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
@@ -1500,7 +1511,7 @@ export class AcpAgent implements Agent {
 	}
 
 	async #openStoredSession(
-		sessionPath: string,
+		stored: StoredSessionInfo,
 		cwd: string,
 		mcpServers: McpServer[],
 		sessionId: string,
@@ -1511,6 +1522,7 @@ export class AcpAgent implements Agent {
 			}),
 		);
 		try {
+			const sessionPath = await this.#relocateFromRemovedWorktree(stored, session.sessionManager);
 			const success = await session.switchSession(sessionPath);
 			if (!success) {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
@@ -1520,6 +1532,28 @@ export class AcpAgent implements Agent {
 			throw error;
 		}
 		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
+	}
+
+	/**
+	 * Move a session recorded in a removed worktree of the request cwd's
+	 * repository (e.g. a `/wt` worktree) into that cwd, as `omp --resume` does:
+	 * its own directory cannot be entered. Returns the session file to switch to.
+	 */
+	async #relocateFromRemovedWorktree(stored: StoredSessionInfo, target: SessionManager): Promise<string> {
+		const cwd = target.getCwd();
+		const sessionDir = target.getSessionDir();
+		if (!(await SessionManager.isFromRemovedWorktree(stored, cwd, sessionDir))) return stored.path;
+		try {
+			const relocated = await SessionManager.openRelocated(stored.path, stored.cwd, cwd, sessionDir);
+			const movedPath = relocated.getSessionFile() ?? stored.path;
+			await relocated.close();
+			return movedPath;
+		} catch (error) {
+			if (!(error instanceof SessionMoveRefusedError)) throw error;
+			throw new Error(
+				`Cannot resume ACP session ${stored.id} from removed worktree ${stored.cwd}: ${error.message} Close the session in the other omp process, then load it again.`,
+			);
+		}
 	}
 
 	async #registerPreparedSession(
