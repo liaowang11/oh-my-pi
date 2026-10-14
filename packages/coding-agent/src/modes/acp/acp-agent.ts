@@ -117,6 +117,7 @@ import {
 import { AcpSubagentRelay, clientSupportsSubagents, subagentSessionId } from "./acp-subagents";
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
+	AIR_CUSTOM_ANSWER_KEY,
 	airCapabilityMeta,
 	clientSupportsAsyncTasks,
 	isAirClient,
@@ -137,6 +138,13 @@ const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
 const ACP_VIBE_MODE_ID = "vibe";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
+// Descriptions of an ask form's free-text "Other" field, as claude-agent-acp words them.
+const OTHER_MULTI_DESCRIPTION = "Type your own answer to add to your selection above (optional).";
+const OTHER_SINGLE_DESCRIPTION = "Type your own answer, or add a note to the option you chose above (optional).";
+// Un-namespaced custom-answer key: agent-shell reads it from every agent, released AIR versions too.
+const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
+// `_meta` key an ask form's option carries its preview under.
+const OPTION_META_KEY = "_claude/askUserQuestionOption";
 const APPROVE_OPTION = "Approve and execute";
 const REFINE_OPTION = "Refine plan";
 const MODE_CONFIG_ID = "mode";
@@ -751,6 +759,7 @@ export function createAcpExtensionUiContext(
 	clientCapabilities: ClientCapabilities | undefined,
 ): ExtensionUIContext {
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
+	const airClient = isAirClient(clientCapabilities);
 	return {
 		supportsEditor: false,
 		select: async (title, options, dialogOptions) => {
@@ -804,13 +813,20 @@ export function createAcpExtensionUiContext(
 					const: option.label,
 					title: option.label,
 					...(option.description?.trim() ? { description: option.description.trim() } : {}),
+					// ACP's enum option has no preview slot; claude-agent-acp sends it under
+					// this `_meta` key, which agent-shell renders.
+					...(option.preview?.trim() ? { _meta: { [OPTION_META_KEY]: { preview: option.preview } } } : {}),
 				}));
-				const description = question.header?.trim();
+				// A single question already travels as the elicitation `message`, so the
+				// field carries only the header; repeating the question renders it twice.
+				const header = question.header?.trim();
+				const title = header || question.question;
+				const description = header && questions.length > 1 ? question.question : undefined;
 				if (entries.length > 0) {
 					if (question.multi === true) {
 						properties[key] = {
 							type: "array",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							items: { anyOf: entries },
 						};
@@ -818,7 +834,7 @@ export function createAcpExtensionUiContext(
 						const recommended = question.recommended;
 						properties[key] = {
 							type: "string",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							oneOf: entries,
 							...(recommended !== undefined && recommended >= 0 && recommended < question.options.length
@@ -827,7 +843,26 @@ export function createAcpExtensionUiContext(
 						};
 					}
 				}
-				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
+				// Marks the free-text field as the select's companion so clients
+				// (agent-shell, JetBrains AIR) offer it as one more option of that
+				// select instead of a separate field. Every client gets the
+				// un-namespaced key, which agent-shell reads from any agent; an AIR
+				// client also gets `_meta.jetbrains.air.customAnswer`, as
+				// claude-agent-acp sends it. Without options the free-text field is
+				// the whole question.
+				const customAnswer = { questionId: key, isCustomAnswer: true };
+				const customAnswerMeta = { [CUSTOM_ANSWER_META_KEY]: customAnswer };
+				properties[`${key}__other`] =
+					entries.length > 0
+						? {
+								type: "string",
+								title: OTHER_OPTION,
+								description: question.multi === true ? OTHER_MULTI_DESCRIPTION : OTHER_SINGLE_DESCRIPTION,
+								_meta: airClient
+									? withAirMeta(customAnswerMeta, AIR_CUSTOM_ANSWER_KEY, customAnswer)
+									: customAnswerMeta,
+							}
+						: { type: "string", title, ...(description ? { description } : {}) };
 			}
 
 			let timedOut = false;
