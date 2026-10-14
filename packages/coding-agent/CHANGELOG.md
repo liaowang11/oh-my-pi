@@ -369,6 +369,7 @@
 - Added `omp auth-gateway serve --clients=<file>`: per-client bearer tokens, each limited to listed models and broker OAuth accounts with no fallback to other accounts or API keys, re-read while serving ([#5098](https://github.com/can1357/oh-my-pi/issues/5098), [#15900](https://github.com/can1357/oh-my-pi/pull/15900) by [@alphastorm](https://github.com/alphastorm))
 - ACP background bash and eval jobs that a subagent starts now show as async tasks on that subagent's session, and can be stopped
 - `/session` now lists tokens, cost, and calls per provider/model (subagent runs on their own line), and `get_session_stats` returns the same data as `models` and `subagents`
+- ACP ask forms now send each option's preview, so clients such as agent-shell can show it
 
 ### Changed
 
@@ -437,6 +438,8 @@
 - Improved responsiveness when placing assistant text after tool calls in long transcripts ([#12178](https://github.com/can1357/oh-my-pi/issues/12178), [#14344](https://github.com/can1357/oh-my-pi/pull/14344) by [@F0Rextasy](https://github.com/F0Rextasy), [#15353](https://github.com/can1357/oh-my-pi/pull/15353) by [@iliaal](https://github.com/iliaal)).
 - Fixed `apply_patch` rejecting a hunk without context lines when its text occurs more than once ("Found 2 occurrences"); like Codex, each hunk now takes the first exact or whitespace-insensitive match at or after the previous hunk, while fuzzy matches must still be unique ([#15340](https://github.com/can1357/oh-my-pi/pull/15340) by [@Ikaleio](https://github.com/Ikaleio))
 - Fixed `/session` in ACP showing only the session id, title, and working directory; it now shows messages, tokens, cost, and routed models like the TUI
+- ACP ask forms now explain what typing into "Other" does, and mark that field for JetBrains AIR clients the way claude-agent-acp does.
+- Fixed ACP ask forms in clients such as agent-shell: a single question with a header no longer shows twice, "Other" is offered as one more option instead of a separate field, and questions without options are labelled with their own text instead of "Other"
 
 ## [18.11.1] - 2026-10-15
 
