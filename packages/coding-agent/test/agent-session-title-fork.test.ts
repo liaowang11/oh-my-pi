@@ -307,4 +307,35 @@ describe("AgentSession title fork", () => {
 		expect(side.calls).toHaveLength(0);
 		expect(titleModel).not.toHaveBeenCalled();
 	});
+
+	it("keeps a title the user gave the session", async () => {
+		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+		const target = await createSession(main, side);
+		await target.sessionManager.setSessionName("Parent title", "user");
+
+		await target.prompt(FIRST_MESSAGE);
+
+		expect(target.sessionName).toBe("Parent title");
+		expect(side.calls).toHaveLength(0);
+	});
+
+	it.each<[string, string | undefined, string]>([
+		["the inherited title", undefined, "Parent title"],
+		["an interim title", "Interim title", "Interim title"],
+	])("titles a fork after its own first turn over %s", async (_case, interim, shown) => {
+		const main = createMockModel({ responses: [{ content: ["Reading the park tests first."] }] });
+		const side = createMockModel({ handler: { content: [CARD_REPLY] } });
+		const target = await createSession(main, side);
+		// A fork copies its parent's title, a user rename included.
+		await target.sessionManager.setSessionName("Parent title", "user");
+
+		await target.markTitleInherited(interim);
+		expect(target.sessionName).toBe(shown);
+		const titled = nextTitle(target);
+		await target.prompt(FIRST_MESSAGE);
+		await titled;
+
+		expect(target.sessionName).toBe("🧪 FLAKY: Fix flaky park tests");
+	});
 });

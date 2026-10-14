@@ -1052,6 +1052,8 @@ export class AgentSession implements SettingsScope {
 	#titleSystemPrompt: string | undefined;
 	/** Name the session from the operator's messages (see {@link AgentSessionConfig.autoTitle}). */
 	readonly #autoTitle: boolean;
+	/** A title the session shows but automatic titling may replace (see {@link markTitleInherited}). */
+	#inheritedTitle: { sessionId: string; title: string } | undefined;
 	#titleGenerationInFlightFor: string | undefined;
 	/** First-message auto-title that may be retried from conversation context.
 	 *  Once the title model declines the message (greeting-like or too ambiguous,
@@ -10764,9 +10766,30 @@ export class AgentSession implements SettingsScope {
 		this.#replanTitleRefreshInFlight = refresh;
 	}
 
+	/**
+	 * Treat the current title, or `interimTitle` applied now, as inherited, the way a
+	 * fork's title comes from its parent: it shows until automatic titling names the
+	 * session after its own turns, which it otherwise never does for a titled session.
+	 * Kept in memory only; a reloaded session keeps the title it was saved with.
+	 */
+	async markTitleInherited(interimTitle?: string): Promise<void> {
+		await this.sessionManager.yieldTitleToAuto();
+		if (interimTitle) await this.sessionManager.setSessionName(interimTitle, "auto");
+		const title = this.sessionName;
+		this.#inheritedTitle = title ? { sessionId: this.sessionManager.getSessionId(), title } : undefined;
+	}
+
+	/** Whether the session has a title of its own; an inherited one does not count (see {@link markTitleInherited}). */
+	#hasOwnTitle(): boolean {
+		const title = this.sessionName;
+		if (!title) return false;
+		const inherited = this.#inheritedTitle;
+		return inherited?.sessionId !== this.sessionManager.getSessionId() || inherited.title !== title;
+	}
+
 	/** Record an operator message as the title source while an auto-titled session is unnamed. */
 	#noteTitleInput(message: AgentMessage): void {
-		if (!this.#autoTitle || this.sessionName || $env.PI_NO_TITLE) return;
+		if (!this.#autoTitle || this.#hasOwnTitle() || $env.PI_NO_TITLE) return;
 		const text = operatorTitleText(message);
 		if (!text || isLowSignalTitleInput(text)) return;
 		this.#titleInput = { sessionId: this.sessionManager.getSessionId(), text, replied: false, tried: false };
@@ -10791,7 +10814,7 @@ export class AgentSession implements SettingsScope {
 	#maybeStartTitle(): boolean {
 		const input = this.#titleInput;
 		const sessionId = this.sessionManager.getSessionId();
-		if (!input?.replied || input.tried || input.sessionId !== sessionId || this.sessionName) return false;
+		if (!input?.replied || input.tried || input.sessionId !== sessionId || this.#hasOwnTitle()) return false;
 		if (this.#titleGenerationInFlightFor === sessionId) return false;
 		input.tried = true;
 		this.#deferredTitle = { sessionId, declined: false, replied: false, words: 0 };
@@ -10847,7 +10870,7 @@ export class AgentSession implements SettingsScope {
 					const named = await this.#cardTitle(title).finally(() => {
 						if (this.#titleGenerationInFlightFor === sessionId) this.#titleGenerationInFlightFor = undefined;
 					});
-					if (this.sessionManager.getSessionId() !== sessionId || this.sessionName) return;
+					if (this.sessionManager.getSessionId() !== sessionId || this.#hasOwnTitle()) return;
 					await this.sessionManager.setSessionName(named, "auto");
 					this.#deferredTitle = undefined;
 				},
@@ -10888,7 +10911,7 @@ export class AgentSession implements SettingsScope {
 			this.#cancelTitle(input.sessionId);
 			return;
 		}
-		if (this.sessionManager.getSessionId() !== input.sessionId || this.sessionName) return;
+		if (this.sessionManager.getSessionId() !== input.sessionId || this.#hasOwnTitle()) return;
 		this.#titleWithTitleModel(input);
 	}
 
@@ -10905,9 +10928,9 @@ export class AgentSession implements SettingsScope {
 				// the first title, and a request from a replaced session cannot
 				// name the current one.
 				if (this.sessionManager.getSessionId() !== sessionId) return;
-				if (!title || this.sessionName) return;
+				if (!title || this.#hasOwnTitle()) return;
 				const named = this.#cardsAutoTitles() ? await this.#cardTitle(title) : title;
-				if (this.sessionManager.getSessionId() !== sessionId || this.sessionName) return;
+				if (this.sessionManager.getSessionId() !== sessionId || this.#hasOwnTitle()) return;
 				await this.sessionManager.setSessionName(named, "auto");
 			})
 			.catch(err => {
@@ -10958,7 +10981,7 @@ export class AgentSession implements SettingsScope {
 		const deferred = this.#deferredTitle;
 		if (!deferred) return;
 		const sessionId = this.sessionManager.getSessionId();
-		if (deferred.sessionId !== sessionId || this.sessionName) {
+		if (deferred.sessionId !== sessionId || this.#hasOwnTitle()) {
 			this.#deferredTitle = undefined;
 			return;
 		}
