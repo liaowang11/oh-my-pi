@@ -3377,6 +3377,18 @@ export class SessionManager {
 	}
 
 	/**
+	 * Let automatic titles replace the current title, as they may a fork's title
+	 * copied from its parent: a user title is kept, recorded as an automatic one.
+	 * Returns whether the title source changed.
+	 */
+	async yieldTitleToAuto(): Promise<boolean> {
+		const title = this.#sessionName;
+		if (!title || this.#titleSource !== "user") return false;
+		this.#titleSource = undefined;
+		return this.setSessionName(title, "auto");
+	}
+
+	/**
 	 * Journal an idle recap for this session in history.db. Recaps never enter
 	 * the session file or LLM context; in-memory sessions are not journaled.
 	 */

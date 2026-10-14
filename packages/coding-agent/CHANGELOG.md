@@ -371,6 +371,7 @@
 - `/session` now lists tokens, cost, and calls per provider/model (subagent runs on their own line), and `get_session_stats` returns the same data as `models` and `subagents`
 - ACP ask forms now send each option's preview, so clients such as agent-shell can show it
 - ACP clients can now load, resume, and fork sessions from removed git worktrees of the repository; loading moves the session into the current checkout, forking copies it there.
+- ACP `session/fork` can fork at an agent message (AIR's `_meta.jetbrains.air.fork`), name the fork with `_meta.sessionTitle`, and retitle it after its own first turn with `_meta.generateSessionTitle`
 
 ### Changed
 
