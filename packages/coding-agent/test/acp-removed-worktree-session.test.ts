@@ -115,11 +115,13 @@ describe.skipIf(process.platform === "win32")("ACP sessions from removed git wor
 	}
 
 	/** Runs `/wt`'s worktree creation and session move for a fresh answered session in `repo`. */
-	async function sessionMovedByWt(branch: string): Promise<{ id: string; worktree: string; file: string }> {
+	async function sessionMovedByWt(branch: string, turns = 1): Promise<{ id: string; worktree: string; file: string }> {
 		const session = SessionManager.create(repo);
-		session.appendMessage({ role: "user", content: `work on ${branch}`, timestamp: 1 });
-		// The model the ACP session runs, so `switchSession` can restore it.
-		session.appendMessage({ ...makeAssistantMessage(), model: "claude-sonnet-4-5" });
+		for (let turn = 0; turn < turns; turn++) {
+			session.appendMessage({ role: "user", content: `work on ${branch}`, timestamp: 1 });
+			// The model the ACP session runs, so `switchSession` can restore it.
+			session.appendMessage({ ...makeAssistantMessage(), model: "claude-sonnet-4-5" });
+		}
 		await session.flush();
 		const { path: worktree } = await createSessionWorktree(repo, Settings.isolated(), branch);
 		await session.moveTo(worktree);
@@ -173,5 +175,24 @@ describe.skipIf(process.platform === "win32")("ACP sessions from removed git wor
 		const source = await SessionManager.open(gone.file);
 		expect(source.getHeader()?.cwd).toBe(gone.worktree);
 		await source.close();
+	});
+
+	it("unstable_forkSession cuts a removed worktree's session at a fork point, leaving no interim copy", async () => {
+		const gone = await sessionMovedByWt("wt/fork-point", 2);
+		await removeWorktree(gone.worktree);
+		const source = await SessionManager.open(gone.file);
+		const firstAnswer = source.getEntries().find(e => e.type === "message" && e.message.role === "assistant")!;
+		await source.close();
+
+		const forked = await createAgent().unstable_forkSession({
+			sessionId: gone.id,
+			cwd: repo,
+			mcpServers: [],
+			_meta: { jetbrains: { air: { fork: { version: 1, messageId: firstAnswer.id } } } },
+		});
+
+		const fork = sessions.find(s => s.sessionId === forked.sessionId);
+		expect(fork?.sessionManager.buildSessionContext().messages.map(m => m.role)).toEqual(["user", "assistant"]);
+		expect((await SessionManager.list(repo)).map(s => s.id)).toEqual([forked.sessionId]);
 	});
 });
