@@ -83,7 +83,7 @@ import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
-import type { UsageStatistics } from "../../session/session-entries";
+import type { SessionEntry, UsageStatistics } from "../../session/session-entries";
 import { readSessionInfo, type SessionInfo as StoredSessionInfo } from "../../session/session-listing";
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
@@ -572,6 +572,67 @@ function replayedIdleState(stopReason: string | undefined): SubagentWorkState {
 	}
 }
 
+/** Longest title `session/fork`'s `_meta.sessionTitle` may give a fork, as in claude-agent-acp. */
+const MAX_FORK_TITLE_LENGTH = 256;
+
+/**
+ * The agent message AIR's fork-point extension asks `session/fork` to cut
+ * after, `_meta.jetbrains.air.fork = { version: 1, messageId }`. Undefined
+ * (any other shape) forks the whole session.
+ */
+function forkPointMessageId(meta: unknown): string | undefined {
+	type ForkPointMeta = { jetbrains?: { air?: { fork?: { version?: unknown; messageId?: unknown } } } };
+	const fork = (meta as ForkPointMeta | null | undefined)?.jetbrains?.air?.fork;
+	if (fork?.version !== 1 || typeof fork.messageId !== "string") return undefined;
+	return fork.messageId.trim() || undefined;
+}
+
+/** The ids a fork point may name: as sent, then without the `:segment:<n>` suffix older AIR builds append. */
+function forkPointCandidates(messageId: string): string[] {
+	const unsegmented = messageId.replace(/:segment:\d+$/, "");
+	return unsegmented === messageId ? [messageId] : [messageId, unsegmented];
+}
+
+/** The title `_meta.sessionTitle` asks a fork to carry, on one line and at most {@link MAX_FORK_TITLE_LENGTH} long. */
+function forkSessionTitle(meta: unknown): string | undefined {
+	const requested = (meta as { sessionTitle?: unknown } | null | undefined)?.sessionTitle;
+	if (typeof requested !== "string") return undefined;
+	const title = requested.replace(/\s+/g, " ").trim();
+	if (title.length <= MAX_FORK_TITLE_LENGTH) return title || undefined;
+	return `${title.slice(0, MAX_FORK_TITLE_LENGTH - 1)}…`;
+}
+
+/**
+ * What identifies an assistant message through a copy of it — a replay copy
+ * without dangling tool calls, the same message reloaded from disk: when, and
+ * by which model, it was produced.
+ */
+function assistantMessageStamp(message: unknown): string | undefined {
+	if (typeof message !== "object" || message === null) return undefined;
+	const { role, timestamp, provider, model } = message as {
+		role?: unknown;
+		timestamp?: unknown;
+		provider?: unknown;
+		model?: unknown;
+	};
+	if (role !== "assistant" || typeof timestamp !== "number") return undefined;
+	return `${timestamp}:${String(provider)}:${String(model)}`;
+}
+
+/** Assistant message entries by message object and by {@link assistantMessageStamp}. */
+type AssistantEntryIndex = { byMessage: Map<object, string>; byStamp: Map<string, string> };
+
+function indexAssistantEntries(entries: readonly SessionEntry[]): AssistantEntryIndex {
+	const index: AssistantEntryIndex = { byMessage: new Map(), byStamp: new Map() };
+	for (const entry of entries) {
+		if (entry.type !== "message" || entry.message.role !== "assistant") continue;
+		index.byMessage.set(entry.message, entry.id);
+		const stamp = assistantMessageStamp(entry.message);
+		if (stamp) index.byStamp.set(stamp, entry.id);
+	}
+	return index;
+}
+
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
@@ -986,6 +1047,9 @@ export class AcpAgent implements Agent {
 	#sessions = new Map<string, ManagedSessionRecord>();
 	/** Serializes writes of the handle map ({@link readAcpSessionHandles}). */
 	#handleWrites: Promise<void> = Promise.resolve();
+	// Each session's active-branch assistant entries, as of the leaf they were
+	// indexed at, so one replay indexes them once (see `#replayedMessageId`).
+	readonly #replayEntryIndexes = new WeakMap<SessionManager, { leafId: string | null; index: AssistantEntryIndex }>();
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
@@ -1898,18 +1962,64 @@ export class AcpAgent implements Agent {
 			if (!success) {
 				throw new Error(`ACP session fork was cancelled: ${params.sessionId}`);
 			}
-			// A copy out of a removed worktree already is the fork.
-			const forked = copied !== undefined || (await session.fork());
+			const forkPoint = this.#resolveForkPoint(params, session.sessionManager);
+			// A copy out of a removed worktree already is a whole-session fork; a cut forks the copy again.
+			const forked =
+				forkPoint !== undefined ? await session.fork(forkPoint) : copied !== undefined || (await session.fork());
 			if (!forked) {
 				throw new Error(`ACP session fork failed: ${params.sessionId}`);
 			}
+			if (copied !== undefined && forkPoint !== undefined) {
+				// The cut copies the interim copy's artifacts; let that finish before deleting them.
+				await session.sessionManager.flush();
+				await session.sessionManager.dropSession(copied);
+			}
+			await this.#titleFork(session, params._meta);
 		} catch (error) {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, params.mcpServers ?? [], setToolUIContext, eventBus);
+		return await this.#registerPreparedSession(
+			session,
+			params.mcpServers ?? [],
+			setToolUIContext,
+			undefined,
+			eventBus,
+		);
 	}
 
+	/**
+	 * The entry `session/fork`'s fork point names in `sessionManager`, the fork
+	 * source just opened: an agent message by its entry id, which it both
+	 * streamed and replayed under. Undefined without a fork point; invalid
+	 * params when it names no persisted agent message.
+	 */
+	#resolveForkPoint(params: ForkSessionRequest, sessionManager: SessionManager): string | undefined {
+		const messageId = forkPointMessageId(params._meta);
+		if (messageId === undefined) return undefined;
+		for (const candidate of forkPointCandidates(messageId)) {
+			const entry = sessionManager.getEntry(candidate);
+			if (entry?.type === "message" && entry.message.role === "assistant") return entry.id;
+		}
+		throw RequestError.invalidParams(
+			{ messageId },
+			`Fork point message ${messageId} was not found in session ${params.sessionId}`,
+		);
+	}
+
+	/**
+	 * Title a fork as `session/fork`'s `_meta` asks: `sessionTitle` as the
+	 * user's title, or with `generateSessionTitle`, the title it shows (the
+	 * parent's, or `sessionTitle`) only until it is titled after its own turns.
+	 */
+	async #titleFork(session: AgentSession, meta: unknown): Promise<void> {
+		const title = forkSessionTitle(meta);
+		if ((meta as { generateSessionTitle?: unknown } | null | undefined)?.generateSessionTitle === true) {
+			await session.markTitleInherited(title);
+		} else if (title) {
+			await session.sessionManager.setSessionName(title, "user");
+		}
+	}
 	async #openStoredSession(
 		stored: StoredSessionInfo,
 		cwd: string,
@@ -2539,7 +2649,8 @@ export class AcpAgent implements Agent {
 			event.message.role === "assistant" &&
 			(event.type === "message_start" || !record.liveMessageId || !record.liveMessageProgress)
 		) {
-			record.liveMessageId = crypto.randomUUID();
+			// The entry the message persists as names it, so a fork at it resolves from the journal alone.
+			record.liveMessageId = record.session.assistantEntryId(event.message) ?? crypto.randomUUID();
 			record.liveMessageProgress = { textEmitted: false, thoughtEmitted: false };
 		}
 	}
@@ -3657,7 +3768,7 @@ export class AcpAgent implements Agent {
 		replayedToolCallArgs: Map<string, unknown>,
 	): SessionNotification[] {
 		const notifications: SessionNotification[] = [];
-		const messageId = crypto.randomUUID();
+		const messageId = this.#replayedMessageId(sessionId, message);
 		if (Array.isArray(message.content)) {
 			for (const item of message.content) {
 				if (typeof item !== "object" || item === null || !("type" in item)) {
@@ -3739,6 +3850,28 @@ export class AcpAgent implements Agent {
 			});
 		}
 		return notifications;
+	}
+
+	/**
+	 * The id a replayed agent message carries: its session entry id, which
+	 * `session/fork` takes as a fork point. A message of no open session (a
+	 * subagent transcript) or without an entry gets a fresh id.
+	 */
+	#replayedMessageId(sessionId: string, message: ReplayableMessage): string {
+		const sessionManager = this.#sessions.get(sessionId)?.session.sessionManager;
+		if (!sessionManager) return crypto.randomUUID();
+		const leafId = sessionManager.getLeafId();
+		let cached = this.#replayEntryIndexes.get(sessionManager);
+		if (cached?.leafId !== leafId) {
+			cached = { leafId, index: indexAssistantEntries(sessionManager.getBranchView()) };
+			this.#replayEntryIndexes.set(sessionManager, cached);
+		}
+		const stamp = assistantMessageStamp(message);
+		return (
+			cached.index.byMessage.get(message) ??
+			(stamp ? cached.index.byStamp.get(stamp) : undefined) ??
+			crypto.randomUUID()
+		);
 	}
 
 	#buildReplayAssistantToolArgs(item: ReplayableToolItem): unknown {

@@ -210,6 +210,11 @@ class FakeAgentSession {
 	promptHook: (() => Promise<void>) | undefined;
 	asyncJobManager: AsyncJobManager | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
+	/** Backs `assistantEntryId`: the entry id a test streams an assistant message under. */
+	assistantEntryIds = new WeakMap<object, string>();
+	assistantEntryId(message: object): string | undefined {
+		return this.assistantEntryIds.get(message);
+	}
 
 	getAgentId(): string {
 		return "Main";
@@ -551,15 +556,21 @@ class FakeAgentSession {
 
 	async compact(_instructions?: string, _options?: unknown): Promise<void> {}
 
-	async fork(): Promise<boolean> {
+	async fork(entryId?: string): Promise<boolean> {
 		await this.sessionManager.flush();
-		const forked = await this.sessionManager.fork();
-		if (!forked) {
+		if (entryId !== undefined) {
+			this.sessionManager.createBranchedSession(entryId);
+		} else if (!(await this.sessionManager.fork())) {
 			return false;
 		}
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent.sessionId = this.sessionId;
 		return true;
+	}
+
+	inheritedTitles: Array<string | undefined> = [];
+	async markTitleInherited(interimTitle?: string): Promise<void> {
+		this.inheritedTitles.push(interimTitle);
 	}
 }
 
@@ -607,6 +618,8 @@ interface AgentHarness {
 	cwdA: string;
 	cwdB: string;
 	findSession(sessionId: string): FakeAgentSession | undefined;
+	/** Another agent on the same connection and session factory, sharing no memory with `agent`, as another ACP process. */
+	createAgent(): AcpAgent;
 }
 
 function getChunkMessageId(notification: SessionNotification): string | undefined {
@@ -741,6 +754,7 @@ async function createHarness(
 		cwdA,
 		cwdB,
 		findSession: (sessionId: string) => sessions.find(session => session.sessionId === sessionId),
+		createAgent: () => new AcpAgent(connection, factory),
 	};
 }
 
@@ -6056,6 +6070,224 @@ describe("ACP async tasks", () => {
 				.filter(update => "asyncTaskId" in update && update.asyncTaskId === silent)
 				.some(update => "outputFilePath" in update),
 		).toBe(false);
+		harness.abortController.abort();
+	});
+});
+
+describe("ACP session fork point", () => {
+	/** `_meta` asking `session/fork` to cut after the agent message `messageId`. */
+	function forkAt(messageId: string): Record<string, unknown> {
+		return { jetbrains: { air: { fork: { version: 1, messageId } } } };
+	}
+
+	/** The fork's transcript as `role: text` lines. */
+	function transcript(harness: AgentHarness, sessionId: string): string[] {
+		const messages = harness.findSession(sessionId)?.sessionManager.buildSessionContext().messages ?? [];
+		return messages.map(message => {
+			const content = "content" in message ? message.content : undefined;
+			const text =
+				typeof content === "string"
+					? content
+					: Array.isArray(content)
+						? content.map(block => ("text" in block ? block.text : "")).join("")
+						: "";
+			return `${message.role}: ${text}`;
+		});
+	}
+
+	/** The `messageId` the agent message chunk carrying `text` was sent under. */
+	function agentMessageId(harness: AgentHarness, sessionId: string, text: string): string {
+		const chunk = harness.updates.find(
+			update =>
+				update.sessionId === sessionId &&
+				update.update.sessionUpdate === "agent_message_chunk" &&
+				update.update.content.type === "text" &&
+				update.update.content.text === text,
+		);
+		const messageId = chunk && getChunkMessageId(chunk);
+		if (!messageId) throw new Error(`no agent message chunk for ${text}`);
+		return messageId;
+	}
+
+	/** A stored two-turn session, not loaded by the agent. */
+	async function storeTwoTurns(harness: AgentHarness): Promise<FakeAgentSession> {
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		const start = Date.now();
+		stored.sessionManager.appendMessage({ role: "user", content: "first question", timestamp: start });
+		stored.sessionManager.appendMessage({ ...makeAssistantMessage("first answer"), timestamp: start + 1 });
+		stored.sessionManager.appendMessage({ role: "user", content: "second question", timestamp: start + 2 });
+		stored.sessionManager.appendMessage({ ...makeAssistantMessage("second answer"), timestamp: start + 3 });
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+		return stored;
+	}
+
+	it.each<[string, (messageId: string) => string]>([
+		["its replayed id", messageId => messageId],
+		["its replayed id with a :segment: suffix", messageId => `${messageId}:segment:2`],
+	])("forks a loaded session at an agent message by %s, keeping that message", async (_case, toForkId) => {
+		const harness = await createHarness();
+		const stored = await storeTwoTurns(harness);
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const messageId = agentMessageId(harness, stored.sessionId, "first answer");
+
+		const forked = await harness.agent.unstable_forkSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			_meta: forkAt(toForkId(messageId)),
+		});
+
+		expect(transcript(harness, forked.sessionId)).toEqual(["user: first question", "assistant: first answer"]);
+		// Replayed again, the source keeps the id the client stamped on its message.
+		harness.updates.length = 0;
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		expect(agentMessageId(harness, stored.sessionId, "first answer")).toBe(messageId);
+		harness.abortController.abort();
+	});
+
+	/**
+	 * A live session whose prompts each stream one agent message, `answers[i]`
+	 * for the i-th prompt, under the entry id it persists as — unless that
+	 * answer's `persist` is false, as for a reply the session never records.
+	 */
+	async function liveSession(
+		harness: AgentHarness,
+		answers: Array<{ text: string; persist: boolean }>,
+	): Promise<FakeAgentSession> {
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		let turn = 0;
+		session.prompt = async (text: string): Promise<boolean> => {
+			const timestamp = Date.now() + 10 * turn;
+			const answer = answers[turn++]!;
+			session.sessionManager.appendMessage({ role: "user", content: text, timestamp });
+			const entryId = session.sessionManager.reserveEntryId();
+			// Each event carries its own copy of the message, as the agent loop's snapshots do.
+			const copy = () => {
+				const message = { ...makeAssistantMessage(answer.text), timestamp: timestamp + 1 };
+				session.assistantEntryIds.set(message, entryId);
+				return message;
+			};
+			const emit = (event: unknown) => {
+				for (const listener of session.listeners()) listener(event as AgentSessionEvent);
+			};
+			emit({ type: "message_start", message: copy() });
+			emit({
+				type: "message_update",
+				message: copy(),
+				assistantMessageEvent: { type: "text_delta", delta: answer.text },
+			});
+			const ended = copy();
+			if (answer.persist) session.sessionManager.appendMessage(ended, entryId);
+			emit({ type: "message_end", message: ended });
+			emit({ type: "agent_end", messages: [ended] });
+			return true;
+		};
+		for (const question of ["first question", "second question"].slice(0, answers.length)) {
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: question }] });
+		}
+		await session.sessionManager.ensureOnDisk();
+		await session.sessionManager.flush();
+		return session;
+	}
+
+	it.each<[string, (harness: AgentHarness) => AcpAgent]>([
+		["the agent that streamed it", harness => harness.agent],
+		["another agent, as another ACP process", harness => harness.createAgent()],
+	])("forks a live session at an agent message it streamed, through %s", async (_case, forker) => {
+		const harness = await createHarness();
+		const session = await liveSession(harness, [
+			{ text: "first answer", persist: true },
+			{ text: "second answer", persist: true },
+		]);
+		const messageId = agentMessageId(harness, session.sessionId, "first answer");
+
+		const forked = await forker(harness).unstable_forkSession({
+			sessionId: session.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			_meta: forkAt(messageId),
+		});
+
+		expect(transcript(harness, forked.sessionId)).toEqual(["user: first question", "assistant: first answer"]);
+		harness.abortController.abort();
+	});
+
+	it("rejects a fork point at a streamed agent message the session never recorded", async () => {
+		const harness = await createHarness();
+		const session = await liveSession(harness, [{ text: "lost answer", persist: false }]);
+		const messageId = agentMessageId(harness, session.sessionId, "lost answer");
+
+		await expect(
+			harness.createAgent().unstable_forkSession({
+				sessionId: session.sessionId,
+				cwd: harness.cwdA,
+				mcpServers: [],
+				_meta: forkAt(messageId),
+			}),
+		).rejects.toMatchObject({ code: -32602 });
+		harness.abortController.abort();
+	});
+
+	it("rejects a fork point that names no agent message with invalid params", async () => {
+		const harness = await createHarness();
+		const stored = await storeTwoTurns(harness);
+		const userEntry = stored.sessionManager
+			.getEntries()
+			.find(entry => entry.type === "message" && entry.message.role === "user")!;
+
+		for (const messageId of ["no-such-message", userEntry.id]) {
+			await expect(
+				harness.agent.unstable_forkSession({
+					sessionId: stored.sessionId,
+					cwd: harness.cwdA,
+					mcpServers: [],
+					_meta: forkAt(messageId),
+				}),
+			).rejects.toMatchObject({ code: -32602 });
+		}
+		harness.abortController.abort();
+	});
+
+	it("titles the fork with a requested sessionTitle as the user's title", async () => {
+		const harness = await createHarness();
+		const stored = await storeTwoTurns(harness);
+		await stored.sessionManager.setSessionName("Parent title", "auto");
+
+		const forked = await harness.agent.unstable_forkSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			_meta: { sessionTitle: "  Try the\n  other   approach " },
+		});
+
+		const fork = harness.findSession(forked.sessionId)!;
+		expect(fork.sessionManager.getSessionName()).toBe("Try the other approach");
+		expect(fork.sessionManager.titleSource).toBe("user");
+		expect(fork.inheritedTitles).toEqual([]);
+		harness.abortController.abort();
+	});
+
+	it.each<[string, Record<string, unknown>, string | undefined]>([
+		["the parent's", {}, undefined],
+		["a requested sessionTitle", { sessionTitle: " Interim\ttitle " }, "Interim title"],
+	])("lets generateSessionTitle retitle a fork shown under %s title", async (_case, meta, interim) => {
+		const harness = await createHarness();
+		const stored = await storeTwoTurns(harness);
+		await stored.sessionManager.setSessionName("Parent title", "user");
+
+		const forked = await harness.agent.unstable_forkSession({
+			sessionId: stored.sessionId,
+			cwd: harness.cwdA,
+			mcpServers: [],
+			_meta: { ...meta, generateSessionTitle: true },
+		});
+
+		const fork = harness.findSession(forked.sessionId)!;
+		expect(fork.inheritedTitles).toStrictEqual([interim]);
+		expect(fork.sessionManager.getSessionName()).toBe("Parent title");
 		harness.abortController.abort();
 	});
 });
