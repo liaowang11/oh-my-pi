@@ -11,6 +11,8 @@ import type {
 } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { AskTool, recoverAskHtml } from "@oh-my-pi/pi-coding-agent/tools/ask";
+import { createAcpExtensionUiContext } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
+import type { AgentSideConnection, CreateElicitationRequest, SessionNotification } from "@oh-my-pi/pi-utils/acp";
 import { ToolAbortError } from "@oh-my-pi/pi-coding-agent/tools/tool-errors";
 import { TERMINAL } from "@oh-my-pi/pi-tui";
 import { initTheme } from "@oh-my-pi/pi-tui/theme";
@@ -20,6 +22,8 @@ const DB_FORM = `<form>
   <p>Sessions live in memory.</p>
   <fieldset>
     <legend>Session store</legend>
+    <p>SQLite needs no service.</p>
+    <p>Redis supports multiple hosts.</p>
     <label><input type="radio" name="store" value="sqlite" checked> SQLite</label>
     <label><input type="radio" name="store" value="redis"> Redis</label>
   </fieldset>
@@ -102,6 +106,36 @@ afterEach(() => {
 });
 
 describe("AskTool form dialog", () => {
+	it("links the ACP form to the ask call so the client can hide its raw HTML", async () => {
+		const calls: CreateElicitationRequest[] = [];
+		const events: string[] = [];
+		const connection = {
+			unstable_createElicitation: async (request: CreateElicitationRequest) => {
+				calls.push(request);
+				events.push("form");
+				return { action: "accept", content: { store: "redis", ttl: 7 } };
+			},
+			sessionUpdate: async (notification: SessionNotification) => {
+				if (notification.update.sessionUpdate === "tool_call_update") {
+					events.push(notification.update.toolCallId);
+				}
+			},
+		} as unknown as AgentSideConnection;
+		const ui = createAcpExtensionUiContext(connection, () => "session-form", { elicitation: { form: {} } });
+		const result = await new AskTool(createSession()).execute(
+			"call-html-form",
+			{ html: DB_FORM },
+			undefined,
+			undefined,
+			{ ...createContext({}), ui },
+		);
+
+		expect(calls).toHaveLength(1);
+		expect(calls[0]).toMatchObject({ toolCallId: "call-html-form", sessionId: "session-form" });
+		expect(events).toEqual(["form", "call-html-form"]);
+		expect(result.details?.answers[0]).toEqual({ name: "store", question: "Session store", answer: "Redis" });
+	});
+
 	it("returns the submitted form data as JSON and each field's question and answer", async () => {
 		const formDialog = vi.fn<FormDialog>(async () => ({ data: { store: "redis", ttl: 7 } }));
 		const result = await new AskTool(createSession()).execute(

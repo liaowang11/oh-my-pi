@@ -131,14 +131,21 @@ export function defaultFormData(form: HtmlForm): HtmlFormData {
 }
 
 /**
- * The question each field answers: its own label, else the text block right
- * before it (`<p>Which database?</p>` above a radio group), else its section
- * title, else a lone option's label (a single checkbox), else its name.
+ * The question each field answers: its own label, else the legend of a
+ * single-field fieldset, else the text block right before it
+ * (`<p>Which database?</p>` above a radio group), else its section title,
+ * else a lone option's label (a single checkbox), else its name.
  */
 export function fieldQuestions(form: HtmlForm): Map<FormField, string> {
 	const questions = new Map<FormField, string>();
 	for (const section of form.sections) {
 		const title = spansText(section.title);
+		// A single-question fieldset names its control with the legend; paragraphs
+		// between the legend and the choices explain it rather than replace it.
+		const groupTitle =
+			section.fieldset && section.blocks.reduce((count, block) => count + (block.kind === "field" ? 1 : 0), 0) === 1
+				? title
+				: "";
 		let caption = "";
 		for (const block of section.blocks) {
 			if (block.kind === "field") {
@@ -146,7 +153,7 @@ export function fieldQuestions(form: HtmlForm): Map<FormField, string> {
 				const own = spansText(field.label);
 				const lone =
 					field.kind === "choice" && field.options.length === 1 ? spansText(field.options[0]!.label) : "";
-				questions.set(field, oneLine(own || caption || title || lone || field.name));
+				questions.set(field, oneLine(own || groupTitle || caption || title || lone || field.name));
 				caption = "";
 				continue;
 			}

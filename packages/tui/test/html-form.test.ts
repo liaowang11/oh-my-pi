@@ -255,7 +255,7 @@ describe("html form", () => {
 			expect(onTimeout).toHaveBeenCalledWith(form.data(), [
 				{
 					name: "db",
-					question: "Which store should ledger use?",
+					question: "Database",
 					option: "SQLite",
 					value: "sqlite",
 					text: "pasted",
@@ -346,7 +346,7 @@ describe("html form", () => {
 			expect(onTimeout).toHaveBeenCalledWith(form.data(), [
 				{
 					name: "db",
-					question: "Which store should ledger use?",
+					question: "Database",
 					option: "SQLite",
 					value: "sqlite",
 					text: "draft",
@@ -469,7 +469,7 @@ describe("html form", () => {
 			const form = parseHtmlForm(DB_FORM);
 			expect(defaultFormData(form)).toEqual({ db: "sqlite", extras: ["ci"], region: "us", workers: 4, notes: "" });
 			expect(formAnswers(form, { db: "pg", extras: [], region: "eu", workers: 2, notes: "" })).toEqual([
-				{ name: "db", question: "Which store should ledger use?", answer: "Postgres" },
+				{ name: "db", question: "Database", answer: "Postgres" },
 				{ name: "extras", question: "Extras", answer: "" },
 				{ name: "region", question: "Region", answer: "EU" },
 				{ name: "workers", question: "Workers", answer: "2" },

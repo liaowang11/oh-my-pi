@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed single-question form fieldsets to retain their legend as the question label when explanatory paragraphs precede the choices.
+
 ## [18.19.0] - 2026-11-12
 
 ### Added

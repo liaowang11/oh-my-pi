@@ -100,10 +100,16 @@ import {
 	type HtmlFormData,
 	type HtmlFormValue,
 	isArrayChoice,
-	OTHER_LABEL,
 	textValue,
 } from "@oh-my-pi/pi-tui/html-form/data";
-import { type ChoiceField, type HtmlForm, parseHtmlForm, spansText } from "@oh-my-pi/pi-tui/html-form/parse";
+import {
+	type ChoiceField,
+	type FormBlock,
+	type FormField,
+	type HtmlForm,
+	parseHtmlForm,
+	spansText,
+} from "@oh-my-pi/pi-tui/html-form/parse";
 import { resolvePlanFilePath } from "../../plan-mode/plan-files";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
@@ -128,6 +134,7 @@ import {
 import { AcpSubagentRelay, clientSupportsSubagents, subagentSessionId } from "./acp-subagents";
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
+	AIR_CUSTOM_ANSWER_KEY,
 	airCapabilityMeta,
 	clientSupportsAsyncTasks,
 	isAirClient,
@@ -148,6 +155,13 @@ const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
 const ACP_VIBE_MODE_ID = "vibe";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
+// Descriptions of an ask form's free-text "Other" field, as claude-agent-acp words them.
+const OTHER_MULTI_DESCRIPTION = "Type your own answer to add to your selection above (optional).";
+const OTHER_SINGLE_DESCRIPTION = "Type your own answer, or add a note to the option you chose above (optional).";
+// Un-namespaced custom-answer key: agent-shell reads it from every agent, released AIR versions too.
+const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
+// `_meta` key an ask form's option carries its preview under.
+const OPTION_META_KEY = "_claude/askUserQuestionOption";
 const APPROVE_OPTION = "Approve and execute";
 const REFINE_OPTION = "Refine plan";
 /** Title of the free-text property each `askDialog` question gets beside its options. */
@@ -722,6 +736,7 @@ async function elicitFormFromAcpClient(
 		.unstable_createElicitation({
 			mode: "form",
 			sessionId,
+			...(dialogOptions?.toolCallId ? { toolCallId: dialogOptions.toolCallId } : {}),
 			message,
 			requestedSchema: {
 				type: "object",
@@ -735,6 +750,16 @@ async function elicitFormFromAcpClient(
 			logger.warn("ACP elicitation failed", { acpSessionId: sessionId, method, error });
 			finish(undefined);
 		});
+	// The tool's raw input may already be on screen. Redraw it after the form
+	// request so clients can hide that input while its linked form is pending.
+	if (dialogOptions?.toolCallId) {
+		void connection
+			.sessionUpdate({
+				sessionId,
+				update: { sessionUpdate: "tool_call_update", toolCallId: dialogOptions.toolCallId, status: "in_progress" },
+			})
+			.catch(error => logger.warn("ACP elicitation tool update failed", { sessionId, error }));
+	}
 	const response = await promise;
 	if (!isAcceptedElicitation(response) || !response.content) {
 		return undefined;
@@ -762,31 +787,66 @@ async function elicitFromAcpClient(
 	return content?.value;
 }
 
-/**
- * The elicitation message for an HTML form: its section titles and context
- * blocks (paragraphs, lists, preformatted text, tables) as plain text, the
- * fields themselves being schema properties.
- */
-function formElicitationMessage(form: HtmlForm): string {
-	const parts: string[] = [];
+/** Plain-text context supported by ACP's schema descriptions. */
+function formBlockText(block: FormBlock): string | undefined {
+	switch (block.kind) {
+		case "text":
+			return spansText(block.spans);
+		case "pre":
+			return block.text;
+		case "list":
+			return block.items
+				.map((item, index) => `${block.ordered ? `${index + 1}.` : "-"} ${spansText(item)}`)
+				.join("\n");
+		case "table":
+			return block.rows.map(cells => cells.map(cell => spansText(cell)).join(" | ")).join("\n");
+		default:
+			return undefined;
+	}
+}
+
+/** Keep a section's context with its controls, not in a detached preamble. */
+function formElicitationLayout(
+	form: HtmlForm,
+	questions: Map<FormField, string>,
+): { message: string; descriptions: Map<FormField, string> } {
+	const intro: string[] = [];
+	const descriptions = new Map<FormField, string>();
 	for (const section of form.sections) {
+		let context: string[] = [];
 		const title = spansText(section.title).trim();
-		if (title) parts.push(title);
-		for (const block of section.blocks) {
-			if (block.kind === "text") parts.push(spansText(block.spans));
-			else if (block.kind === "pre") parts.push(block.text);
-			else if (block.kind === "list") {
-				parts.push(
-					block.items
-						.map((item, index) => `${block.ordered ? `${index + 1}.` : "-"} ${spansText(item)}`)
-						.join("\n"),
-				);
-			} else if (block.kind === "table") {
-				parts.push(block.rows.map(cells => cells.map(cell => spansText(cell)).join(" | ")).join("\n"));
+		if (title) context.push(title);
+		let lastField: FormField | undefined;
+		let optionsEnd = 0;
+		for (const [index, block] of section.blocks.entries()) {
+			if (block.kind === "field") {
+				const field = block.field;
+				if (!field.name) continue;
+				const heading = questions.get(field);
+				const description = context.filter(text => text.replace(/\s+/g, " ").trim() !== heading).join("\n\n");
+				if (description) descriptions.set(field, description);
+				context = [];
+				lastField = field;
+				optionsEnd = block.optionsEnd ?? 0;
+				continue;
+			}
+			const text = formBlockText(block);
+			if (!text?.trim()) continue;
+			if (lastField && index < optionsEnd) {
+				descriptions.set(lastField, [descriptions.get(lastField), text].filter(Boolean).join("\n\n"));
+			} else {
+				context.push(text);
 			}
 		}
+		if (lastField) {
+			if (context.length > 0) {
+				descriptions.set(lastField, [descriptions.get(lastField), ...context].filter(Boolean).join("\n\n"));
+			}
+		} else {
+			intro.push(...context);
+		}
 	}
-	return parts.filter(part => part.trim()).join("\n\n") || "Fill in the form";
+	return { message: intro.join("\n\n") || "Fill in the form", descriptions };
 }
 
 /**
@@ -814,17 +874,24 @@ function otherProperties(form: HtmlForm): Map<ChoiceField, string> {
  * "Other" answer ({@link otherProperties}). Preselected options and prefilled
  * text are the properties' defaults.
  */
-function formElicitationSchema(form: HtmlForm): {
+function formElicitationSchema(
+	form: HtmlForm,
+	airClient: boolean,
+): {
+	message: string;
 	properties: Record<string, ElicitationPropertySchema>;
 	required: string[];
 } {
 	const questions = fieldQuestions(form);
+	const { message, descriptions } = formElicitationLayout(form, questions);
 	const others = otherProperties(form);
 	const properties: Record<string, ElicitationPropertySchema> = {};
 	const required: string[] = [];
 	for (const field of form.fields) {
 		if (!field.name) continue;
 		const title = questions.get(field) ?? field.name;
+		const context = descriptions.get(field);
+		const description = context ? { description: context } : {};
 		if (field.required) required.push(field.name);
 		if (field.kind === "choice") {
 			const options = field.options.filter(option => !option.disabled);
@@ -834,41 +901,58 @@ function formElicitationSchema(form: HtmlForm): {
 			}));
 			const checked = options.filter(option => option.checked).map(option => option.value);
 			if (isArrayChoice(field)) {
-				properties[field.name] = { type: "array", title, items: { anyOf: entries }, default: checked };
+				properties[field.name] = {
+					type: "array",
+					title,
+					...description,
+					items: { anyOf: entries },
+					default: checked,
+				};
 			} else if (field.multi) {
 				// A lone checkbox renders as one box: its own label says what checking it means.
 				const boxLabel = entries[0]?.title;
+				const details = [
+					boxLabel !== undefined && title !== field.name && title !== boxLabel ? title : undefined,
+					context,
+				]
+					.filter(Boolean)
+					.join("\n\n");
 				properties[field.name] = {
 					type: "boolean",
 					title: boxLabel ?? title,
-					...(boxLabel !== undefined && title !== field.name && title !== boxLabel ? { description: title } : {}),
+					...(details ? { description: details } : {}),
 					default: checked.length > 0,
 				};
 			} else {
 				properties[field.name] = {
 					type: "string",
 					title,
+					...description,
 					oneOf: entries,
 					...(checked[0] !== undefined ? { default: checked[0] } : {}),
 				};
 			}
 			const other = others.get(field);
 			if (other !== undefined) {
+				const customAnswer = { questionId: field.name, isCustomAnswer: true };
+				const meta = { [CUSTOM_ANSWER_META_KEY]: customAnswer };
 				properties[other] = {
 					type: "string",
-					title: `${title} — ${OTHER_LABEL}`,
-					description: field.multi ? "Another answer, added to those checked" : "Your own answer instead",
+					title: OTHER_OPTION,
+					description: field.multi ? OTHER_MULTI_DESCRIPTION : OTHER_SINGLE_DESCRIPTION,
+					_meta: airClient ? withAirMeta(meta, AIR_CUSTOM_ANSWER_KEY, customAnswer) : meta,
 				};
 			}
 			continue;
 		}
-		const description = field.placeholder.trim() ? { description: field.placeholder } : {};
+		const details = [context, field.placeholder.trim()].filter(Boolean).join("\n\n");
+		const textDescription = details ? { description: details } : {};
 		if (field.type === "number" || field.type === "range") {
 			const value = textValue(field, field.value);
 			properties[field.name] = {
 				type: "number",
 				title,
-				...description,
+				...textDescription,
 				...(field.min !== undefined ? { minimum: field.min } : {}),
 				...(field.max !== undefined ? { maximum: field.max } : {}),
 				...(typeof value === "number" ? { default: value } : {}),
@@ -878,13 +962,13 @@ function formElicitationSchema(form: HtmlForm): {
 		properties[field.name] = {
 			type: "string",
 			title,
-			...description,
+			...textDescription,
 			...(field.minLength !== undefined ? { minLength: field.minLength } : {}),
 			...(field.maxLength !== undefined ? { maxLength: field.maxLength } : {}),
 			...(field.value ? { default: field.value } : {}),
 		};
 	}
-	return { properties, required };
+	return { message, properties, required };
 }
 
 /** Form data from an accepted elicitation of {@link formElicitationSchema}, keeping only values the form offers. */
@@ -942,6 +1026,7 @@ export function createAcpExtensionUiContext(
 	clientCapabilities: ClientCapabilities | undefined,
 ): ExtensionUIContext {
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
+	const airClient = isAirClient(clientCapabilities);
 	return {
 		supportsEditor: false,
 		select: async (title, options, dialogOptions) => {
@@ -995,13 +1080,20 @@ export function createAcpExtensionUiContext(
 					const: option.label,
 					title: option.label,
 					...(option.description?.trim() ? { description: option.description.trim() } : {}),
+					// ACP's enum option has no preview slot; claude-agent-acp sends it under
+					// this `_meta` key, which agent-shell renders.
+					...(option.preview?.trim() ? { _meta: { [OPTION_META_KEY]: { preview: option.preview } } } : {}),
 				}));
-				const description = question.header?.trim();
+				// A single question already travels as the elicitation `message`, so the
+				// field carries only the header; repeating the question renders it twice.
+				const header = question.header?.trim();
+				const title = header || question.question;
+				const description = header && questions.length > 1 ? question.question : undefined;
 				if (entries.length > 0) {
 					if (question.multi === true) {
 						properties[key] = {
 							type: "array",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							items: { anyOf: entries },
 						};
@@ -1009,7 +1101,7 @@ export function createAcpExtensionUiContext(
 						const recommended = question.recommended;
 						properties[key] = {
 							type: "string",
-							title: question.question,
+							title,
 							...(description ? { description } : {}),
 							oneOf: entries,
 							...(recommended !== undefined && recommended >= 0 && recommended < question.options.length
@@ -1018,7 +1110,26 @@ export function createAcpExtensionUiContext(
 						};
 					}
 				}
-				properties[`${key}__other`] = { type: "string", title: OTHER_OPTION };
+				// Marks the free-text field as the select's companion so clients
+				// (agent-shell, JetBrains AIR) offer it as one more option of that
+				// select instead of a separate field. Every client gets the
+				// un-namespaced key, which agent-shell reads from any agent; an AIR
+				// client also gets `_meta.jetbrains.air.customAnswer`, as
+				// claude-agent-acp sends it. Without options the free-text field is
+				// the whole question.
+				const customAnswer = { questionId: key, isCustomAnswer: true };
+				const customAnswerMeta = { [CUSTOM_ANSWER_META_KEY]: customAnswer };
+				properties[`${key}__other`] =
+					entries.length > 0
+						? {
+								type: "string",
+								title: OTHER_OPTION,
+								description: question.multi === true ? OTHER_MULTI_DESCRIPTION : OTHER_SINGLE_DESCRIPTION,
+								_meta: airClient
+									? withAirMeta(customAnswerMeta, AIR_CUSTOM_ANSWER_KEY, customAnswer)
+									: customAnswerMeta,
+							}
+						: { type: "string", title, ...(description ? { description } : {}) };
 			}
 
 			let timedOut = false;
@@ -1071,13 +1182,13 @@ export function createAcpExtensionUiContext(
 		formDialog: async (html, dialogOptions) => {
 			if (!supportsForm) return undefined;
 			const form = parseHtmlForm(html);
-			const { properties, required } = formElicitationSchema(form);
+			const { message, properties, required } = formElicitationSchema(form, airClient);
 			let timedOut = false;
 			const content = await elicitFormFromAcpClient(
 				connection,
 				getSessionId(),
 				"formDialog",
-				formElicitationMessage(form),
+				message,
 				properties,
 				required.length > 0 ? required : undefined,
 				{

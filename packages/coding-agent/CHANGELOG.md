@@ -2,6 +2,10 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Fixed ACP ask forms to keep question headings and context together, show Other answers inline, and hide duplicated raw HTML while awaiting an answer.
+
 ## [18.19.0] - 2026-11-12
 
 ### Breaking Changes

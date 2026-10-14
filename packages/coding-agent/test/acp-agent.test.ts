@@ -4321,19 +4321,23 @@ describe("ACP agent", () => {
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(request.message).toBe("Which approach?");
 			expect(request.requestedSchema.required).toBeUndefined();
+			// The question rides in `message`; repeating it on the field renders it twice.
 			expect(request.requestedSchema.properties.q0).toEqual({
 				type: "string",
-				title: "Which approach?",
-				description: "Choose one",
+				title: "Choose one",
 				oneOf: [
 					{ const: "Approach A", title: "Approach A", description: "Faster" },
 					{ const: "Approach B", title: "Approach B", description: "Safer" },
 				],
 				default: "Approach A",
 			});
+			// The marker lets clients fold the free-text field into the select as one more option.
+			// A client that is not AIR gets only the un-namespaced key agent-shell reads.
 			expect(request.requestedSchema.properties.q0__other).toEqual({
 				type: "string",
 				title: "Other (type your own)",
+				description: "Type your own answer, or add a note to the option you chose above (optional).",
+				_meta: { _askUserQuestionCustomAnswer: { questionId: "q0", isCustomAnswer: true } },
 			});
 			expect(result).toEqual({
 				kind: "submit",
@@ -4424,7 +4428,7 @@ describe("ACP agent", () => {
 			const ctx = createAcpExtensionUiContext(connection, () => "session-ask-no-options", FORM_CAPABILITIES);
 
 			const result = await ctx.askDialog!([
-				{ id: "single", question: "Single?", options: [] },
+				{ id: "single", question: "Single?", header: "One", options: [] },
 				{ id: "multi", question: "Multi?", options: [], multi: true },
 			]);
 
@@ -4432,10 +4436,72 @@ describe("ACP agent", () => {
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0__other", "q1__other"]);
+			// The free-text field is the whole question, so it is labelled as one;
+			// no select to fold into, so no companion marker either.
+			expect(request.requestedSchema.properties.q0__other).toEqual({
+				type: "string",
+				title: "One",
+				description: "Single?",
+			});
+			expect(request.requestedSchema.properties.q1__other).toEqual({ type: "string", title: "Multi?" });
 			expect(result?.kind === "submit" ? result.results : undefined).toMatchObject([
 				{ id: "single", selectedOptions: [], customInput: "single answer" },
 				{ id: "multi", selectedOptions: [], customInput: "multi answer" },
 			]);
+		});
+
+		it("marks legacy and HTML Other fields for an AIR client under both custom-answer keys", async () => {
+			const { connection, calls } = createElicitConnection(async () => ({ action: "accept", content: {} }));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-ask-air", {
+				...FORM_CAPABILITIES,
+				_meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+			});
+
+			await ctx.askDialog!([{ id: "choice", question: "Choose", options: [{ label: "A" }] }]);
+
+			const request = calls[0]!;
+			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
+			expect(request.requestedSchema.properties.q0__other?._meta).toEqual({
+				_askUserQuestionCustomAnswer: { questionId: "q0", isCustomAnswer: true },
+				jetbrains: { air: { version: 1, customAnswer: { questionId: "q0", isCustomAnswer: true } } },
+			});
+
+			await ctx.formDialog!(
+				'<form><label><input type="radio" name="choice" value="a"> A</label><label><input type="radio" name="choice" value="b"> B</label></form>',
+			);
+			const htmlRequest = calls[1]!;
+			if (!isFormElicitation(htmlRequest)) throw new Error("expected form-mode elicitation");
+			expect(htmlRequest.requestedSchema.properties.choice_other?._meta).toEqual({
+				_askUserQuestionCustomAnswer: { questionId: "choice", isCustomAnswer: true },
+				jetbrains: { air: { version: 1, customAnswer: { questionId: "choice", isCustomAnswer: true } } },
+			});
+		});
+
+		it("forwards an option's preview under the claude-agent-acp option key", async () => {
+			const { connection, calls } = createElicitConnection(async () => ({ action: "accept", content: {} }));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-ask-preview", FORM_CAPABILITIES);
+
+			await ctx.askDialog!([
+				{
+					id: "layout",
+					question: "Layout?",
+					options: [{ label: "Grid", preview: "| a | b |\n| c | d |" }, { label: "List" }],
+					multi: true,
+				},
+			]);
+
+			const request = calls[0]!;
+			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
+			expect(request.requestedSchema.properties.q0?.items).toEqual({
+				anyOf: [
+					{
+						const: "Grid",
+						title: "Grid",
+						_meta: { "_claude/askUserQuestionOption": { preview: "| a | b |\n| c | d |" } },
+					},
+					{ const: "List", title: "List" },
+				],
+			});
 		});
 
 		it("drops ask values the client was never offered", async () => {
@@ -4461,6 +4527,7 @@ describe("ACP agent", () => {
 				{
 					id: "storage",
 					question: "Storage?",
+					header: "Storage",
 					options: [{ label: "SQLite" }, { label: "PostgreSQL" }],
 				},
 				{
@@ -4476,6 +4543,14 @@ describe("ACP agent", () => {
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
 			expect(request.message).toBe("Answer 2 questions");
 			expect(Object.keys(request.requestedSchema.properties)).toEqual(["q0", "q0__other", "q1", "q1__other"]);
+			// `message` names no question here, so each field carries its own text.
+			expect(request.requestedSchema.properties.q0).toMatchObject({ title: "Storage", description: "Storage?" });
+			expect(request.requestedSchema.properties.q1).toMatchObject({ title: "Features?" });
+			expect(request.requestedSchema.properties.q1).not.toHaveProperty("description");
+			expect(request.requestedSchema.properties.q1__other).toMatchObject({
+				description: "Type your own answer to add to your selection above (optional).",
+				_meta: { _askUserQuestionCustomAnswer: { questionId: "q1", isCustomAnswer: true } },
+			});
 			expect(result?.kind === "submit" ? result.results.map(item => item.id) : undefined).toEqual([
 				"storage",
 				"features",
@@ -4553,6 +4628,8 @@ describe("ACP agent", () => {
   <p>Staging is green; production has a pending migration.</p>
   <fieldset>
     <legend>Target</legend>
+    <p>Choose the environment to deploy.</p>
+    <p>Production needs approval.</p>
     <label><input type="radio" name="target" value="staging" checked> Staging</label>
     <label><input type="radio" name="target" value="prod"> Production</label>
   </fieldset>
@@ -4579,19 +4656,26 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
-			expect(request.message).toContain("Staging is green; production has a pending migration.");
+			expect(request.message).toBe("Staging is green; production has a pending migration.");
+			expect(request).not.toHaveProperty("toolCallId");
 			expect(request.requestedSchema.required).toEqual(["replicas"]);
 			expect(request.requestedSchema.properties).toEqual({
 				target: {
 					type: "string",
 					title: "Target",
+					description: "Choose the environment to deploy.\n\nProduction needs approval.",
 					oneOf: [
 						{ const: "staging", title: "Staging" },
 						{ const: "prod", title: "Production" },
 					],
 					default: "staging",
 				},
-				target_other: { type: "string", title: "Target — Other", description: "Your own answer instead" },
+				target_other: {
+					type: "string",
+					title: "Other (type your own)",
+					description: "Type your own answer, or add a note to the option you chose above (optional).",
+					_meta: { _askUserQuestionCustomAnswer: { questionId: "target", isCustomAnswer: true } },
+				},
 				checks: {
 					type: "array",
 					title: "Checks",
@@ -4605,8 +4689,9 @@ describe("ACP agent", () => {
 				},
 				checks_other: {
 					type: "string",
-					title: "Checks — Other",
-					description: "Another answer, added to those checked",
+					title: "Other (type your own)",
+					description: "Type your own answer to add to your selection above (optional).",
+					_meta: { _askUserQuestionCustomAnswer: { questionId: "checks", isCustomAnswer: true } },
 				},
 				notify: { type: "boolean", title: "Notify the channel", default: false },
 				replicas: { type: "number", title: "Replicas", minimum: 1, maximum: 5, default: 2 },
@@ -4621,6 +4706,32 @@ describe("ACP agent", () => {
 					replicas: 3,
 					notes: "ship it",
 				},
+			});
+		});
+
+		it("keeps context between options and trailing context with that group, and merges text hints", async () => {
+			const { connection, calls } = createElicitConnection(async () => ({ action: "accept", content: {} }));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-context", FORM_CAPABILITIES);
+			await ctx.formDialog!(`<form>
+  <fieldset><legend>Store</legend>
+    <p>Use a durable store.</p>
+    <label><input type="radio" name="store" value="sqlite"> SQLite</label>
+    <p>Redis needs a service.</p>
+    <label><input type="radio" name="store" value="redis"> Redis</label>
+    <p>Choose a compliant region.</p>
+    <label>Region <input name="region" placeholder="us or eu"></label>
+    <pre>Check residency before submitting.</pre>
+  </fieldset>
+</form>`);
+			const request = calls[0]!;
+			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
+			expect(request.requestedSchema.properties.store).toMatchObject({
+				title: "Use a durable store.",
+				description: "Store\n\nRedis needs a service.",
+			});
+			expect(request.requestedSchema.properties.region).toMatchObject({
+				title: "Region",
+				description: "Choose a compliant region.\n\nCheck residency before submitting.\n\nus or eu",
 			});
 		});
 
