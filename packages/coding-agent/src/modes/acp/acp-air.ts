@@ -12,6 +12,8 @@ import type { ClientCapabilities } from "@oh-my-pi/pi-utils/acp";
 
 /** Background tasks surfaced as `async_task_*` session updates. */
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
+/** Marks an ask form's free-text field as the custom answer of a select field. */
+export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
 /** AIR extension version this agent speaks. */
 export const AIR_EXTENSION_VERSION = 1;
 
