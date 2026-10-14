@@ -964,6 +964,9 @@ export class SessionManager {
 	#hasTitleSlot = true;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
+	/** Ids {@link reserveEntryId} handed out that no entry carries yet; no other entry is minted under them. */
+	readonly #reservedIds = new Set<string>();
+	readonly #takenIds = { has: (id: string): boolean => this.#index.has(id) || this.#reservedIds.has(id) };
 
 	/** File reflects all current entries; appends can go incrementally. */
 	#fileIsCurrent = false;
@@ -2139,7 +2142,7 @@ export class SessionManager {
 
 	#freshEntryFields(): { id: string; parentId: string | null; timestamp: string; runtime: RuntimeIdentity } {
 		return {
-			id: generateId(this.#index),
+			id: generateId(this.#takenIds),
 			parentId: this.#index.leafId(),
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
@@ -3542,6 +3545,18 @@ export class SessionManager {
 	}
 
 	/**
+	 * Let automatic titles replace the current title, as they may a fork's title
+	 * copied from its parent: a user title is kept, recorded as an automatic one.
+	 * Returns whether the title source changed.
+	 */
+	async yieldTitleToAuto(): Promise<boolean> {
+		const title = this.#sessionName;
+		if (!title || this.#titleSource !== "user") return false;
+		this.#titleSource = undefined;
+		return this.setSessionName(title, "auto");
+	}
+
+	/**
 	 * Journal an idle recap for this session in history.db. Recaps never enter
 	 * the session file or LLM context; in-memory sessions are not journaled.
 	 */
@@ -3582,10 +3597,25 @@ export class SessionManager {
 			| BashExecutionMessage
 			| PythonExecutionMessage
 			| FileMentionMessage,
+		reservedId?: string,
 	): string {
 		const entry: SessionMessageEntry = { type: "message", ...this.#freshEntryFields(), message };
+		if (reservedId !== undefined && this.#reservedIds.delete(reservedId) && !this.#index.has(reservedId)) {
+			entry.id = reservedId;
+		}
 		this.#recordEntry(entry);
 		return entry.id;
+	}
+
+	/**
+	 * An id for a message entry not appended yet — a reply still streaming —
+	 * that {@link appendMessage} gives the entry when passed it. No other entry
+	 * is minted under it meanwhile.
+	 */
+	reserveEntryId(): string {
+		const id = generateId(this.#takenIds);
+		this.#reservedIds.add(id);
+		return id;
 	}
 
 	/**
@@ -3612,7 +3642,7 @@ export class SessionManager {
 		const activeLeafId = this.#index.leafId();
 		const entry: SessionMessageEntry = {
 			type: "message",
-			id: generateId(this.#index),
+			id: generateId(this.#takenIds),
 			parentId,
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
@@ -3641,7 +3671,7 @@ export class SessionManager {
 		const activeLeafId = this.#index.leafId();
 		const entry: ModelUsageEntry = {
 			type: "model_usage",
-			id: generateId(this.#index),
+			id: generateId(this.#takenIds),
 			parentId: owner.parentId,
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
@@ -4092,7 +4122,7 @@ export class SessionManager {
 				// chain stays made of entries collab guests replicate.
 				this.#recordEntry({
 					type: "model_usage",
-					id: generateId(this.#index),
+					id: generateId(this.#takenIds),
 					parentId: leafId,
 					timestamp: entry.timestamp,
 					runtime: currentRuntimeIdentity(),
@@ -4121,7 +4151,7 @@ export class SessionManager {
 		this.#setLeaf(branchFromId);
 		const entry: BranchSummaryEntry = {
 			type: "branch_summary",
-			id: generateId(this.#index),
+			id: generateId(this.#takenIds),
 			parentId: branchFromId,
 			timestamp: nowIso(),
 			runtime: currentRuntimeIdentity(),
