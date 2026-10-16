@@ -84,8 +84,14 @@ import type { AgentSession, AgentSessionEvent } from "../../session/agent-sessio
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
 import type { SessionEntry, UsageStatistics } from "../../session/session-entries";
-import { readSessionInfo, type SessionInfo as StoredSessionInfo } from "../../session/session-listing";
+import {
+	findSessionFiles,
+	readSessionInfo,
+	sessionIdFromSessionPath,
+	type SessionInfo as StoredSessionInfo,
+} from "../../session/session-listing";
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
+import { isAgentManagedWorktree } from "../../session/session-paths";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
@@ -121,8 +127,27 @@ import {
 	airCapabilityMeta,
 	clientSupportsAsyncTasks,
 	isAirClient,
+	withAirFields,
 	withAirMeta,
 } from "./acp-air";
+import {
+	clientSupportsSessionIndex,
+	compareSessionIndexPositions,
+	decodeSessionIndexCursor,
+	encodeSessionIndexCursor,
+	matchesArchivedFilter,
+	parseRenameSessionRequest,
+	parseSessionIdRequest,
+	parseSessionIndexListOptions,
+	type RenameSessionRequest,
+	SESSION_ARCHIVE_METHOD,
+	SESSION_RENAME_METHOD,
+	SESSION_UNARCHIVE_METHOD,
+	type SessionIndexPosition,
+	type SessionIndexRowFields,
+	sessionIndexCapabilities,
+	sessionNotFound,
+} from "./acp-session-index";
 import {
 	AcpAsyncTaskRelay,
 	ASYNC_TASK_STOP_METHOD,
@@ -611,6 +636,31 @@ function indexAssistantEntries(entries: readonly SessionEntry[]): AssistantEntry
 	return index;
 }
 
+function isoToMs(value: string | undefined): number | undefined {
+	if (value === undefined) return undefined;
+	const ms = Date.parse(value);
+	return Number.isFinite(ms) ? ms : undefined;
+}
+
+/**
+ * A session index row's `updatedAt`: its last message, capped at the file
+ * mtime, so a title-slot write (rename, archive) moves neither it nor the
+ * order. The mtime when the tail window holds no message.
+ */
+function sessionIndexUpdatedAtMs(session: StoredSessionInfo): number {
+	const mtime = session.modified.getTime();
+	const lastMessage = isoToMs(session.activity?.lastMessageAt);
+	return lastMessage === undefined ? mtime : Math.min(lastMessage, mtime);
+}
+
+/** The parent session id of a header `parentSession`, which a branch records as the parent's file path. */
+function parentSessionId(parentSession: string | undefined): string | undefined {
+	if (!parentSession) return undefined;
+	if (path.isAbsolute(parentSession) || parentSession.endsWith(".jsonl"))
+		return sessionIdFromSessionPath(parentSession);
+	return parentSession;
+}
+
 function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
@@ -1034,6 +1084,10 @@ export class AcpAgent implements Agent {
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
+	/** The client declared AIR `sessionIndex`: list pages carry AIR rows and the `_session/*` index methods answer. */
+	#sessionIndex = false;
+	/** Serializes rename/archive/unarchive, so two of them never interleave on one session's title slot. */
+	#sessionIndexQueue: Promise<void> = Promise.resolve();
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
 	#blobs = new BlobStore(getBlobsDir());
 
@@ -1050,6 +1104,7 @@ export class AcpAgent implements Agent {
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
 		this.#registerConnectionCleanup();
 		this.#clientCapabilities = params.clientCapabilities;
+		this.#sessionIndex = clientSupportsSessionIndex(params.clientCapabilities);
 		const authMethods: AuthMethod[] = [
 			{
 				id: "agent",
@@ -1098,7 +1153,9 @@ export class AcpAgent implements Agent {
 			// an AIR client only.
 			_meta: {
 				steering: { supported: true },
-				...(isAirClient(params.clientCapabilities) ? airCapabilityMeta(AIR_ASYNC_TASKS_CAPABILITY) : {}),
+				...(isAirClient(params.clientCapabilities)
+					? airCapabilityMeta(AIR_ASYNC_TASKS_CAPABILITY, ...sessionIndexCapabilities(params.clientCapabilities))
+					: {}),
 			},
 		};
 	}
@@ -1145,6 +1202,9 @@ export class AcpAgent implements Agent {
 		}
 		for (const record of this.#sessions.values()) {
 			await record.session.sessionManager.flush();
+		}
+		if (this.#sessionIndex) {
+			return await this.#listSessionIndexPage(params);
 		}
 		// Picker view: untitled 0-turn stubs are hidden but still loadable by id.
 		const sessions = (
@@ -1696,6 +1756,18 @@ export class AcpAgent implements Agent {
 		switch (method) {
 			case ASYNC_TASK_STOP_METHOD:
 				return await this.#stopAsyncTask(parseAsyncTaskStopRequest(params));
+			case SESSION_RENAME_METHOD: {
+				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
+				const request = parseRenameSessionRequest(params);
+				return await this.#runSessionIndexOperation(() => this.#renameSession(request));
+			}
+			case SESSION_ARCHIVE_METHOD:
+			case SESSION_UNARCHIVE_METHOD: {
+				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
+				const { sessionId } = parseSessionIdRequest(params);
+				const archived = method === SESSION_ARCHIVE_METHOD;
+				return await this.#runSessionIndexOperation(() => this.#setSessionArchived(sessionId, archived));
+			}
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
@@ -3244,6 +3316,134 @@ export class AcpAgent implements Agent {
 
 	async #buildAvailableCommands(session: AgentSession): Promise<AvailableCommand[]> {
 		return toAcpAvailableCommands(await buildAvailableSlashCommands(session));
+	}
+
+	/**
+	 * A `session/list` page for an AIR `sessionIndex` client: filtered by the
+	 * archive state, ordered by last prompt (else last message) descending,
+	 * then session id, and paged by an opaque cursor bound to the request.
+	 * Without `includeWorktrees`, the sessions of the repository's other live
+	 * worktrees are left out; a removed worktree's session stays listed under
+	 * the request cwd, where a load moves it.
+	 */
+	async #listSessionIndexPage(params: ListSessionsRequest): Promise<ListSessionsResponse> {
+		const options = parseSessionIndexListOptions(params._meta);
+		const requestCwd = params.cwd ?? undefined;
+		const scope = { cwd: requestCwd ?? null, includeWorktrees: options.includeWorktrees, archived: options.archived };
+		const after = params.cursor ? decodeSessionIndexCursor(params.cursor, scope) : undefined;
+		const stored = (
+			requestCwd ? await SessionManager.listForPicker(requestCwd) : await SessionManager.listAllForPicker()
+		).sort((left, right) => right.modified.getTime() - left.modified.getTime());
+		const ownDir = requestCwd ? path.resolve(SessionManager.getDefaultSessionDir(requestCwd)) : undefined;
+		const rows: Array<{ session: StoredSessionInfo; position: SessionIndexPosition; updatedAtMs: number }> = [];
+		const listed = new Set<string>();
+		for (const candidate of stored) {
+			if (listed.has(candidate.id) || !matchesArchivedFilter(candidate.archived === true, options.archived))
+				continue;
+			let session = candidate;
+			if (requestCwd && path.resolve(path.dirname(candidate.path)) !== ownDir) {
+				if (await SessionManager.isFromRemovedWorktree(candidate, requestCwd)) {
+					session = { ...candidate, cwd: requestCwd };
+				} else if (!options.includeWorktrees) {
+					continue;
+				}
+			}
+			listed.add(session.id);
+			const updatedAtMs = sessionIndexUpdatedAtMs(session);
+			const orderAtMs = isoToMs(session.activity?.lastPromptAt) ?? updatedAtMs;
+			rows.push({ session, updatedAtMs, position: { orderAtMs, sessionId: session.id } });
+		}
+		rows.sort((left, right) => compareSessionIndexPositions(left.position, right.position));
+		const remaining = after ? rows.filter(row => compareSessionIndexPositions(row.position, after) > 0) : rows;
+		const page = remaining.slice(0, options.limit);
+		const last = page.at(-1);
+		return {
+			sessions: page.map(row => this.#toSessionIndexRow(row.session, row.updatedAtMs)),
+			nextCursor:
+				last && remaining.length > page.length ? encodeSessionIndexCursor(last.position, scope) : undefined,
+		};
+	}
+
+	/** A list row with its AIR fields; a session loaded here reports its live state, model and cost. */
+	#toSessionIndexRow(session: StoredSessionInfo, updatedAtMs: number): SessionInfo {
+		const base = this.#toSessionInfo(session);
+		const record = this.#sessions.get(session.id);
+		const activity = session.activity;
+		const fields: SessionIndexRowFields = { archived: session.archived === true };
+		if (activity?.lastPromptAt) fields.lastPromptAt = activity.lastPromptAt;
+		const model = record?.session.model?.id ?? activity?.model;
+		if (model) fields.model = model;
+		const forkedFrom = parentSessionId(session.parentSessionPath);
+		if (forkedFrom) fields.forkedFrom = forkedFrom;
+		const running = record !== undefined && (isPromptTurnInFlight(record.promptTurn) || record.session.isStreaming);
+		fields.state = running ? "running" : session.status === "error" ? "error" : "idle";
+		if (activity?.lastTurnEndedAt) fields.lastTurnEndedAt = activity.lastTurnEndedAt;
+		const cost = record?.session.sessionManager.getUsageStatistics().cost ?? 0;
+		if (cost > 0) fields.cost = { amount: cost, currency: "USD" };
+		if (session.cwd && isAgentManagedWorktree(session.cwd)) fields.agentWorktree = true;
+		return {
+			...base,
+			updatedAt: new Date(updatedAtMs).toISOString(),
+			_meta: withAirFields(base._meta, fields),
+		};
+	}
+
+	#runSessionIndexOperation(
+		operation: () => Promise<{ [key: string]: unknown }>,
+	): Promise<{ [key: string]: unknown }> {
+		const run = this.#sessionIndexQueue.then(operation, operation);
+		this.#sessionIndexQueue = run.then(
+			() => undefined,
+			() => undefined,
+		);
+		return run;
+	}
+
+	/** Every stored file of `sessionId` (an exact id), or `-32002` when there is none. */
+	async #storedSessionFiles(sessionId: string): Promise<Array<{ path: string; id: string }>> {
+		const files = (await findSessionFiles(sessionId)).filter(file => sessionIdFromSessionPath(file) === sessionId);
+		if (files.length === 0) throw sessionNotFound(sessionId);
+		return files.map(file => ({ path: file, id: sessionId }));
+	}
+
+	async #renameSession(request: RenameSessionRequest): Promise<{ [key: string]: unknown }> {
+		const record = this.#sessions.get(request.sessionId);
+		if (record) {
+			await record.session.setSessionName(request.title, "user");
+			// The title listener sends the update once bootstrap installed it.
+			if (!record.titleUnsubscribe) await this.#pushSessionInfoUpdate(record);
+			return {};
+		}
+		for (const stored of await this.#storedSessionFiles(request.sessionId)) {
+			await SessionManager.updateStoredSessionMeta(stored, { title: request.title });
+		}
+		return {};
+	}
+
+	/**
+	 * Archive or unarchive a session. Archiving one loaded here stops it, as
+	 * claude-agent-acp does: its turn is cancelled and the session closed, so a
+	 * later prompt fails until the client unarchives and loads it again.
+	 * Unarchiving never loads a session.
+	 */
+	async #setSessionArchived(sessionId: string, archived: boolean): Promise<{ [key: string]: unknown }> {
+		const record = this.#sessions.get(sessionId);
+		if (!record) {
+			for (const stored of await this.#storedSessionFiles(sessionId)) {
+				await SessionManager.updateStoredSessionMeta(stored, { archived });
+			}
+			return {};
+		}
+		if (archived) await this.#cancelPromptForClose(record);
+		await record.session.sessionManager.setArchived(archived);
+		await record.session.sessionManager.flush();
+		if (archived) await this.#closeManagedSession(sessionId, record);
+		// Sent after the close: an archive's update is the session's last.
+		await this.#connection.sessionUpdate({
+			sessionId,
+			update: { sessionUpdate: "session_info_update", _meta: withAirFields(undefined, { archived }) },
+		});
+		return {};
 	}
 
 	#toSessionInfo(session: StoredSessionInfo): SessionInfo {
