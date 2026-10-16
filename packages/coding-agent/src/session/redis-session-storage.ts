@@ -93,6 +93,7 @@ function decodeTitleMeta(raw: string | undefined): SessionTitleUpdate | undefine
 			title: typeof record.title === "string" ? record.title : undefined,
 			source,
 			updatedAt: record.updatedAt,
+			...(record.archived === true ? { archived: true } : {}),
 		};
 	} catch {
 		return undefined;
@@ -170,6 +171,7 @@ class RedisSessionStorageBackend implements SessionStorageBackend {
 					title: title?.title,
 					titleSource: title?.source,
 					titleUpdatedAt: title?.updatedAt,
+					titleArchived: title?.archived,
 				};
 			}),
 		);

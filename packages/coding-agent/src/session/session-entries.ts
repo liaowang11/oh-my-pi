@@ -30,6 +30,8 @@ export interface SessionTitleSlotEntry {
 	title: string;
 	source?: SessionTitleSource;
 	updatedAt: string;
+	/** Present (always `true`) while the session is archived: hidden from default session lists. */
+	archived?: true;
 	pad: string;
 }
 
