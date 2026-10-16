@@ -25,6 +25,7 @@ export interface SessionStorageIndexEntry {
 	title?: string;
 	titleSource?: SessionTitleUpdate["source"];
 	titleUpdatedAt?: string;
+	titleArchived?: boolean;
 }
 
 export interface SessionStorageBackend {
@@ -62,6 +63,7 @@ interface IndexEntry {
 	 * metadata), so only a later full write confirms it again.
 	 */
 	unconfirmed?: true;
+	titleArchived?: boolean;
 }
 
 interface EnqueueOptions {
@@ -113,7 +115,12 @@ function uniquePaths(paths: readonly string[]): string[] {
 }
 function titleUpdateForIndex(entry: IndexEntry): SessionTitleUpdate | undefined {
 	if (!entry.titleUpdatedAt) return undefined;
-	return { title: entry.title, source: entry.titleSource, updatedAt: entry.titleUpdatedAt };
+	return {
+		title: entry.title,
+		source: entry.titleSource,
+		updatedAt: entry.titleUpdatedAt,
+		...(entry.titleArchived ? { archived: true } : {}),
+	};
 }
 
 export class IndexedSessionStorage implements SessionStorage {
@@ -163,7 +170,12 @@ export class IndexedSessionStorage implements SessionStorage {
 		this.#index.clear();
 		for (const row of rows) {
 			const title = row.titleUpdatedAt
-				? { title: row.title, source: row.titleSource, updatedAt: row.titleUpdatedAt }
+				? {
+						title: row.title,
+						source: row.titleSource,
+						updatedAt: row.titleUpdatedAt,
+						...(row.titleArchived ? { archived: true } : {}),
+					}
 				: null;
 			this.#setIndex(row.path, row.size, row.mtimeMs, title);
 		}
@@ -240,6 +252,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			title: title.title,
 			titleSource: title.source,
 			titleUpdatedAt: title.updatedAt,
+			titleArchived: title.archived === true || undefined,
 			mtimeMs,
 		};
 		this.#index.set(path, next);
@@ -522,6 +535,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			titleUpdatedAt: title === undefined ? current?.titleUpdatedAt : (title?.updatedAt ?? undefined),
 			// An append extends the current content, so it does not restore what a failed removal deleted.
 			...(current?.unconfirmed ? { unconfirmed: true } : {}),
+			titleArchived: title === undefined ? current?.titleArchived : title?.archived === true || undefined,
 		});
 		if (mtimeMs > this.#nextMtimeMs) this.#nextMtimeMs = mtimeMs;
 	}
