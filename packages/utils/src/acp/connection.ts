@@ -8,6 +8,8 @@ import type {
 	CreateElicitationRequest,
 	CreateElicitationResponse,
 	CreateTerminalRequest,
+	DeleteSessionRequest,
+	DeleteSessionResponse,
 	ForkSessionRequest,
 	ForkSessionResponse,
 	InitializeRequest,
@@ -123,17 +125,24 @@ export class AgentSideConnection {
 		const response = await this.#connection.request<CreateTerminalResponse>("terminal/create", params);
 		return new TerminalHandle(response.terminalId, params.sessionId, this.#connection);
 	}
-	/** Creates an interactive elicitation on the client. */
-	unstable_createElicitation(params: CreateElicitationRequest): Promise<CreateElicitationResponse> {
-		return this.#connection.request("elicitation/create", params);
+	/** Creates an interactive elicitation on the client; aborting `signal` withdraws it. */
+	unstable_createElicitation(
+		params: CreateElicitationRequest,
+		signal?: AbortSignal,
+	): Promise<CreateElicitationResponse> {
+		return this.#connection.request("elicitation/create", params, { signal });
 	}
 	/** Notifies a client that URL elicitation completed. */
 	unstable_completeElicitation(params: CompleteElicitationNotification): Promise<void> {
 		return this.#connection.notify("elicitation/complete", params);
 	}
-	/** Sends a custom request. */
-	request<Response = unknown, Params = unknown>(method: string, params?: Params): Promise<Response> {
-		return this.#connection.request(method, params);
+	/** Sends a custom request; aborting `options.signal` withdraws it. */
+	request<Response = unknown, Params = unknown>(
+		method: string,
+		params?: Params,
+		options?: { signal?: AbortSignal },
+	): Promise<Response> {
+		return this.#connection.request(method, params, options);
 	}
 	/** Sends a custom notification. */
 	notify<Params = unknown>(method: string, params?: Params): Promise<void> {
@@ -242,6 +251,10 @@ export class ClientSideConnection {
 	closeSession(params: CloseSessionRequest): Promise<CloseSessionResponse> {
 		return this.#connection.request("session/close", params);
 	}
+	/** Deletes a session. */
+	deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+		return this.#connection.request("session/delete", params);
+	}
 	/** Sets a session mode. */
 	setSessionMode(params: SetSessionModeRequest): Promise<SetSessionModeResponse> {
 		return this.#connection.request("session/set_mode", params);
@@ -278,6 +291,8 @@ async function dispatchAgent(agent: Agent, method: string, params: unknown, noti
 			return invokeRequired(agent, agent.unstable_forkSession, method, params as ForkSessionRequest);
 		case "session/close":
 			return invokeRequired(agent, agent.closeSession, method, params as CloseSessionRequest);
+		case "session/delete":
+			return invokeRequired(agent, agent.deleteSession, method, params as DeleteSessionRequest);
 		case "session/set_mode":
 			return invokeRequired(agent, agent.setSessionMode, method, params as SetSessionModeRequest);
 		case "session/set_config_option":
