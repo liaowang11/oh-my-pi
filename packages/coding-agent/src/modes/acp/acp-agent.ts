@@ -83,7 +83,13 @@ import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } fro
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
-import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
+import {
+	bashExecutionToText,
+	isSilentAbort,
+	pythonExecutionToText,
+	SKILL_PROMPT_MESSAGE_TYPE,
+	USER_INTERRUPT_LABEL,
+} from "../../session/messages";
 import type { ModelTokenStatistics, SessionEntry, UsageStatistics } from "../../session/session-entries";
 import {
 	findSessionFiles,
@@ -116,6 +122,7 @@ import type { EventBus } from "../../utils/event-bus";
 import { enterVibeMode, exitVibeMode, type VibeModeHandle, vibeParentSessionOf } from "../../vibe/mode";
 import { VibeSessionRegistry } from "../../vibe/runtime";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
+import type { BashExecutionMessage, PythonExecutionMessage } from "@oh-my-pi/pi-tui/chat/messages";
 import { createAcpClientBridge } from "./acp-client-bridge";
 import {
 	extractAssistantMessageText,
@@ -132,6 +139,12 @@ import {
 	withAirFields,
 	withAirMeta,
 } from "./acp-air";
+import {
+	AcpCompactionLifecycle,
+	type CompactionOutcome,
+	clientSupportsCompactionUpdates,
+	compactionReplayUpdate,
+} from "./acp-compaction";
 import {
 	clientSupportsNotices,
 	mapSessionNoticeEvent,
@@ -222,6 +235,8 @@ export const ACP_BOOTSTRAP_RACE_GUARD_MS = 50;
 const ACP_CANCEL_CLEANUP_TIMEOUT_MS = 5_000;
 const ACP_ASYNC_DELIVERY_DRAIN_TIMEOUT_MS = 250;
 const ACP_ASYNC_DELIVERY_DRAIN_MAX_PASSES = 3;
+/** Auto-maintenance actions that rewrite the context; handoff and shake are not reported as compactions. */
+const COMPACTION_ACTIONS: ReadonlySet<string> = new Set(["context-full", "remote", "snapcompact"]);
 
 type AgentImageContent = {
 	type: "image";
@@ -485,6 +500,8 @@ type ManagedSessionRecord = {
 	sentUsage: string | undefined;
 	// Config warnings already sent as notices, so each reaches the client once.
 	sentConfigWarnings: Set<string>;
+	// Reports this session's context compactions (auto and manual /compact).
+	compaction: AcpCompactionLifecycle;
 	// Goal auto-continuation bookkeeping, same rule as the TUI: a continuation
 	// turn that did no tool work, or repeated the previous one, stops the chain
 	// until the user speaks again.
@@ -500,6 +517,11 @@ type ManagedSessionRecord = {
 type ReplayableMessage = {
 	role: string;
 	content?: unknown;
+	/** `compactionSummary` messages carry their text here, not in `content`. */
+	summary?: unknown;
+	tokensBefore?: unknown;
+	tokensAfter?: unknown;
+	timestamp?: unknown;
 	errorMessage?: string;
 	toolCallId?: string;
 	toolName?: string;
@@ -1676,6 +1698,23 @@ export class AcpAgent implements Agent {
 			notifyTitleChanged: async () => {
 				await this.#pushSessionInfoUpdate(record);
 			},
+			reportCompaction: {
+				start: () => this.#sendQuietly(record.compaction.start("manual"), "compaction start"),
+				finish: outcome =>
+					this.#sendQuietly(
+						record.compaction.finish(
+							outcome.status === "completed"
+								? {
+										status: "completed",
+										summary: outcome.summary,
+										preTokens: outcome.tokensBefore,
+										postTokens: outcome.tokensAfter,
+									}
+								: outcome,
+						),
+						"compaction outcome",
+					),
+			},
 			notifyConfigChanged: async options => {
 				// Mirrors `setSessionConfigOption`: once the session-lifetime
 				// subscription is installed, `model_changed`/`thinking_level_changed`
@@ -1710,6 +1749,7 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			// A builtin such as /compact can change the context with no agent turn.
+			await record.compaction.reset();
 			await this.#pushUsageUpdate(record);
 			this.#finishPrompt(record, { stopReason: "end_turn", ...this.#turnUsage(record, promptTurn) });
 			return;
@@ -1842,6 +1882,9 @@ export class AcpAgent implements Agent {
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
 		promptTurn.unsubscribe?.();
+		// The compaction's own end event can no longer reach this turn. The send
+		// is queued now, so `cancelled` precedes the prompt response.
+		void record.compaction.reset();
 		const cleanup = this.#runCancelCleanup(record, promptTurn);
 		promptTurn.cleanup = cleanup;
 		this.#finishPrompt(record, {
@@ -2340,6 +2383,10 @@ export class AcpAgent implements Agent {
 			sentTitle: undefined,
 			sentUsage: undefined,
 			sentConfigWarnings: new Set(),
+			compaction: new AcpCompactionLifecycle(
+				update => this.#connection.sessionUpdate({ sessionId: session.sessionId, update }),
+				this.#compactionReportOptions(),
+			),
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 			vibeMode: undefined,
 		};
@@ -2447,6 +2494,7 @@ export class AcpAgent implements Agent {
 			await this.#flushUnreportedTurnError(record, event);
 			await this.#emitEndOfTurnUpdates(record);
 			await this.#waitForAcpPromptIdle(record);
+			await record.compaction.reset();
 			try {
 				await this.#finishGoalModeAfterTurn(record);
 			} catch (error) {
@@ -2548,6 +2596,7 @@ export class AcpAgent implements Agent {
 				await this.#flushMissedFinalAssistantText(record, event);
 				await this.#flushUnreportedTurnError(record, event);
 				await this.#finishGoalModeAfterTurn(record);
+				await record.compaction.reset();
 				record.liveMessageId = undefined;
 				record.liveMessageProgress = undefined;
 			}
@@ -2587,6 +2636,14 @@ export class AcpAgent implements Agent {
 			onDelivery?.(delivery);
 			await delivery;
 		}
+		if (
+			(event.type === "auto_compaction_start" || event.type === "auto_compaction_end") &&
+			COMPACTION_ACTIONS.has(event.action)
+		) {
+			const delivery = this.#reportAutoCompaction(record, event);
+			onDelivery?.(delivery);
+			await delivery;
+		}
 		const notices = this.#sessionNotices(record, event);
 		// Await only when there is something to send: an idle await here would
 		// delay the usage reading below past later synchronous session events.
@@ -2601,6 +2658,49 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	#compactionReportOptions(): { presentation: "compaction_update" | "tool_call"; airClient: boolean } {
+		return {
+			presentation: clientSupportsCompactionUpdates(this.#clientCapabilities) ? "compaction_update" : "tool_call",
+			airClient: isAirClient(this.#clientCapabilities),
+		};
+	}
+
+	/** Await a report whose failure must not fail the command that triggered it. */
+	async #sendQuietly(delivery: Promise<void>, what: string): Promise<void> {
+		try {
+			await delivery;
+		} catch (error) {
+			logger.warn(`Failed to send the ACP ${what}`, { error });
+		}
+	}
+
+	/** Open or close the compaction entity of an automatic context-rewriting compaction. */
+	async #reportAutoCompaction(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" | "auto_compaction_end" }>,
+	): Promise<void> {
+		if (event.type === "auto_compaction_start") {
+			await record.compaction.start("automatic");
+			return;
+		}
+		let outcome: CompactionOutcome;
+		if (event.aborted) {
+			outcome = { status: "cancelled" };
+		} else if (event.skipped) {
+			outcome = { status: "cancelled", skipped: event.errorMessage ? { reason: event.errorMessage } : {} };
+		} else if (event.result) {
+			outcome = {
+				status: "completed",
+				summary: event.result.summary,
+				preTokens: event.result.tokensBefore,
+				postTokens: record.session.getContextUsage()?.tokens ?? undefined,
+			};
+		} else {
+			outcome = { status: "failed", error: event.errorMessage ?? "Compaction failed" };
+		}
+		await record.compaction.finish(outcome);
 	}
 
 	/** The session notices an event carries. */
@@ -4098,17 +4198,26 @@ export class AcpAgent implements Agent {
 				},
 			);
 		}
-		if (
-			message.role === "bashExecution" ||
-			message.role === "pythonExecution" ||
-			message.role === "compactionSummary"
-		) {
-			return this.#wrapReplayContent(
-				sessionId,
-				this.#extractReplayContent(message.content, undefined),
-				"user_message_chunk",
-				crypto.randomUUID(),
+		if (message.role === "bashExecution" || message.role === "pythonExecution") {
+			// The role fixes the shape: these come from buildSessionContext, and keep their text in fields, not `content`.
+			const text =
+				message.role === "bashExecution"
+					? bashExecutionToText(message as BashExecutionMessage)
+					: pythonExecutionToText(message as PythonExecutionMessage);
+			return this.#wrapReplayContent(sessionId, [{ type: "text", text }], "user_message_chunk", crypto.randomUUID());
+		}
+		if (message.role === "compactionSummary" && typeof message.summary === "string" && message.summary.length > 0) {
+			// Replay is terminal-only: one completed compaction at this position.
+			const update = compactionReplayUpdate(
+				`compaction:${message.timestamp}`,
+				message.summary,
+				{
+					...(typeof message.tokensBefore === "number" ? { preTokens: message.tokensBefore } : {}),
+					...(typeof message.tokensAfter === "number" ? { postTokens: message.tokensAfter } : {}),
+				},
+				this.#compactionReportOptions(),
 			);
+			return [{ sessionId, update }];
 		}
 		return [];
 	}

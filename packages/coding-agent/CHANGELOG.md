@@ -450,6 +450,8 @@
 - Fixed ACP form dialogs staying open on the client after the agent stopped waiting: a turn cancel or dialog timeout now withdraws the request with `$/cancel_request`, and cancelling a turn during plan approval no longer leaves the approval dialog pending.
 - ACP clients that support subagents can stop one running subagent with `session/cancel` on its child session id; the parent turn keeps running and the task reports the subagent as cancelled. Running subagents advertise this with `capabilities.cancel` (not offered to JetBrains AIR).
 - ACP clients now see session notices (model fallbacks, retry failures, config warnings, extension notifications and other agent warnings) as `notice` updates when they declare `session.notices`, or as a bold-labelled message line otherwise.
+- Fixed ACP `session/load` dropping past compactions and user-run shell and Python commands from the replayed transcript.
+- ACP clients now see context compactions, automatic and `/compact`: a `compaction_update` lifecycle carrying the summary when they declare `session.compaction`, otherwise a "Compact conversation" tool call that shows the summary (a skipped compaction shows "Compaction skipped" rather than failing); `session/load` replays past compactions the same way, and JetBrains AIR clients get the token counts and duration.
 
 ## [18.11.1] - 2026-10-15
 

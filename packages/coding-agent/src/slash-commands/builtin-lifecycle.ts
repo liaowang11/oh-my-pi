@@ -2,7 +2,7 @@ import { SEANCE_SLASH_COMMAND } from "./seance";
 import { clearSubmittedText } from "./helpers/draft";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
+import { CompactionCancelledError, type CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import { logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { clearClaudePluginRootsCache } from "../discovery/helpers";
 import { rebindMemoryBackendForCwd } from "../hindsight/backend";
@@ -231,26 +231,48 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 			// (RPC) returns before `runCompact` settles.
 			let compactFailed = false;
 			const runCompact = async (): Promise<void> => {
+				const reporter = runtime.reportCompaction;
 				const before = runtime.session.getContextUsage?.();
 				const beforeTokens = before?.tokens;
+				await reporter?.start();
+				let result: CompactionResult;
 				try {
-					await runtime.session.compact(parsed.instructions, parsed.mode ? { mode: parsed.mode } : undefined);
+					result = await runtime.session.compact(
+						parsed.instructions,
+						parsed.mode ? { mode: parsed.mode } : undefined,
+					);
 				} catch (err) {
 					// RPC `abort` and ACP `session/cancel` propagate their explicit
 					// USER_INTERRUPT_LABEL through the compaction abort signal. The client
 					// already saw the interrupt it sent; emitting anything here would
 					// append an out-of-turn chunk. Other cancellations (including an
 					// extension veto) remain visible.
-					if (err instanceof CompactionCancelledError && err.cause === USER_INTERRUPT_LABEL) return;
+					if (err instanceof CompactionCancelledError && err.cause === USER_INTERRUPT_LABEL) {
+						await reporter?.finish({ status: "cancelled" });
+						return;
+					}
 					// Compaction precondition failures (no model, already compacted, too
 					// small) and provider errors propagate as plain Errors; surface them
 					// via runtime.output so they don't fail the ACP prompt turn.
 					compactFailed = true;
+					if (reporter) {
+						await reporter.finish({ status: "failed", error: errorMessage(err) });
+						return;
+					}
 					await runtime.output(`Compaction failed: ${errorMessage(err)}`);
 					return;
 				}
 				const after = runtime.session.getContextUsage?.();
 				const afterTokens = after?.tokens;
+				if (reporter) {
+					await reporter.finish({
+						status: "completed",
+						summary: result.summary,
+						tokensBefore: result.tokensBefore,
+						tokensAfter: afterTokens ?? undefined,
+					});
+					return;
+				}
 				if (beforeTokens != null && afterTokens != null) {
 					const saved = beforeTokens - afterTokens;
 					await runtime.output(`Compaction complete. Tokens: ${beforeTokens} -> ${afterTokens} (saved ${saved}).`);
