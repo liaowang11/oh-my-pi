@@ -69,6 +69,10 @@ const ContentBlock = type({ type: "'text'", text: "string" })
 const OptionalString = "string | null | undefined";
 const OptionalObject = type("object").narrow(notArray).or("null | undefined");
 const OptionalContentBlocks = ContentBlock.array().or("null | undefined");
+const PlanUpdateContent = type({ planId: "string", type: "'items'", entries: "unknown[]" })
+	.or({ planId: "string", type: "'file'", uri: "string" })
+	.or({ planId: "string", type: "'markdown'", content: "string" })
+	.narrow(notArray);
 const SubagentWorkState = type({ state: "string", "stopReason?": OptionalString }).narrow(notArray);
 
 const SessionUpdate = type({
@@ -93,6 +97,17 @@ const SessionUpdate = type({
 		"content?": OptionalContentBlocks,
 	})
 	.or({ sessionUpdate: "'plan'", entries: "unknown[]" })
+	.or({ sessionUpdate: "'plan_update'", plan: PlanUpdateContent })
+	.or({ sessionUpdate: "'plan_removed'", planId: "string" })
+	.or({ sessionUpdate: "'notice'", severity: "string", title: "string", "description?": OptionalString })
+	.or({
+		sessionUpdate: "'compaction_update'",
+		compactionId: "string",
+		status: "string",
+		"summary?": OptionalContentBlocks,
+		"error?": OptionalString,
+	})
+	.or({ sessionUpdate: "'compaction_summary_chunk'", compactionId: "string", content: ContentBlock })
 	.or({ sessionUpdate: "'current_mode_update'", currentModeId: "string" })
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
 	.or({ sessionUpdate: "'config_option_update'", configOptions: "unknown[]" })
