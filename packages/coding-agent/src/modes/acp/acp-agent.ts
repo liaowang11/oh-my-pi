@@ -777,21 +777,22 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
  * Bridge an ExtensionUIContext form to ACP `unstable_createElicitation`.
  *
  * `dialogOptions.signal` short-circuits the elicitation if it is already
- * aborted and races the in-flight request against the abort event. The SDK
- * exposes no `cancel_elicitation` surface for form-mode elicitations
- * (`unstable_completeElicitation` is URL-mode only), so the ACP request itself
- * keeps running on the client side until the user dismisses it — but
- * resolving the local promise unblocks the caller (matches the RPC mode
- * pattern in `requestRpcEditor`). The abort listener is removed once the
- * elicitation settles so that callers which reuse the same signal across many
- * elicitations don't accumulate listeners and trip Node's `MaxListeners`
- * warning.
+ * aborted and races the in-flight request against the abort event.
  *
  * `dialogOptions.timeout` mirrors `RpcExtensionUIContext.#createDialogPromise`:
  * when the timer fires before the client responds, `onTimeout` is invoked and
- * the caller's promise resolves to the stub fallback. Late SDK responses that
- * arrive after abort/timeout — both rejections and successful `accept`s —
- * are dropped silently (no `logger.warn`) to keep operator logs clean.
+ * the caller's promise resolves to the stub fallback.
+ *
+ * Either way the caller stops waiting at once, and the request itself is
+ * withdrawn: one internal controller, aborted whenever the elicitation settles
+ * without a client answer, is the request's signal, so the transport sends
+ * `$/cancel_request` and the client can close the abandoned dialog. ACP has
+ * no form-mode cancel method (`elicitation/complete` is URL-mode only); a
+ * client that ignores `$/cancel_request` keeps a stale dialog whose late
+ * answer is dropped. Late responses after abort/timeout — rejections and
+ * `accept`s alike — are dropped silently to keep operator logs clean. The
+ * caller's abort listener is removed on settle so a signal reused across many
+ * elicitations does not accumulate listeners.
  */
 async function elicitFormFromAcpClient(
 	connection: AgentSideConnection,
@@ -807,16 +808,18 @@ async function elicitFormFromAcpClient(
 		return undefined;
 	}
 	const { promise, resolve } = Promise.withResolvers<CreateElicitationResponse | undefined>();
+	const request = new AbortController();
 	let settled = false;
 	let timeoutId: NodeJS.Timeout | undefined;
-	const finish = (value: CreateElicitationResponse | undefined) => {
+	const finish = (value: CreateElicitationResponse | undefined, answered: boolean) => {
 		if (settled) return;
 		settled = true;
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
+		if (!answered) request.abort();
 		resolve(value);
 	};
-	const onAbort = () => finish(undefined);
+	const onAbort = () => finish(undefined, false);
 	signal?.addEventListener("abort", onAbort, { once: true });
 	if (dialogOptions?.timeout !== undefined) {
 		timeoutId = setTimeout(() => {
@@ -828,7 +831,7 @@ async function elicitFormFromAcpClient(
 				// pending — settle it via `finish` below regardless.
 				logger.warn("ACP elicitation onTimeout threw", { sessionId, method, error });
 			}
-			finish(undefined);
+			finish(undefined, false);
 		}, dialogOptions.timeout);
 		// A long pending timeout alone shouldn't keep the event loop alive when
 		// the rest of the agent has shut down — matches `job-manager.ts` /
@@ -837,22 +840,28 @@ async function elicitFormFromAcpClient(
 		timeoutId.unref();
 	}
 	connection
-		.unstable_createElicitation({
-			mode: "form",
-			sessionId,
-			message,
-			requestedSchema: {
-				type: "object",
-				properties,
-				required,
+		.unstable_createElicitation(
+			{
+				mode: "form",
+				sessionId,
+				message,
+				requestedSchema: {
+					type: "object",
+					properties,
+					required,
+				},
 			},
-		})
-		.then(finish, error => {
-			// Caller may already have moved on via abort/timeout; suppress noise.
-			if (settled) return;
-			logger.warn("ACP elicitation failed", { sessionId, method, error });
-			finish(undefined);
-		});
+			request.signal,
+		)
+		.then(
+			response => finish(response, true),
+			error => {
+				// Caller may already have moved on via abort/timeout; suppress noise.
+				if (settled) return;
+				logger.warn("ACP elicitation failed", { sessionId, method, error });
+				finish(undefined, true);
+			},
+		);
 	const response = await promise;
 	if (!isAcceptedElicitation(response) || !response.content) {
 		return undefined;
@@ -3232,7 +3241,15 @@ export class AcpAgent implements Agent {
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});
-		const approved = await this.#requestAcpPlanApprovalChoice(session.sessionId, resolvedTitle, planContent);
+		// A turn cancel while the approval dialog is open settles as refine and
+		// withdraws the dialog.
+		const turnSignal = this.#sessions.get(session.sessionId)?.promptTurn?.abortController.signal;
+		const approved = await this.#requestAcpPlanApprovalChoice(
+			session.sessionId,
+			resolvedTitle,
+			planContent,
+			turnSignal,
+		);
 		const details: PlanApprovalDetails = {
 			planFilePath,
 			title: resolvedTitle,
@@ -3352,7 +3369,12 @@ export class AcpAgent implements Agent {
 	 * confirmation surface available; without that, plan mode would strand
 	 * the agent (the bug this method exists to fix).
 	 */
-	async #requestAcpPlanApprovalChoice(sessionId: string, title: string, planContent: string): Promise<boolean> {
+	async #requestAcpPlanApprovalChoice(
+		sessionId: string,
+		title: string,
+		planContent: string,
+		signal: AbortSignal | undefined,
+	): Promise<boolean> {
 		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
 		if (!supportsForm) return true;
 		// Include a short preview of the plan so the user has context in the
@@ -3367,7 +3389,7 @@ export class AcpAgent implements Agent {
 			"select",
 			message,
 			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
-			undefined,
+			signal ? { signal } : undefined,
 		);
 		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
 		// timeout, or any other non-approve response falls through to refine
