@@ -47,6 +47,23 @@ export function withAirMeta(
 }
 
 /**
+ * Merge flat fields straight into `_meta.jetbrains.air` (no capability key),
+ * as the session index's list rows and `session_info_update`s carry them.
+ * Preserves every other namespace and sibling AIR field.
+ */
+export function withAirFields(
+	meta: Record<string, unknown> | null | undefined,
+	fields: Record<string, unknown>,
+): Record<string, unknown> {
+	const jetbrains = asRecord(meta?.[JETBRAINS_META_KEY]);
+	const air = asRecord(jetbrains[AIR_META_KEY]);
+	return {
+		...meta,
+		[JETBRAINS_META_KEY]: { ...jetbrains, [AIR_META_KEY]: { ...air, version: AIR_EXTENSION_VERSION, ...fields } },
+	};
+}
+
+/**
  * Whether the client is an AIR client: it sent `_meta.jetbrains.air` with a
  * supported version (a finite integer >= 1). Only such a client is told about
  * AIR. Tolerates malformed `_meta`: wire data is unvalidated.

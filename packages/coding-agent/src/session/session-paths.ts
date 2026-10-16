@@ -2,6 +2,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { getTerminalId } from "../utils/ttyid";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import {
 	getCustomSessionFilesDir,
 	getSessionsDir,
@@ -284,6 +285,21 @@ export async function worktreeSessionDirs(
 	} catch (error) {
 		logger.debug("Worktree session directory lookup failed", { cwd, error: String(error) });
 		return [];
+	}
+}
+
+/**
+ * Whether `cwd` sits in a worktree omp made: under the agent worktree base
+ * (`/wt`, PR checkouts, task isolation all live there) and, right now, inside
+ * a linked git worktree. A removed worktree's path no longer exists, so it
+ * fails; nothing is cached.
+ */
+export function isAgentManagedWorktree(cwd: string): boolean {
+	try {
+		if (!pathIsWithin(resolveEquivalentPath(getWorktreesDir()), fs.realpathSync(cwd))) return false;
+		return Boolean(vcs.git(cwd)?.linkedWorktree());
+	} catch {
+		return false;
 	}
 }
 
