@@ -97,9 +97,9 @@ export class AgentSideConnection {
 	sessionUpdate(params: SessionNotification): Promise<void> {
 		return this.#connection.notify("session/update", params);
 	}
-	/** Requests permission from the client. */
-	requestPermission(params: RequestPermissionRequest): Promise<RequestPermissionResponse> {
-		return this.#connection.request("session/request_permission", params);
+	/** Requests permission from the client; aborting `signal` withdraws it. */
+	requestPermission(params: RequestPermissionRequest, signal?: AbortSignal): Promise<RequestPermissionResponse> {
+		return this.#connection.request("session/request_permission", params, { signal });
 	}
 	/**
 	 * Requests permission from the client, returning a handle that cancels the
