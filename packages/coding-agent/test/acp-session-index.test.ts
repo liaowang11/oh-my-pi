@@ -166,12 +166,13 @@ describe("ACP AIR sessionIndex", () => {
 			(meta as { jetbrains: { air: { capabilities: string[] } } }).jetbrains.air.capabilities;
 		expect(advertised(withIndex._meta)).toEqual([
 			"asyncTasks",
+			"planFile",
 			"sessionIndex",
 			"sessionArchive",
 			"sessionRename",
 			"sessionWorktrees",
 		]);
-		expect(advertised(without._meta)).toEqual(["asyncTasks"]);
+		expect(advertised(without._meta)).toEqual(["asyncTasks", "planFile"]);
 	});
 
 	it("answers the session index methods with -32601 when the client did not declare sessionIndex", async () => {
