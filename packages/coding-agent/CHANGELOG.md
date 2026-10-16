@@ -452,6 +452,7 @@
 - ACP clients now see session notices (model fallbacks, retry failures, config warnings, extension notifications and other agent warnings) as `notice` updates when they declare `session.notices`, or as a bold-labelled message line otherwise.
 - Fixed ACP `session/load` dropping past compactions and user-run shell and Python commands from the replayed transcript.
 - ACP clients now see context compactions, automatic and `/compact`: a `compaction_update` lifecycle carrying the summary when they declare `session.compaction`, otherwise a "Compact conversation" tool call that shows the summary (a skipped compaction shows "Compaction skipped" rather than failing); `session/load` replays past compactions the same way, and JetBrains AIR clients get the token counts and duration.
+- ACP clients that declare `plan` now get an approved plan-mode plan as a markdown `plan_update`; JetBrains AIR clients can declare `planFile` to have the plan proposal name the plan file and clear it on approval.
 
 ## [18.11.1] - 2026-10-15
 
