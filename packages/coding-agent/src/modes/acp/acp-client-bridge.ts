@@ -148,7 +148,27 @@ async function requestPermission(
 	// dialog for a tool call the loop has already reported as cancelled.
 	const { promise, cancel } = connection.requestPermissionWithCancel(request);
 	if (!steeringSignal) {
-		const response = await promise;
+		let response: RequestPermissionResponse;
+		// Aborting `signal` withdraws the open prompt on the client with
+		// `$/cancel_request`; the turn no longer waits for an answer the
+		// client would otherwise keep showing. Without a steering signal there
+		// is no other canceller, so `signal` is wired to `cancel()` here.
+		if (signal) {
+			if (signal.aborted) {
+				cancel();
+				void promise.catch(() => undefined);
+				return { outcome: "cancelled" };
+			}
+			signal.addEventListener("abort", cancel, { once: true });
+		}
+		try {
+			response = await promise;
+		} catch (error) {
+			if (signal?.aborted) return { outcome: "cancelled" };
+			throw error;
+		} finally {
+			signal?.removeEventListener("abort", cancel);
+		}
 		return permissionOutcomeFromResponse(response, options);
 	}
 	if (steeringSignal.aborted) {
