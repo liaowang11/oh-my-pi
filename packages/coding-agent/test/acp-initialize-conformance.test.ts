@@ -288,6 +288,7 @@ describe("ACP initialize conformance", () => {
 					fork: expect.any(Object),
 					resume: expect.any(Object),
 					close: expect.any(Object),
+					delete: expect.any(Object),
 				}),
 			}),
 		);

@@ -13,6 +13,8 @@ import {
 	type ClientCapabilities,
 	type CloseSessionRequest,
 	type CloseSessionResponse,
+	type DeleteSessionRequest,
+	type DeleteSessionResponse,
 	type CreateElicitationResponse,
 	type ElicitationContentValue,
 	type ElicitationPropertySchema,
@@ -92,6 +94,7 @@ import {
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
 import { isAgentManagedWorktree } from "../../session/session-paths";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
+import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
@@ -119,7 +122,7 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
-import { AcpSubagentRelay, clientSupportsSubagents, subagentSessionId } from "./acp-subagents";
+import { AcpSubagentRelay, clientSupportsSubagents, isSubagentSessionId, subagentSessionId } from "./acp-subagents";
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
 	AIR_CUSTOM_ANSWER_KEY,
@@ -1171,6 +1174,7 @@ export class AcpAgent implements Agent {
 					fork: {},
 					resume: {},
 					close: {},
+					delete: {},
 				},
 			},
 			// Top-level `_meta`, sibling of `agentCapabilities`: the shared ACP
@@ -1287,6 +1291,51 @@ export class AcpAgent implements Agent {
 			return {};
 		}
 		await this.#closeManagedSession(params.sessionId, record);
+		return {};
+	}
+
+	/**
+	 * `session/delete`, as claude-agent-acp answers it. A live session's turn is
+	 * cancelled and the session closed first, so nothing writes its transcript
+	 * again. Then a `sessionIndex` client deletes for real (an id stored nowhere
+	 * and not loaded here is -32002); an AIR client without it uses delete to
+	 * mark a session done, so it is archived instead; every other client deletes
+	 * for real, and an unknown id succeeds silently. A subagent child id is not a
+	 * stored session: a no-op. A session worktree is left in place.
+	 */
+	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
+		const { sessionId } = params;
+		if (isSubagentSessionId(sessionId)) return {};
+		return await this.#runSessionIndexOperation(async () => {
+			if (!this.#sessionIndex && isAirClient(this.#clientCapabilities)) {
+				try {
+					return await this.#setSessionArchived(sessionId, true);
+				} catch (error) {
+					if (error instanceof RequestError && error.code === -32002) return {};
+					throw error;
+				}
+			}
+			return await this.#deleteStoredSession(sessionId);
+		});
+	}
+
+	async #deleteStoredSession(sessionId: string): Promise<{ [key: string]: unknown }> {
+		const record = this.#sessions.get(sessionId);
+		const files = new Set(
+			(await findSessionFiles(sessionId)).filter(file => sessionIdFromSessionPath(file) === sessionId),
+		);
+		const liveFile = record?.session.sessionManager.getSessionFile();
+		if (liveFile) files.add(liveFile);
+		if (record) await this.#closeManagedSession(sessionId, record);
+		if (!record && files.size === 0 && this.#sessionIndex) throw sessionNotFound(sessionId);
+		const storage = new FileSessionStorage();
+		for (const file of files) {
+			try {
+				await storage.deleteSessionWithArtifacts(file);
+			} catch (error) {
+				if (!isEnoent(error)) throw error;
+			}
+		}
 		return {};
 	}
 

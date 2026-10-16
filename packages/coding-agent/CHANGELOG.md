@@ -446,6 +446,7 @@
 - ACP ask forms now explain what typing into "Other" does, and mark that field for JetBrains AIR clients the way claude-agent-acp does.
 - Fixed ACP ask forms in clients such as agent-shell: a single question with a header no longer shows twice, "Other" is offered as one more option instead of a separate field, and questions without options are labelled with their own text instead of "Other"
 - JetBrains AIR clients with `sessionIndex` now see `sessionWorktrees`: `session/list` rows of sessions running in a live worktree omp made (`/wt`, PR checkouts, task isolation) carry `agentWorktree: true`.
+- ACP clients can delete sessions with `session/delete`: a loaded session is cancelled and closed first, and its transcript and subagent transcripts are removed; JetBrains AIR clients without `sessionIndex` get the session archived instead.
 
 ## [18.11.1] - 2026-10-15
 
