@@ -1,7 +1,7 @@
 import { clearSubmittedText, refuseImages, restoreDetachedDraft, runWithDetachedDraft } from "./helpers/draft";
 import * as fs from "node:fs/promises";
 import * as path from "node:path";
-import { CompactionCancelledError } from "@oh-my-pi/pi-agent-core/compaction";
+import { CompactionCancelledError, type CompactionResult } from "@oh-my-pi/pi-agent-core/compaction";
 import { errorMessage, logger, setProjectDir } from "@oh-my-pi/pi-utils";
 import { type CwdRescopeOptions, rescopeSessionToCwd } from "../session/cwd-rescope";
 import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../memory-backend";
@@ -42,25 +42,42 @@ async function handleCompact(command: ParsedSlashCommand, runtime: SlashCommandR
 	if ("error" in parsed) return usage(parsed.error, runtime);
 	let failed = false;
 	const run = async (): Promise<void> => {
+		const reporter = runtime.reportCompaction;
 		const before = runtime.session.getContextUsage?.()?.tokens;
+		await reporter?.start();
+		let result: CompactionResult;
 		try {
 			const { mode, instructions } = parsed;
-			await runtime.session.compact(
+			result = await runtime.session.compact(
 				instructions,
 				runtime.signal ? { mode, signal: runtime.signal } : mode ? { mode } : undefined,
 			);
 		} catch (err) {
 			// Don't append an out-of-turn notice after the host already reported its interrupt.
 			if (err instanceof CompactionCancelledError && (isInterruptReason(err.cause) || runtime.signal?.aborted)) {
+				await reporter?.finish({ status: "cancelled" });
 				return;
 			}
 			const message = errorMessage(err);
 			logger.error("Compaction failed", { error: message });
 			failed = true;
+			if (reporter) {
+				await reporter.finish({ status: "failed", error: message });
+				return;
+			}
 			await runtime.output(`Compaction failed: ${message}`);
 			return;
 		}
 		const after = runtime.session.getContextUsage?.()?.tokens;
+		if (reporter) {
+			await reporter.finish({
+				status: "completed",
+				summary: result.summary,
+				tokensBefore: result.tokensBefore,
+				tokensAfter: after ?? undefined,
+			});
+			return;
+		}
 		await runtime.output(
 			before == null || after == null
 				? "Compaction complete."
