@@ -11,6 +11,7 @@ import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
 import { lookupSessionTitle, recordSessionTitle } from "./session-index";
+import { parseTitleSlotLine } from "./session-title-slot";
 
 /**
  * Coarse lifecycle status of a session, derived from its last persisted message.
@@ -50,6 +51,26 @@ export interface SessionInfo {
 	 * synthesized {@link SessionInfo}s (cross-project stubs, tests) leave it unset.
 	 */
 	status?: SessionStatus;
+	/** Archived flag from the title slot; unset on synthesized infos. */
+	archived?: boolean;
+	/** Activity read from the tail window that also yields {@link status}; unset when not scanned for status. */
+	activity?: SessionActivity;
+}
+
+/**
+ * Timestamps and the model of a session's latest activity, from the bounded
+ * tail window of its file. A field is unset when the window does not hold it
+ * (e.g. the last prompt lies before a long run of tool output).
+ */
+export interface SessionActivity {
+	/** Entry timestamp of the last user prompt (not synthetic, not agent-attributed). */
+	lastPromptAt?: string;
+	/** Entry timestamp of the last message of any role. */
+	lastMessageAt?: string;
+	/** Entry timestamp of the last assistant message that ended its turn (no tool use). */
+	lastTurnEndedAt?: string;
+	/** Model of the last assistant message. */
+	model?: string;
 }
 
 export interface ResolvedSessionMatch {
@@ -185,6 +206,38 @@ interface TailMessage {
 	role?: string;
 	stopReason?: string;
 	content?: unknown;
+	model?: string;
+	synthetic?: boolean;
+	attribution?: string;
+}
+
+/** Walk a tail window backwards for {@link SessionActivity}; stops once every field is found. */
+function deriveSessionActivity(suffix: string): SessionActivity {
+	const activity: SessionActivity = {};
+	if (!suffix) return activity;
+	const lines = suffix.split("\n");
+	for (let i = lines.length - 1; i >= 0 && activity.lastPromptAt === undefined; i--) {
+		const line = lines[i];
+		if (line.charCodeAt(0) !== 123) continue;
+		let entry: { type?: string; timestamp?: unknown; message?: TailMessage };
+		try {
+			entry = JSON.parse(line);
+		} catch {
+			continue;
+		}
+		const message = entry.message;
+		if (entry.type !== "message" || !message || typeof entry.timestamp !== "string") continue;
+		activity.lastMessageAt ??= entry.timestamp;
+		if (message.role === "assistant") {
+			if (activity.model === undefined && typeof message.model === "string") activity.model = message.model;
+			if (activity.lastTurnEndedAt === undefined && message.stopReason !== "toolUse") {
+				activity.lastTurnEndedAt = entry.timestamp;
+			}
+		} else if (message.role === "user" && message.synthetic !== true && message.attribution !== "agent") {
+			activity.lastPromptAt = entry.timestamp;
+		}
+	}
+	return activity;
 }
 
 function isToolCallBlock(block: unknown): boolean {
@@ -318,6 +371,8 @@ interface SessionListHeader {
 	title?: string;
 	parentSession?: string;
 	timestamp?: string;
+	/** From the title slot before the header. */
+	archived?: boolean;
 }
 
 function normalizeTitleOverride(title: string | undefined): string | null | undefined {
@@ -366,19 +421,26 @@ function parseSessionListHeader(
 		firstEntry?.type === "title" && typeof firstEntry.title === "string" ? firstEntry.title : undefined,
 	);
 	const parsedHeader = sessionListHeaderFromRecord(entries[firstEntry?.type === "title" ? 1 : 0], parsedSlotTitle);
-	if (parsedHeader) return parsedHeader;
+	if (parsedHeader) {
+		if (firstEntry?.type === "title" && firstEntry.archived === true) parsedHeader.archived = true;
+		return parsedHeader;
+	}
 
 	let slotTitle: string | null | undefined;
+	let slotArchived = false;
 	let firstNonEmpty = true;
 	for (const rawLine of content.split(/\r?\n/)) {
 		const line = rawLine.trim();
 		if (!line) continue;
 		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
 			slotTitle = normalizeTitleOverride(extractStringProperty(line, "title"));
+			slotArchived = parseTitleSlotLine(line)?.archived === true;
 			firstNonEmpty = false;
 			continue;
 		}
-		return parseSessionListHeaderLine(line, slotTitle);
+		const header = parseSessionListHeaderLine(line, slotTitle);
+		if (header && slotArchived) header.archived = true;
+		return header;
 	}
 	return undefined;
 }
@@ -494,6 +556,8 @@ async function scanSessionFile(
 			firstMessage: firstMessage || "(no messages)",
 			allMessagesText: allMessages.length > 0 ? allMessages.join(" ") : firstMessage,
 			status: withStatus ? deriveSessionStatus(suffix) : undefined,
+			archived: header.archived === true,
+			activity: withStatus ? deriveSessionActivity(suffix) : undefined,
 		};
 		// The cache keeps its own shallow copy; hits also hand out copies, so
 		// callers can never mutate the shared cached object.
@@ -715,7 +779,7 @@ export async function findMostRecentSession(
 }
 
 /** Session id embedded in a `<file-safe-timestamp>_<id>.jsonl` filename, if present. */
-function sessionIdFromSessionPath(file: string): string | undefined {
+export function sessionIdFromSessionPath(file: string): string | undefined {
 	const base = path.basename(file);
 	if (!base.endsWith(".jsonl")) return undefined;
 	const sep = base.lastIndexOf("_");

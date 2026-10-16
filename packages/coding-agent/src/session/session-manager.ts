@@ -66,6 +66,7 @@ import {
 	type NewSessionOptions,
 	type ResetBoundaryEntry,
 	type ServiceTierChangeEntry,
+	SESSION_TITLE_SLOT_BYTES,
 	sessionEntryLeafId,
 	type SessionEntry,
 	type SessionHeader,
@@ -117,7 +118,12 @@ import {
 	type SessionStorageWriter,
 	SessionWriteConflictError,
 } from "./session-storage";
-import { type SessionTitleUpdate, serializeTitleSlot } from "./session-title-slot";
+import {
+	parseTitleSlotFromContent,
+	type SessionTitleUpdate,
+	serializeTitleSlot,
+	titleUpdateFromSlot,
+} from "./session-title-slot";
 import {
 	additionalWorkspaceDirectories,
 	normalizeSessionWorkspace,
@@ -754,6 +760,7 @@ interface SessionManagerStateSnapshot {
 	expectedDiskSize: number | null;
 	titleUpdatedAt: string;
 	hasTitleSlot: boolean;
+	archived: boolean;
 	onDisk: boolean;
 	needsRewrite: boolean;
 	draftOnlySessionCleanupArmed: boolean;
@@ -908,6 +915,8 @@ export class SessionManager {
 	#header!: SessionHeader;
 	#titleUpdatedAt = "";
 	#hasTitleSlot = true;
+	/** Archived flag from the title slot. A new session id (new, fork, branch, copy) starts unarchived. */
+	#archived = false;
 	#entries: SessionEntry[] = [];
 	#index = new SessionEntryIndex();
 
@@ -1556,12 +1565,18 @@ export class SessionManager {
 			});
 	}
 
-	#titleSlotLine(): string {
-		return serializeTitleSlot({
+	#titleSlotUpdate(): SessionTitleUpdate {
+		const update: SessionTitleUpdate = {
 			title: this.#sessionName,
 			source: this.#titleSource,
 			updatedAt: this.#titleUpdatedAt || this.#header.timestamp,
-		});
+		};
+		if (this.#archived) update.archived = true;
+		return update;
+	}
+
+	#titleSlotLine(): string {
+		return serializeTitleSlot(this.#titleSlotUpdate());
 	}
 
 	/** Serialize the whole file — title slot, header, entries — as lines, stamped with the state they came from. */
@@ -1920,7 +1935,8 @@ export class SessionManager {
 		}
 	}
 
-	async #persistTitleChangeEntry(entry: TitleChangeEntry, update: SessionTitleUpdate): Promise<void> {
+	/** Persist a title-slot change, appending `entry` first when the change has one (a rename does, an archive does not). */
+	async #persistTitleChangeEntry(entry: TitleChangeEntry | undefined, update: SessionTitleUpdate): Promise<void> {
 		if (!this.#persist || !this.#sessionFile) return;
 		if (this.#diskFailure) {
 			this.#fileIsCurrent = false;
@@ -1956,15 +1972,17 @@ export class SessionManager {
 		}
 
 		const epoch = this.#diskEpoch;
-		const line = this.#lineFor(entry);
+		const line = entry ? this.#lineFor(entry) : undefined;
 		await this.#scheduleDiskWork(
 			async () => {
 				if (this.#released) return;
 				const sessionFile = this.#sessionFile;
 				if (!sessionFile) return;
 				try {
-					await this.#appendWriter().append(line);
-					this.#recordDurableAppend(line);
+					if (line !== undefined) {
+						await this.#appendWriter().append(line);
+						this.#recordDurableAppend(line);
+					}
 					await this.#storage.updateSessionTitle(sessionFile, update);
 					if (this.#diskEpoch === epoch) this.#fileIsCurrent = true;
 				} catch {
@@ -2004,6 +2022,7 @@ export class SessionManager {
 		this.#titleSource = undefined;
 		this.#titleUpdatedAt = "";
 		this.#hasTitleSlot = true;
+		this.#archived = false;
 
 		const timestamp = nowIso();
 		this.#header = {
@@ -2219,6 +2238,7 @@ export class SessionManager {
 			titleSource: this.#titleSource,
 			titleUpdatedAt: this.#titleUpdatedAt,
 			hasTitleSlot: this.#hasTitleSlot,
+			archived: this.#archived,
 			sessionFile: this.#sessionFile,
 			expectedDiskSize: this.#expectedDiskSize,
 			onDisk: this.#fileIsCurrent,
@@ -2276,6 +2296,7 @@ export class SessionManager {
 		this.#titleSource = snapshot.titleSource;
 		this.#titleUpdatedAt = snapshot.titleUpdatedAt;
 		this.#hasTitleSlot = snapshot.hasTitleSlot;
+		this.#archived = snapshot.archived;
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
 		this.#adoptedArtifactManager = null;
@@ -2405,6 +2426,7 @@ export class SessionManager {
 		this.#additionalDirectories = header.additionalDirectories ?? [];
 		this.#titleUpdatedAt = titleSlot?.updatedAt ?? header.timestamp;
 		this.#hasTitleSlot = titleSlot !== undefined;
+		this.#archived = titleSlot?.archived === true;
 		this.#fileIsCurrent = true;
 		this.#rewriteRequired = migrated || loaded.malformedRecords > 0;
 		this.#loadedMalformedRecords = loaded.malformedRecords;
@@ -2472,6 +2494,7 @@ export class SessionManager {
 		this.#titleSource = this.#header.titleSource;
 		this.#titleUpdatedAt = timestamp;
 		this.#hasTitleSlot = true;
+		this.#archived = false;
 		this.#fileIsCurrent = false;
 		this.#rewriteRequired = false;
 		this.#forceFileCreation = true;
@@ -3365,7 +3388,7 @@ export class SessionManager {
 		this.#entries.push(entry);
 		this.#index.insert(entry);
 		this.#notifyEntryAppended(entry);
-		await this.#persistTitleChangeEntry(entry, { title, source, updatedAt: timestamp });
+		await this.#persistTitleChangeEntry(entry, this.#titleSlotUpdate());
 		// Keep the recent-sessions title index current so welcome-screen lookups
 		// never have to content-scan this session's file.
 		if (this.#persist && this.#storage instanceof FileSessionStorage) {
@@ -3374,6 +3397,21 @@ export class SessionManager {
 
 		this.#notifySessionNameListeners();
 		return true;
+	}
+
+	/** Whether the session is archived (hidden from default session lists). */
+	isArchived(): boolean {
+		return this.#archived;
+	}
+
+	/**
+	 * Set the archived flag. It lives in the title slot beside the title, so it
+	 * is rewritten in place, adds no transcript entry, and a rename keeps it.
+	 */
+	async setArchived(archived: boolean): Promise<void> {
+		if (this.#released || this.#archived === archived) return;
+		this.#archived = archived;
+		await this.#persistTitleChangeEntry(undefined, this.#titleSlotUpdate());
 	}
 
 	/**
@@ -3980,6 +4018,7 @@ export class SessionManager {
 		this.#titleSource = header.titleSource;
 		this.#titleUpdatedAt = timestamp;
 		this.#hasTitleSlot = true;
+		this.#archived = false;
 		this.#index.rebuild(this.#entries);
 		this.#artifactManager = null;
 		this.#artifactManagerSessionFile = null;
@@ -4253,6 +4292,44 @@ export class SessionManager {
 			newSession: { parentSession: options?.parentSession },
 		});
 		return manager;
+	}
+
+	/**
+	 * Rename and/or (un)archive a stored session that no {@link SessionManager}
+	 * of this process holds. A file with a title slot is updated in place, so
+	 * the transcript is not rewritten and gains no entry; a legacy file without
+	 * one is opened and rewritten once, which adds the slot. A rename is a
+	 * `"user"` title. Fields left out of `patch` keep their stored value.
+	 * @throws ENOENT when the session file is gone.
+	 */
+	static async updateStoredSessionMeta(
+		session: Pick<SessionInfo, "path" | "id">,
+		patch: { title?: string; archived?: boolean },
+		storage: SessionStorage = new FileSessionStorage(),
+	): Promise<void> {
+		const title = patch.title === undefined ? undefined : SessionManager.#cleanTitle(patch.title) || undefined;
+		const [prefix] = await storage.readTextSlices(session.path, SESSION_TITLE_SLOT_BYTES, 0);
+		const slot = titleUpdateFromSlot(parseTitleSlotFromContent(prefix));
+		if (slot) {
+			const update: SessionTitleUpdate = title
+				? { title, source: "user", updatedAt: nowIso() }
+				: { title: slot.title, source: slot.source, updatedAt: slot.updatedAt };
+			if (patch.archived ?? slot.archived) update.archived = true;
+			await storage.updateSessionTitle(session.path, update);
+			if (title && storage instanceof FileSessionStorage) recordSessionTitle(session.id, title);
+			return;
+		}
+		const manager = await SessionManager.open(session.path, undefined, storage, {
+			suppressBreadcrumb: true,
+			throwIfMissing: true,
+		});
+		try {
+			if (title) await manager.setSessionName(title, "user");
+			if (patch.archived !== undefined) await manager.setArchived(patch.archived);
+			await manager.flush();
+		} finally {
+			await manager.close();
+		}
 	}
 
 	/**

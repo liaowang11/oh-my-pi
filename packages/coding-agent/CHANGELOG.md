@@ -372,6 +372,7 @@
 - ACP ask forms now send each option's preview, so clients such as agent-shell can show it
 - ACP clients can now load, resume, and fork sessions from removed git worktrees of the repository; loading moves the session into the current checkout, forking copies it there.
 - ACP `session/fork` can fork at an agent message (AIR's `_meta.jetbrains.air.fork`), name the fork with `_meta.sessionTitle`, and retitle it after its own first turn with `_meta.generateSessionTitle`
+- ACP clients that declare the JetBrains AIR `sessionIndex` extension get session lists ordered by last prompt with archive filtering and row details (model, state, fork parent), and can rename, archive, and unarchive sessions
 
 ### Changed
 
@@ -442,6 +443,7 @@
 - Fixed `/session` in ACP showing only the session id, title, and working directory; it now shows messages, tokens, cost, and routed models like the TUI
 - ACP ask forms now explain what typing into "Other" does, and mark that field for JetBrains AIR clients the way claude-agent-acp does.
 - Fixed ACP ask forms in clients such as agent-shell: a single question with a header no longer shows twice, "Other" is offered as one more option instead of a separate field, and questions without options are labelled with their own text instead of "Other"
+- JetBrains AIR clients with `sessionIndex` now see `sessionWorktrees`: `session/list` rows of sessions running in a live worktree omp made (`/wt`, PR checkouts, task isolation) carry `agentWorktree: true`.
 
 ## [18.11.1] - 2026-10-15
 
