@@ -138,15 +138,34 @@ export class RpcConnection {
 		return this.#closed.promise;
 	}
 
-	/** Sends a correlated JSON-RPC request. */
-	request<Response>(method: string, params?: unknown): Promise<Response> {
+	/**
+	 * Sends a correlated JSON-RPC request. Aborting `options.signal` withdraws it:
+	 * the peer gets `$/cancel_request {requestId}`, the request rejects with
+	 * {@link RequestError.requestCancelled}, and a late reply is ignored.
+	 */
+	request<Response>(method: string, params?: unknown, options?: { signal?: AbortSignal }): Promise<Response> {
 		if (this.signal.aborted) return Promise.reject(new Error("Connection closed"));
+		const signal = options?.signal;
+		if (signal?.aborted) return Promise.reject(RequestError.requestCancelled());
 		const id = this.#nextId++;
 		const deferred = Promise.withResolvers<unknown>();
-		this.#pending.set(id, deferred);
+		const onAbort = () => {
+			if (!this.#pending.delete(id)) return;
+			deferred.reject(RequestError.requestCancelled());
+			if (!this.signal.aborted) void this.notify("$/cancel_request", { requestId: id }).catch(() => {});
+		};
+		const settle = (outcome: () => void) => {
+			signal?.removeEventListener("abort", onAbort);
+			outcome();
+		};
+		this.#pending.set(id, {
+			resolve: value => settle(() => deferred.resolve(value)),
+			reject: reason => settle(() => deferred.reject(reason)),
+		});
+		signal?.addEventListener("abort", onAbort, { once: true });
 		void this.#write({ jsonrpc: "2.0", id, method, ...(params === undefined ? {} : { params }) }).catch(error => {
 			this.#pending.delete(id);
-			deferred.reject(error);
+			settle(() => deferred.reject(error));
 		});
 		return deferred.promise as Promise<Response>;
 	}
