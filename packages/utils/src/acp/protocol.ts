@@ -151,8 +151,17 @@ export interface ClientCapabilities {
 	elicitation?: { form?: Record<string, unknown>; url?: Record<string, unknown> };
 	/** ACP subagents RFD: present (as an object) when the client renders child sessions. */
 	subagents?: Record<string, unknown>;
-	/** Session capabilities; `configOptions.boolean` opts in to `type: "boolean"` config options. */
-	session?: { configOptions?: { boolean?: Record<string, unknown> } };
+	/** Unstable: present (as an object) when the client accepts `plan_update` and `plan_removed`. */
+	plan?: Record<string, unknown> | null;
+	/**
+	 * Session capabilities; `configOptions.boolean` opts in to `type: "boolean"` config options,
+	 * `compaction` to `compaction_update`/`compaction_summary_chunk`, `notices` to `notice` updates.
+	 */
+	session?: {
+		configOptions?: { boolean?: Record<string, unknown> };
+		compaction?: Record<string, unknown> | null;
+		notices?: Record<string, unknown> | null;
+	};
 	_meta?: Record<string, unknown>;
 }
 /** Implementation identity sent during initialization. */
@@ -272,6 +281,12 @@ export interface CloseSessionRequest extends Meta {
 }
 /** Close-session response. */
 export interface CloseSessionResponse extends Meta {}
+/** Delete-session request. */
+export interface DeleteSessionRequest extends Meta {
+	sessionId: SessionId;
+}
+/** Delete-session response. */
+export interface DeleteSessionResponse extends Meta {}
 /** Session-list request. */
 export interface ListSessionsRequest extends Meta {
 	cwd?: string | null;
@@ -331,6 +346,8 @@ export type SessionUpdate =
 	| ({ sessionUpdate: "tool_call" } & ToolCall)
 	| ({ sessionUpdate: "tool_call_update" } & ToolCallUpdate)
 	| ({ sessionUpdate: "plan"; entries: PlanEntry[] } & Meta)
+	| ({ sessionUpdate: "plan_update" } & PlanUpdate)
+	| ({ sessionUpdate: "plan_removed" } & PlanRemoved)
 	| ({ sessionUpdate: "current_mode_update"; currentModeId: string } & Meta)
 	| ({ sessionUpdate: "config_option_update"; configOptions: SessionConfigOption[] } & Meta)
 	| ({ sessionUpdate: "available_commands_update"; availableCommands: AvailableCommand[] } & Meta)
@@ -341,11 +358,47 @@ export type SessionUpdate =
 			used: number;
 			cost?: { amount: number; currency: string } | null;
 	  } & Meta)
+	| ({ sessionUpdate: "notice" } & Notice)
+	| ({ sessionUpdate: "compaction_update" } & CompactionUpdate)
+	| ({ sessionUpdate: "compaction_summary_chunk" } & CompactionSummaryChunk)
 	| ({ sessionUpdate: "subagent_update" } & SubagentUpdate)
 	| ({ sessionUpdate: "session_message" } & SessionMessage)
 	| ({ sessionUpdate: "async_task_spawned" } & AsyncTaskSpawned)
 	| ({ sessionUpdate: "async_task_progress" } & AsyncTaskProgress)
 	| ({ sessionUpdate: "async_task_state_update" } & AsyncTaskStateUpdate);
+/** Plan content carried by `plan_update` (unstable): entries, a file URI, or markdown. */
+export type PlanUpdateContent =
+	| ({ type: "items"; planId: string; entries: PlanEntry[] } & Meta)
+	| ({ type: "file"; planId: string; uri: string } & Meta)
+	| ({ type: "markdown"; planId: string; content: string } & Meta);
+/** Replaces the plan identified by `plan.planId` (unstable). */
+export interface PlanUpdate extends Meta {
+	plan: PlanUpdateContent;
+}
+/** Removes a plan previously sent with `plan_update` (unstable). */
+export interface PlanRemoved extends Meta {
+	planId: string;
+}
+/** User-visible session notice (unstable). */
+export interface Notice extends Meta {
+	severity: "info" | "warning" | "error" | (string & {});
+	title: string;
+	description?: string | null;
+}
+/** Lifecycle of a context compaction (unstable). */
+export type CompactionStatus = "in_progress" | "completed" | "failed" | "cancelled" | (string & {});
+/** Reports a context compaction's state; `summary` on completion, `error` on failure (unstable). */
+export interface CompactionUpdate extends Meta {
+	compactionId: string;
+	status: CompactionStatus;
+	summary?: ContentBlock[] | null;
+	error?: string | null;
+}
+/** Streams one chunk of a compaction summary (unstable). */
+export interface CompactionSummaryChunk extends Meta {
+	compactionId: string;
+	content: ContentBlock;
+}
 /** Current-work snapshot of a subagent session (ACP subagents RFD). */
 export type SubagentWorkState =
 	| ({ state: "running" } & Meta)
@@ -365,6 +418,8 @@ export interface SubagentUpdate extends Meta {
 	title?: string | null;
 	description?: string | null;
 	state?: SubagentWorkState | null;
+	/** Child mutations the client may request; `cancel` allows `session/cancel` on the child id. `null` clears. */
+	capabilities?: ({ cancel?: Meta | null } & Meta) | null;
 }
 /** A message in a session's transcript from another participant, e.g. a subagent's prompt. */
 export interface SessionMessage extends Meta {
@@ -527,6 +582,7 @@ export interface Agent {
 	resumeSession?(params: ResumeSessionRequest): MaybePromise<ResumeSessionResponse>;
 	unstable_forkSession?(params: ForkSessionRequest): MaybePromise<ForkSessionResponse>;
 	closeSession?(params: CloseSessionRequest): MaybePromise<CloseSessionResponse | void>;
+	deleteSession?(params: DeleteSessionRequest): MaybePromise<DeleteSessionResponse | void>;
 	setSessionMode?(params: SetSessionModeRequest): MaybePromise<SetSessionModeResponse | void>;
 	setSessionConfigOption?(params: SetSessionConfigOptionRequest): MaybePromise<SetSessionConfigOptionResponse>;
 	extMethod?(method: string, params: Record<string, unknown>): MaybePromise<Record<string, unknown>>;
