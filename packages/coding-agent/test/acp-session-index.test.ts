@@ -17,6 +17,7 @@ import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
 import type { AuthStorage } from "@oh-my-pi/pi-coding-agent/session/auth-storage";
 import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import { findSessionFiles, sessionIdFromSessionPath } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createSessionWorktree } from "@oh-my-pi/pi-coding-agent/session/session-worktree";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -93,7 +94,8 @@ describe("ACP AIR sessionIndex", () => {
 		removeSyncWithRetries(root);
 	});
 
-	async function createAgent(capabilities: string[] = ["sessionIndex"]): Promise<AcpAgent> {
+	/** `capabilities: null` initializes a plain (non-AIR) client. */
+	async function createAgent(capabilities: string[] | null = ["sessionIndex"]): Promise<AcpAgent> {
 		const model = modelRegistry.find("anthropic", MODEL_ID);
 		if (!model) throw new Error(`Expected ${MODEL_ID} to exist in registry`);
 		const connection = {
@@ -116,7 +118,10 @@ describe("ACP AIR sessionIndex", () => {
 			sessions.push(session);
 			return session;
 		});
-		await agent.initialize({ protocolVersion: 1, clientCapabilities: airCapabilities(capabilities) });
+		await agent.initialize({
+			protocolVersion: 1,
+			clientCapabilities: capabilities === null ? {} : airCapabilities(capabilities),
+		});
 		return agent;
 	}
 
@@ -363,6 +368,95 @@ describe("ACP AIR sessionIndex", () => {
 		// Still loaded: a rename goes through the live session.
 		await agent.extMethod("_session/rename", { sessionId: stored.id, title: "Live" });
 		expect(sessions.find(s => s.sessionId === stored.id)?.sessionManager.getSessionName()).toBe("Live");
+	});
+
+	describe("session/delete", () => {
+		/** Stored transcripts of `id`, plus whether its artifacts directory (subagent transcripts) remains. */
+		async function onDisk(id: string, file: string): Promise<{ files: string[]; artifacts: boolean }> {
+			const files = (await findSessionFiles(id)).filter(found => sessionIdFromSessionPath(found) === id);
+			return { files, artifacts: fs.existsSync(file.slice(0, -".jsonl".length)) };
+		}
+
+		function withSubagentTranscript(file: string): void {
+			const artifacts = file.slice(0, -".jsonl".length);
+			fs.mkdirSync(artifacts, { recursive: true });
+			fs.writeFileSync(path.join(artifacts, "0-Scout.jsonl"), "{}\n");
+		}
+
+		it("a sessionIndex client deletes the transcript and its artifacts; an unknown id is -32002", async () => {
+			const stored = await storedSession("Doomed");
+			const kept = await storedSession("Kept");
+			withSubagentTranscript(stored.file);
+			const agent = await createAgent();
+
+			expect(await agent.deleteSession({ sessionId: stored.id })).toEqual({});
+
+			expect(await onDisk(stored.id, stored.file)).toEqual({ files: [], artifacts: false });
+			expect((await list(agent, { archived: "all" })).sessions.map(row => row.sessionId)).toEqual([kept.id]);
+			expect(await errorCode(agent.deleteSession({ sessionId: stored.id }))).toBe(-32002);
+			// A subagent child id is not a stored session: nothing happens, and no error.
+			expect(await agent.deleteSession({ sessionId: `${kept.id}:subagent:0-Scout` })).toEqual({});
+			expect((await onDisk(kept.id, kept.file)).files).toEqual([kept.file]);
+		});
+
+		it("deleting a loaded session cancels its turn, closes it, and leaves no transcript behind", async () => {
+			const stored = await storedSession("Busy");
+			withSubagentTranscript(stored.file);
+			const agent = await createAgent();
+			await agent.loadSession({ sessionId: stored.id, cwd, mcpServers: [] });
+			await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 20);
+			const session = sessions.find(s => s.sessionId === stored.id)!;
+			const turnAborted = Promise.withResolvers<void>();
+			session.prompt = async () => {
+				await turnAborted.promise;
+				return true;
+			};
+			const realAbort = session.abort.bind(session);
+			session.abort = async options => {
+				turnAborted.resolve();
+				await realAbort(options);
+			};
+			const running = agent.prompt({
+				sessionId: stored.id,
+				prompt: [{ type: "text", text: "work" }],
+			} as PromptRequest);
+			await Bun.sleep(10);
+
+			expect(await agent.deleteSession({ sessionId: stored.id })).toEqual({});
+
+			expect((await running).stopReason).toBe("cancelled");
+			expect(await onDisk(stored.id, stored.file)).toEqual({ files: [], artifacts: false });
+			await expect(
+				agent.prompt({ sessionId: stored.id, prompt: [{ type: "text", text: "again" }] } as PromptRequest),
+			).rejects.toThrow();
+			await Bun.sleep(50);
+			expect((await onDisk(stored.id, stored.file)).files).toEqual([]);
+		});
+
+		it("a plain client deletes for real and an unknown id succeeds silently", async () => {
+			const stored = await storedSession("Plain");
+			const agent = await createAgent(null);
+
+			expect(await agent.deleteSession({ sessionId: stored.id })).toEqual({});
+			expect((await onDisk(stored.id, stored.file)).files).toEqual([]);
+			expect(await agent.deleteSession({ sessionId: stored.id })).toEqual({});
+			expect(await agent.deleteSession({ sessionId: "no-such-session" })).toEqual({});
+		});
+
+		it("an AIR client without sessionIndex archives instead of deleting", async () => {
+			const stored = await storedSession("Done");
+			const agent = await createAgent(["asyncTasks"]);
+
+			expect(await agent.deleteSession({ sessionId: stored.id })).toEqual({});
+
+			expect((await onDisk(stored.id, stored.file)).files).toEqual([stored.file]);
+			const indexed = await createAgent();
+			expect((await list(indexed)).sessions).toHaveLength(0);
+			expect((await list(indexed, { archived: "archived" })).sessions.map(row => row.sessionId)).toEqual([
+				stored.id,
+			]);
+			expect(await agent.deleteSession({ sessionId: "no-such-session" })).toEqual({});
+		});
 	});
 
 	describe.skipIf(process.platform === "win32")("in a git repository", () => {
