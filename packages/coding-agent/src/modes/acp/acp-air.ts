@@ -12,6 +12,11 @@ import type { ClientCapabilities } from "@oh-my-pi/pi-utils/acp";
 
 /** Background tasks surfaced as `async_task_*` session updates. */
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
+/**
+ * The plan of an `xd://propose` call is a file: `rawInput.planFilePath` names
+ * it, and the client reads the plan from it.
+ */
+export const AIR_PLAN_FILE_CAPABILITY = "planFile";
 /** Marks an ask form's free-text field as the custom answer of a select field. */
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
 /** AIR extension version this agent speaks. */
@@ -86,6 +91,11 @@ function airClientMeta(capabilities: ClientCapabilities | undefined): Record<str
 /** Whether the client renders `async_task_*` updates. */
 export function clientSupportsAsyncTasks(capabilities: ClientCapabilities | undefined): boolean {
 	return clientSupportsAirCapability(capabilities, AIR_ASYNC_TASKS_CAPABILITY);
+}
+
+/** Whether the client reads a proposed plan from the file `rawInput.planFilePath` names. */
+export function clientSupportsPlanFile(capabilities: ClientCapabilities | undefined): boolean {
+	return clientSupportsAirCapability(capabilities, AIR_PLAN_FILE_CAPABILITY);
 }
 
 function asRecord(value: unknown): Record<string, unknown> {
