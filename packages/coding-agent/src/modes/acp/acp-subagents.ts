@@ -31,6 +31,11 @@ export function subagentSessionId(rootSessionId: string, id: string): string {
 	return `${rootSessionId}:subagent:${id}`;
 }
 
+/** Whether `sessionId` names a relayed subagent child (see {@link subagentSessionId}), not a stored session. */
+export function isSubagentSessionId(sessionId: string): boolean {
+	return sessionId.includes(":subagent:");
+}
+
 /** A child of a loaded or resumed session; see {@link AcpSubagentRelay.restore}. */
 export interface RestoredSubagent {
 	sessionId: string;
