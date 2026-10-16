@@ -129,6 +129,12 @@ function planSlugFromSupplied(suppliedTitle: unknown): string | undefined {
 	}
 }
 
+/** The `local://` plan URL a proposed title names, or undefined when the title is unusable. */
+export function proposedPlanFileUrl(suppliedTitle: unknown): string | undefined {
+	const slug = planSlugFromSupplied(suppliedTitle);
+	return slug ? planFileUrlForSlug(slug) : undefined;
+}
+
 export interface ResolveApprovedPlanInput {
 	/** The agent's `extra.title` from the `resolve` call, if any. */
 	suppliedTitle?: unknown;
