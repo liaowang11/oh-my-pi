@@ -24,6 +24,13 @@ export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
  * object and the `session_info_update` goal snapshot (see `acp-goal.ts`).
  */
 export const AIR_GOAL_KEY = "goal";
+/**
+ * `_meta.jetbrains.air` key of a shell tool call's description (its intent),
+ * kept out of the standard `title`, which clients use as the command preview.
+ */
+export const AIR_COMMAND_TITLE_KEY = "commandTitle";
+/** `_meta.jetbrains.air` flag marking a tool call that launches subagents. */
+export const AIR_SUBAGENT_KEY = "subagent";
 /** AIR extension version this agent speaks. */
 export const AIR_EXTENSION_VERSION = 1;
 
