@@ -674,7 +674,6 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
-		permissionHandler?: (request: RequestPermissionRequest) => void;
 		/** Gives each session the factory creates a real extension runner with no extensions. */
 		extensionRunners?: boolean;
 		/** Exposed to each created session's `modelRegistry` for MCP credential round-trips. */
@@ -710,10 +709,6 @@ async function createHarness(
 		},
 		extNotification: async (method: string, params: Record<string, unknown>) => {
 			extNotifications.push({ method, params });
-		},
-		requestPermissionWithCancel: (request: RequestPermissionRequest) => {
-			options.permissionHandler?.(request);
-			return { promise: Promise.resolve({ outcome: { outcome: "cancelled" } }), cancel: () => {} };
 		},
 		unstable_createElicitation: options.elicitationHandler
 			? async (req: CreateElicitationRequest, signal?: AbortSignal) => options.elicitationHandler!(req, signal)
@@ -788,7 +783,10 @@ describe("ACP agent", () => {
 				elicitations.push(request);
 				return { action: "accept", content: { value: "Yes" } };
 			},
-			permissionHandler: request => permissions.push(request),
+			requestPermissionHandler: async request => {
+				permissions.push(request);
+				return { outcome: { outcome: "cancelled" } };
+			},
 		});
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
