@@ -449,6 +449,7 @@
 - ACP clients can delete sessions with `session/delete`: a loaded session is cancelled and closed first, and its transcript and subagent transcripts are removed; JetBrains AIR clients without `sessionIndex` get the session archived instead.
 - Fixed ACP form dialogs staying open on the client after the agent stopped waiting: a turn cancel or dialog timeout now withdraws the request with `$/cancel_request`, and cancelling a turn during plan approval no longer leaves the approval dialog pending.
 - ACP clients that support subagents can stop one running subagent with `session/cancel` on its child session id; the parent turn keeps running and the task reports the subagent as cancelled. Running subagents advertise this with `capabilities.cancel` (not offered to JetBrains AIR).
+- ACP clients now see session notices (model fallbacks, retry failures, config warnings, extension notifications and other agent warnings) as `notice` updates when they declare `session.notices`, or as a bold-labelled message line otherwise.
 
 ## [18.11.1] - 2026-10-15
 
