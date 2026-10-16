@@ -12,33 +12,41 @@ export interface SessionTitleUpdate {
 	title?: string;
 	source?: SessionTitleSource;
 	updatedAt: string;
+	/** Archived flag kept beside the title; absent or false means unarchived. */
+	archived?: boolean;
 }
 
 function byteLength(value: string): number {
 	return utf8Encoder.encode(value).byteLength;
 }
 
-function titleSlotLine(title: string, source: SessionTitleSource | undefined, updatedAt: string, pad: string): string {
-	const slot: SessionTitleSlotEntry = source
-		? {
-				type: SESSION_TITLE_SLOT_ENTRY_TYPE,
-				v: 1,
-				title,
-				source,
-				updatedAt,
-				pad,
-			}
-		: {
-				type: SESSION_TITLE_SLOT_ENTRY_TYPE,
-				v: 1,
-				title,
-				updatedAt,
-				pad,
-			};
+function titleSlotLine(
+	title: string,
+	source: SessionTitleSource | undefined,
+	updatedAt: string,
+	archived: boolean | undefined,
+	pad: string,
+): string {
+	// Optional fields are written only when set, so an unarchived slot keeps
+	// the bytes it had before the archived flag existed.
+	const slot: SessionTitleSlotEntry = {
+		type: SESSION_TITLE_SLOT_ENTRY_TYPE,
+		v: 1,
+		title,
+		...(source ? { source } : {}),
+		updatedAt,
+		...(archived ? { archived: true as const } : {}),
+		pad,
+	};
 	return `${JSON.stringify(slot)}\n`;
 }
 
-function truncateTitleForSlot(title: string, source: SessionTitleSource | undefined, updatedAt: string): string {
+function truncateTitleForSlot(
+	title: string,
+	source: SessionTitleSource | undefined,
+	updatedAt: string,
+	archived: boolean | undefined,
+): string {
 	const codePoints = [...title];
 	let low = 0;
 	let high = codePoints.length;
@@ -47,7 +55,7 @@ function truncateTitleForSlot(title: string, source: SessionTitleSource | undefi
 	while (low <= high) {
 		const mid = (low + high) >>> 1;
 		const candidate = codePoints.slice(0, mid).join("");
-		if (byteLength(titleSlotLine(candidate, source, updatedAt, "")) <= SESSION_TITLE_SLOT_BYTES) {
+		if (byteLength(titleSlotLine(candidate, source, updatedAt, archived, "")) <= SESSION_TITLE_SLOT_BYTES) {
 			best = candidate;
 			low = mid + 1;
 		} else {
@@ -71,6 +79,7 @@ function parseTitleSlotObject(value: unknown): SessionTitleSlotEntry | undefined
 	}
 	const source = record.source;
 	if (source !== undefined && !isSessionTitleSource(source)) return undefined;
+	if (record.archived !== undefined && typeof record.archived !== "boolean") return undefined;
 	const slot: SessionTitleSlotEntry = {
 		type: SESSION_TITLE_SLOT_ENTRY_TYPE,
 		v: 1,
@@ -79,6 +88,7 @@ function parseTitleSlotObject(value: unknown): SessionTitleSlotEntry | undefined
 		pad: record.pad,
 	};
 	if (source) slot.source = source;
+	if (record.archived === true) slot.archived = true;
 	return slot;
 }
 
@@ -105,16 +115,17 @@ export function titleUpdateFromSlot(slot: SessionTitleSlotEntry | undefined): Se
 		title: slot.title,
 		source: slot.source,
 		updatedAt: slot.updatedAt,
+		...(slot.archived ? { archived: true } : {}),
 	};
 }
 
 /** Serialize the fixed-width first-line title slot, exactly 256 UTF-8 bytes including newline. */
 export function serializeTitleSlot(options: SessionTitleUpdate): string {
-	const title = truncateTitleForSlot(options.title ?? "", options.source, options.updatedAt);
-	const unpadded = titleSlotLine(title, options.source, options.updatedAt, "");
+	const title = truncateTitleForSlot(options.title ?? "", options.source, options.updatedAt, options.archived);
+	const unpadded = titleSlotLine(title, options.source, options.updatedAt, options.archived, "");
 	const padBytes = SESSION_TITLE_SLOT_BYTES - byteLength(unpadded);
 	if (padBytes < 0) throw new Error("Session title slot metadata exceeds fixed slot size");
-	const line = titleSlotLine(title, options.source, options.updatedAt, " ".repeat(padBytes));
+	const line = titleSlotLine(title, options.source, options.updatedAt, options.archived, " ".repeat(padBytes));
 	if (byteLength(line) !== SESSION_TITLE_SLOT_BYTES) {
 		throw new Error("Session title slot serialization failed to produce fixed-width output");
 	}
