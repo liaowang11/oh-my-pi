@@ -1385,6 +1385,44 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("plan-proposal Save writes the plan into the working directory and asks again", async () => {
+		const requests: CreateElicitationRequest[] = [];
+		const answers = ["Save plan", "Approve and execute"];
+		const harness = await createHarness({
+			elicitationHandler: async request => {
+				requests.push(request);
+				return { action: "accept", content: { value: answers.shift()! } };
+			},
+		});
+		cfgPlanEnabled.set(Settings.instance, true);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), "# Words Counter\n\nFile contents.");
+
+		await session.planProposalHandler!("words-counter");
+
+		const saved = path.join(harness.cwdA, "WORDS_COUNTER_PLAN.md");
+		expect(await Bun.file(saved).text()).toBe("# Words Counter\n\nFile contents.");
+		expect(requests).toHaveLength(2);
+		const options = (request: CreateElicitationRequest) =>
+			(request as { requestedSchema?: { properties?: { value?: { enum?: string[] } } } }).requestedSchema?.properties
+				?.value?.enum;
+		expect(options(requests[0]!)).toEqual(["Approve and execute", "Save plan", "Refine plan"]);
+		expect((requests[1] as { message: string }).message).toContain(`Saved plan to ${saved}`);
+		// The second answer approved: plan mode is over.
+		expect(session.planModeState).toBeUndefined();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("buffers compaction notifications until the client knows the session", async () => {
 		const harness = await createHarness();
 		vi.useFakeTimers();
@@ -1462,6 +1500,143 @@ describe("ACP agent", () => {
 		finishPrompt();
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	describe("approved plan reporting", () => {
+		const PROPOSE_ARGS = { path: "xd://propose", content: "words-counter" };
+		const PLAN_TEXT = "# Words Counter\n\nFile contents.\n";
+		const airCaps = (capabilities: string[]): ClientCapabilities => ({
+			_meta: { jetbrains: { air: { version: 1, capabilities } } },
+		});
+
+		/** Drive one `xd://propose` tool call through the lifetime subscription; returns what the client got. */
+		async function proposePlan(
+			clientCapabilities: ClientCapabilities | undefined,
+			decision: "approve" | "refine" = "approve",
+		) {
+			const harness = await createHarness(
+				decision === "refine"
+					? {
+							clientCapabilities: { ...clientCapabilities, elicitation: { form: {} } },
+							elicitationHandler: async () => ({ action: "cancel" }),
+						}
+					: { clientCapabilities },
+			);
+			cfgPlanEnabled.set(Settings.instance, true);
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+			const localOptions = {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			};
+			cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+			const planPath = resolveLocalUrlToPath("local://words-counter-plan.md", localOptions);
+			await Bun.write(planPath, PLAN_TEXT);
+			const emit = (event: unknown) => {
+				for (const listener of session.listeners()) listener(event as AgentSessionEvent);
+			};
+
+			const from = harness.updates.length;
+			emit({ type: "tool_execution_start", toolCallId: "propose-1", toolName: "write", args: PROPOSE_ARGS });
+			const result = await session.planProposalHandler!("words-counter");
+			emit({ type: "tool_execution_end", toolCallId: "propose-1", toolName: "write", result, isError: false });
+			await Bun.sleep(10);
+
+			const sent = harness.updates.slice(from).filter(update => update.sessionId === created.sessionId);
+			expectAcpNotifications(sent);
+			harness.abortController.abort();
+			await Bun.sleep(0);
+			// Mode, config, and bootstrap updates are not under test here.
+			const updates = sent
+				.map(update => update.update)
+				.filter(update => ["tool_call", "tool_call_update", "plan_update"].includes(update.sessionUpdate));
+			return { updates, planPath };
+		}
+
+		it("sends the approved plan as a markdown plan_update after the propose result, only to plan clients", async () => {
+			const withCap = await proposePlan({ plan: {} });
+			expect(withCap.updates.map(update => update.sessionUpdate)).toEqual([
+				"tool_call",
+				"tool_call_update",
+				"plan_update",
+			]);
+			expect(withCap.updates[2]).toEqual({
+				sessionUpdate: "plan_update",
+				plan: { type: "markdown", planId: "plan-mode", content: PLAN_TEXT.trim() },
+			});
+
+			const withoutCap = await proposePlan(undefined);
+			expect(withoutCap.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+		});
+
+		it("sends no plan_update for a plan sent back for refinement", async () => {
+			const refined = await proposePlan({ plan: {} }, "refine");
+			expect(refined.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+		});
+
+		it("names the plan file in rawInput for an AIR planFile client and clears it on approval", async () => {
+			const { updates, planPath } = await proposePlan(airCaps(["planFile"]));
+			expect(updates[0]).toMatchObject({
+				sessionUpdate: "tool_call",
+				toolCallId: "propose-1",
+				rawInput: { ...PROPOSE_ARGS, planFilePath: planPath },
+			});
+			expect(updates[1]).toMatchObject({
+				sessionUpdate: "tool_call_update",
+				toolCallId: "propose-1",
+				rawInput: { ...PROPOSE_ARGS, planFilePath: planPath },
+			});
+			expect(updates.slice(2)).toEqual([
+				{
+					sessionUpdate: "tool_call",
+					toolCallId: "propose-1:plan-file-clear",
+					title: "Exited Plan Mode",
+					kind: "switch_mode",
+					status: "completed",
+					rawInput: { planFilePath: "" },
+					content: [],
+				},
+			]);
+
+			const other = await proposePlan(airCaps([]));
+			expect(other.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+			expect(other.updates[0]).toMatchObject({ rawInput: PROPOSE_ARGS });
+			expect((other.updates[1] as { rawInput?: unknown }).rawInput).toBeUndefined();
+		});
+
+		it("leaves planFilePath out while the proposed plan file does not exist", async () => {
+			const harness = await createHarness({ clientCapabilities: airCaps(["planFile"]) });
+			cfgPlanEnabled.set(Settings.instance, true);
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+			const from = harness.updates.length;
+			for (const listener of session.listeners()) {
+				listener({
+					type: "tool_execution_start",
+					toolCallId: "propose-1",
+					toolName: "write",
+					args: PROPOSE_ARGS,
+				} as AgentSessionEvent);
+			}
+			await Bun.sleep(0);
+
+			const start = harness.updates
+				.slice(from)
+				.map(update => update.update)
+				.find(update => update.sessionUpdate === "tool_call");
+			expect(start).toMatchObject({ toolCallId: "propose-1" });
+			expect((start as { rawInput?: unknown }).rawInput).toEqual(PROPOSE_ARGS);
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		});
 	});
 
 	it("pushes config_option_update when thinking level changes internally", async () => {
