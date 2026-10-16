@@ -1582,6 +1582,10 @@ export class AcpAgent implements Agent {
 	}
 
 	async cancel(params: { sessionId: string }): Promise<void> {
+		if (isSubagentSessionId(params.sessionId)) {
+			await this.#cancelSubagent(params.sessionId);
+			return;
+		}
 		const record = this.#getSessionRecord(params.sessionId);
 		const promptTurn = record.promptTurn;
 		if (!promptTurn || promptTurn.settled) {
@@ -1593,6 +1597,24 @@ export class AcpAgent implements Agent {
 		} catch (error: unknown) {
 			logger.warn("ACP cancel cleanup timed out; closing session", { sessionId: record.session.sessionId, error });
 			await this.#closeManagedSession(record.session.sessionId, record);
+		}
+	}
+
+	/**
+	 * `session/cancel` on a subagent child id kills that one subagent; the
+	 * parent turn keeps running. An unknown or finished child is a no-op. A
+	 * failed kill is only logged: `session/cancel` is a notification.
+	 */
+	async #cancelSubagent(childSessionId: string): Promise<void> {
+		for (const record of this.#sessions.values()) {
+			const relay = record.subagentRelay;
+			if (!relay) continue;
+			try {
+				if (await relay.cancelChild(childSessionId)) return;
+			} catch (error) {
+				logger.warn("ACP subagent cancel failed", { sessionId: childSessionId, error });
+				return;
+			}
 		}
 	}
 
@@ -1952,6 +1974,8 @@ export class AcpAgent implements Agent {
 				send: notification => this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification)),
 				getCwd: () => session.sessionManager.getCwd(),
 				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
+				// AIR never offers child cancel (claude-agent-acp parity).
+				cancellable: !isAirClient(this.#clientCapabilities),
 			});
 		}
 		// Secondary in-process sessions own no job manager (issue #1923): no relay.
