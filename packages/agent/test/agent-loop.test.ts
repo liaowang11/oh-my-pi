@@ -482,6 +482,45 @@ describe("agentLoop with AgentMessage", () => {
 		expect(executed).toEqual([{ label: "x", i: "INDEX" }]);
 	});
 
+	it("keeps a thrown error's nonExecution kind in the tool result details", async () => {
+		// Consumers (ACP) tell a call that never ran (a rejected permission
+		// request) from a real tool failure by this field; a plain error keeps
+		// empty details.
+		const toolSchema = type({ mode: "string" });
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "gated",
+			label: "Gated",
+			description: "Gated tool",
+			parameters: toolSchema,
+			async execute(_toolCallId, params) {
+				if (params.mode === "rejected") {
+					throw Object.assign(new Error("Tool call rejected by user"), { nonExecution: "user-rejected" });
+				}
+				throw new Error("disk full");
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-rejected", name: "gated", arguments: { mode: "rejected" } },
+						{ type: "toolCall", id: "tool-failed", name: "gated", arguments: { mode: "failed" } },
+					],
+				},
+				{ content: ["done"] },
+			],
+		});
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		const stream = agentLoop([createUserMessage("run gated")], context, config, undefined, mock.stream);
+		const details = new Map<string, unknown>();
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") details.set(event.toolCallId, event.result.details);
+		}
+		expect(details.get("tool-rejected")).toEqual({ nonExecution: "user-rejected" });
+		expect(details.get("tool-failed")).toEqual({});
+	});
+
 	it("still derives intent for a tool that owns `i` as an argument", async () => {
 		const toolSchema = type({ label: "string", "i?": "string" });
 		const executed: unknown[] = [];

@@ -483,8 +483,12 @@ class FakeAgentSession {
 		this.planReferencePath = path;
 	}
 
-	getToolByName(_name: string): undefined {
-		return undefined;
+	/** The MCP server of each registered MCP tool, by tool name. */
+	mcpToolServers = new Map<string, string>();
+
+	getToolByName(name: string): { name: string; mcpServerName: string } | undefined {
+		const mcpServerName = this.mcpToolServers.get(name);
+		return mcpServerName === undefined ? undefined : { name, mcpServerName };
 	}
 
 	toggleFastMode(): boolean {
@@ -7084,12 +7088,77 @@ describe("ACP async tasks", () => {
 		const toolUpdates = harness.updates
 			.map(notification => notification.update)
 			.filter(update => update.sessionUpdate === "tool_call_update");
-		expect(toolUpdates.find(update => update.toolCallId === "call-bg")?._meta).toEqual(
-			expect.objectContaining({ jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } } }),
-		);
-		expect(toolUpdates.find(update => update.toolCallId === "call-fg")?._meta?.jetbrains).toBeUndefined();
+		// The backgrounded stamp joins the tool-call meta instead of replacing it.
+		expect(toolUpdates.find(update => update.toolCallId === "call-bg")?._meta).toEqual({
+			claudeCode: { toolName: "bash" },
+			jetbrains: { air: { version: 1, asyncTasks: { backgrounded: true } } },
+		});
+		expect(toolUpdates.find(update => update.toolCallId === "call-fg")?._meta).toEqual({
+			claudeCode: { toolName: "bash" },
+		});
 		gate.resolve("stopped");
 		harness.abortController.abort();
+	});
+
+	it("tags tool calls with the AIR flags for an AIR client and only the tool name for others", async () => {
+		const startedCalls = async (clientCapabilities: ClientCapabilities) => {
+			const harness = await createHarness({ clientCapabilities });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			session.mcpToolServers.set("docs_search", "docs");
+			session.prompt = async (text: string): Promise<boolean> => {
+				session.promptCalls.push(text);
+				session.isStreaming = true;
+				for (const listener of session.listeners()) {
+					for (const [toolCallId, toolName, intent] of [
+						["call-bash", "bash", "Run the tests"],
+						["call-task", "task", "Review the diff"],
+						["call-mcp", "docs_search", undefined],
+					] as const) {
+						listener({
+							type: "tool_execution_start",
+							toolCallId,
+							toolName,
+							args: {},
+							intent,
+						} as AgentSessionEvent);
+					}
+					listener({ type: "agent_end", messages: [] } as AgentSessionEvent);
+				}
+				session.isStreaming = false;
+				return true;
+			};
+			await harness.agent.prompt({
+				sessionId: created.sessionId,
+				messageId: "00000000-0000-4000-8000-000000000072",
+				prompt: [{ type: "text", text: "work" }],
+			} as PromptRequest);
+			harness.abortController.abort();
+			return new Map(
+				harness.updates
+					.map(notification => notification.update)
+					.filter(update => update.sessionUpdate === "tool_call")
+					.map(update => [update.toolCallId, update._meta]),
+			);
+		};
+
+		const air = await startedCalls(AIR_ASYNC_TASKS);
+		expect(air.get("call-bash")).toEqual({
+			claudeCode: { toolName: "bash" },
+			jetbrains: { air: { version: 1, commandTitle: "Run the tests" } },
+		});
+		expect(air.get("call-task")).toEqual({
+			claudeCode: { toolName: "task" },
+			jetbrains: { air: { version: 1, subagent: true } },
+		});
+		expect(air.get("call-mcp")).toEqual({ claudeCode: { toolName: "docs_search" }, is_mcp_tool_call: true });
+
+		const plain = await startedCalls({});
+		expect([...plain.values()]).toEqual([
+			{ claudeCode: { toolName: "bash" } },
+			{ claudeCode: { toolName: "task" } },
+			{ claudeCode: { toolName: "docs_search" } },
+		]);
 	});
 
 	it("relays a subagent's job on the subagent's session and stops it from the root session", async () => {

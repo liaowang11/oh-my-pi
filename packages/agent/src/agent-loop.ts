@@ -3659,7 +3659,7 @@ async function executeToolCalls(
 				caughtError = e;
 				result = {
 					content: [{ type: "text", text: e instanceof Error ? e.message : String(e) }],
-					details: {},
+					details: nonExecutionDetails(e),
 				};
 				isError = true;
 			}
@@ -4040,6 +4040,18 @@ function createAbortedToolResult(
 	stream.push({ type: "message_end", message: toolResultMessage });
 
 	return toolResultMessage;
+}
+
+/**
+ * Details of a tool call that threw: `{ nonExecution }` when the thrown value
+ * names why the tool never ran (a permission gate's `nonExecution` tag, e.g.
+ * "user-rejected"), else empty. Lets consumers tell a call that was refused
+ * from one that failed while running.
+ */
+function nonExecutionDetails(error: unknown): Record<string, unknown> {
+	const kind =
+		typeof error === "object" && error !== null ? (error as { nonExecution?: unknown }).nonExecution : undefined;
+	return typeof kind === "string" ? { nonExecution: kind } : {};
 }
 
 function createToolSignalAbortedResult(signal: AbortSignal): AgentToolResult<unknown> {

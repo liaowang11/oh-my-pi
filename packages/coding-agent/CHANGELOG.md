@@ -455,6 +455,7 @@
 - ACP clients that declare `plan` now get an approved plan-mode plan as a markdown `plan_update`; JetBrains AIR clients can declare `planFile` to have the plan proposal name the plan file and clear it on approval.
 - JetBrains AIR clients can set or clear a session's goal with `_session/goal` (setting on a running turn changes the goal without interrupting it) and see the goal's state in `session_info_update`.
 - JetBrains AIR clients with `sessionIndex` can subscribe to a project's session list with `_session/list/subscribe` and get `_session/list/changes` notifications as sessions are created, run, renamed, archived or deleted (`sessionListSubscribe`).
+- ACP tool calls now name the omp tool in `_meta.claudeCode.toolName`, and a failed call that never ran says why in `nonExecutionKind` (`user-rejected`, `permission-rule`, `cancelled`, `interrupted`); JetBrains AIR clients also get a shell call's description as `commandTitle`, task calls marked as `subagent`, and MCP tool calls marked with `is_mcp_tool_call`.
 
 ## [18.11.1] - 2026-10-15
 
