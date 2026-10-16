@@ -11,6 +11,8 @@ import { InternalUrlRouter } from "../../internal-urls/router";
 import { extractUriScheme } from "../../internal-urls/parse";
 import type { SchemeSpec } from "../../internal-urls/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import type { MountedMCPToolRouteSource } from "../../session/session-tools";
+import { AIR_COMMAND_TITLE_KEY, AIR_SUBAGENT_KEY, withAirFields } from "./acp-air";
 import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
@@ -32,6 +34,10 @@ interface AcpEventMapperOptions {
 	 * before emitting `ToolCallLocation` entries.
 	 */
 	cwd?: string;
+	/** Whether the client is an AIR client: its tool calls carry the AIR flags. */
+	airClient?: boolean;
+	/** The session's registered tool of a name; an MCP tool names its server. */
+	lookupTool?: (toolName: string) => MountedMCPToolRouteSource | undefined;
 }
 
 interface ContentArrayContainer {
@@ -204,6 +210,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				intent: event.intent,
 				cwd: options.cwd,
 			});
+			update._meta = toolCallStartMeta(event, options);
 			return [toSessionNotification(sessionId, update)];
 		}
 		case "tool_execution_update": {
@@ -217,6 +224,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				toolCallId: event.toolCallId,
 				status: toolUpdateStatus(event.partialResult),
 				rawOutput: event.partialResult,
+				_meta: { claudeCode: { toolName: event.toolName } },
 			};
 			if (content.length > 0) {
 				update.content = content;
@@ -240,6 +248,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 				toolCallId: event.toolCallId,
 				status: event.isError ? "failed" : "completed",
 				rawOutput: event.result,
+				_meta: toolCallEndMeta(event),
 			};
 			if (content.length > 0) {
 				update.content = content;
@@ -268,6 +277,56 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 		default:
 			return [];
 	}
+}
+
+/** Tools whose AIR tool call carries its intent as the command title. */
+const AIR_COMMAND_TITLE_TOOLS = new Set(["bash", "shell", "exec"]);
+
+/**
+ * `_meta` of a tool call: the omp tool name for every client, as
+ * claude-agent-acp's `claudeCode.toolName`. An AIR client also learns a
+ * shell call's description, a subagent launch, and an MCP tool call.
+ */
+function toolCallStartMeta(
+	event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>,
+	options: AcpEventMapperOptions,
+): Record<string, unknown> {
+	const meta: Record<string, unknown> = { claudeCode: { toolName: event.toolName } };
+	if (!options.airClient) return meta;
+	if (typeof options.lookupTool?.(event.toolName)?.mcpServerName === "string") meta.is_mcp_tool_call = true;
+	const air: Record<string, unknown> = {};
+	if (AIR_COMMAND_TITLE_TOOLS.has(event.toolName) && event.intent?.trim()) {
+		air[AIR_COMMAND_TITLE_KEY] = event.intent.trim();
+	}
+	if (event.toolName === "task") air[AIR_SUBAGENT_KEY] = true;
+	return Object.keys(air).length > 0 ? withAirFields(meta, air) : meta;
+}
+
+interface NonExecutionDetails {
+	nonExecution?: unknown;
+	__synthetic?: unknown;
+	source?: unknown;
+}
+
+/**
+ * `_meta` of a tool call's final update: the tool name, and for a failed call
+ * that never ran, why (`nonExecutionKind`): a permission refusal's tag, or
+ * `interrupted` when the assistant turn stopped before the call could run.
+ */
+function toolCallEndMeta(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): Record<string, unknown> {
+	const nonExecutionKind = event.isError ? nonExecutionKindOf(event.result) : undefined;
+	return { claudeCode: { toolName: event.toolName, ...(nonExecutionKind ? { nonExecutionKind } : {}) } };
+}
+
+function nonExecutionKindOf(result: unknown): string | undefined {
+	const details = (result as DetailsContainer | undefined)?.details;
+	if (typeof details !== "object" || details === null) return undefined;
+	const { nonExecution, __synthetic, source } = details as NonExecutionDetails;
+	if (typeof nonExecution === "string") return nonExecution;
+	if (__synthetic === true && typeof source === "string" && source.startsWith("assistant_stop_")) {
+		return "interrupted";
+	}
+	return undefined;
 }
 
 function mapAssistantMessageUpdate(

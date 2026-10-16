@@ -1015,6 +1015,75 @@ it("reject_once: throws ToolError and never calls underlying execute", async () 
 	expect(bashTool.executeCalls).toBe(0);
 });
 
+/** The `nonExecution` tag a gated call's rejection carries; the agent loop keeps it in the result details. */
+async function nonExecutionOf(execution: Promise<unknown>): Promise<unknown> {
+	try {
+		await execution;
+	} catch (error) {
+		return (error as { nonExecution?: unknown }).nonExecution;
+	}
+	throw new Error("Expected the gated call to be refused");
+}
+
+it("tags each permission refusal with why the tool never ran", async () => {
+	const run = async (
+		outcome: ClientBridgePermissionOutcome,
+		settingsOverrides: Record<string, unknown> = {},
+	): Promise<unknown[]> => {
+		const bashTool = makeFakeTool("bash");
+		session = await createSession([bashTool], makeBridge(outcome), settingsOverrides);
+		await session.setActiveToolsByName(["bash"]);
+		const wrappedBash = session.agent.state.tools.find(t => t.name === "bash");
+		if (!wrappedBash) throw new Error("Expected wrapped bash tool");
+		const call = (id: string) =>
+			wrappedBash.execute(id, { command: "echo hi" }, undefined, undefined as never, undefined as never);
+		const kinds = [await nonExecutionOf(call("call-1")), await nonExecutionOf(call("call-2"))];
+		expect(bashTool.executeCalls).toBe(0);
+		await session.dispose();
+		session = undefined;
+		return kinds;
+	};
+
+	expect(await run({ outcome: "selected", optionId: "reject_once", kind: "reject_once" })).toEqual([
+		"user-rejected",
+		"user-rejected",
+	]);
+	// The second call is refused by the persisted "Always reject" decision.
+	expect(await run({ outcome: "selected", optionId: "reject_always", kind: "reject_always" })).toEqual([
+		"permission-rule",
+		"permission-rule",
+	]);
+	expect(await run({ outcome: "cancelled" })).toEqual(["cancelled", "cancelled"]);
+	expect(
+		await run(
+			{ outcome: "selected", optionId: "allow_once", kind: "allow_once" },
+			{ "tools.approvalMode": "always-ask", "tools.approval": { bash: "deny" } },
+		),
+	).toEqual(["permission-rule", "permission-rule"]);
+});
+
+it("tags an aborted permission request as cancelled", async () => {
+	const bashTool = makeFakeTool("bash");
+	const pending = Promise.withResolvers<ClientBridgePermissionOutcome>();
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		requestPermission: async () => pending.promise,
+	};
+	session = await createSession([bashTool], bridge);
+	await session.setActiveToolsByName(["bash"]);
+	const wrappedBash = session.agent.state.tools.find(t => t.name === "bash");
+	if (!wrappedBash) throw new Error("Expected wrapped bash tool");
+	const call = (signal: AbortSignal) =>
+		wrappedBash.execute("call-1", { command: "echo hi" }, signal, undefined as never, undefined as never);
+
+	const open = new AbortController();
+	const execution = call(open.signal);
+	open.abort();
+	expect(await nonExecutionOf(execution)).toBe("cancelled");
+	expect(await nonExecutionOf(call(AbortSignal.abort()))).toBe("cancelled");
+	pending.resolve({ outcome: "cancelled" });
+});
+
 it("unknown selected permission option ID fails closed without executing", async () => {
 	const bashTool = makeFakeTool("bash");
 	const bridge = makeBridge({ outcome: "selected", optionId: "allow_typo" });
