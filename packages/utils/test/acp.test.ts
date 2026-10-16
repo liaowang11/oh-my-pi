@@ -144,6 +144,43 @@ describe("ACP JSON-RPC transport", () => {
 		writer.releaseLock();
 	});
 
+	it("withdraws an open permission request when its signal aborts", async () => {
+		const toClient = new TransformStream<AnyMessage, AnyMessage>();
+		const fromClient = new TransformStream<AnyMessage, AnyMessage>();
+		const agent = new AgentSideConnection(
+			() => ({
+				initialize: params => ({ protocolVersion: params.protocolVersion }),
+				newSession: async () => ({ sessionId: "s" }),
+				prompt: async () => ({ stopReason: "end_turn" }),
+				cancel: async () => {},
+			}),
+			{ writable: toClient.writable, readable: fromClient.readable },
+		);
+		const reader = toClient.readable.getReader();
+		const controller = new AbortController();
+		const permission = agent.requestPermission(
+			{
+				sessionId: "s",
+				toolCall: { toolCallId: "call-1", title: "rm -rf build" },
+				options: [{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+			},
+			controller.signal,
+		);
+		const sent = await reader.read();
+		if (sent.done || !("id" in sent.value) || !("method" in sent.value)) throw new Error("Expected a request");
+		expect(sent.value.method).toBe("session/request_permission");
+
+		controller.abort();
+		await expect(permission).rejects.toMatchObject({ code: -32800 });
+		const cancel = await reader.read();
+		expect(cancel.value).toEqual({
+			jsonrpc: "2.0",
+			method: "$/cancel_request",
+			params: { requestId: sent.value.id },
+		});
+		reader.releaseLock();
+	});
+
 	it("decodes split and batched NDJSON frames", async () => {
 		const bytes = new TransformStream<Uint8Array, Uint8Array>();
 		const output = new TransformStream<Uint8Array, Uint8Array>();

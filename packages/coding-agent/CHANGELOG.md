@@ -447,7 +447,6 @@
 - Fixed ACP ask forms in clients such as agent-shell: a single question with a header no longer shows twice, "Other" is offered as one more option instead of a separate field, and questions without options are labelled with their own text instead of "Other"
 - JetBrains AIR clients with `sessionIndex` now see `sessionWorktrees`: `session/list` rows of sessions running in a live worktree omp made (`/wt`, PR checkouts, task isolation) carry `agentWorktree: true`.
 - ACP clients can delete sessions with `session/delete`: a loaded session is cancelled and closed first, and its transcript and subagent transcripts are removed; JetBrains AIR clients without `sessionIndex` get the session archived instead.
-- Fixed ACP form dialogs staying open on the client after the agent stopped waiting: a turn cancel or dialog timeout now withdraws the request with `$/cancel_request`, and cancelling a turn during plan approval no longer leaves the approval dialog pending.
 - ACP clients that support subagents can stop one running subagent with `session/cancel` on its child session id; the parent turn keeps running and the task reports the subagent as cancelled. Running subagents advertise this with `capabilities.cancel` (not offered to JetBrains AIR).
 - ACP clients now see session notices (model fallbacks, retry failures, config warnings, extension notifications and other agent warnings) as `notice` updates when they declare `session.notices`, or as a bold-labelled message line otherwise.
 - Fixed ACP `session/load` dropping past compactions and user-run shell and Python commands from the replayed transcript.
@@ -456,6 +455,7 @@
 - JetBrains AIR clients can set or clear a session's goal with `_session/goal` (setting on a running turn changes the goal without interrupting it) and see the goal's state in `session_info_update`.
 - JetBrains AIR clients with `sessionIndex` can subscribe to a project's session list with `_session/list/subscribe` and get `_session/list/changes` notifications as sessions are created, run, renamed, archived or deleted (`sessionListSubscribe`).
 - ACP tool calls now name the omp tool in `_meta.claudeCode.toolName`, and a failed call that never ran says why in `nonExecutionKind` (`user-rejected`, `permission-rule`, `cancelled`, `interrupted`); JetBrains AIR clients also get a shell call's description as `commandTitle`, task calls marked as `subagent`, and MCP tool calls marked with `is_mcp_tool_call`.
+- Fixed ACP form dialogs staying open on the client after the agent stopped waiting: a turn cancel or dialog timeout now withdraws the request with `$/cancel_request` (permission prompts included), and cancelling a turn during plan approval no longer leaves the approval dialog pending.
 
 ## [18.11.1] - 2026-10-15
 
