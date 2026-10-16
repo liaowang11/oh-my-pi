@@ -632,7 +632,7 @@ afterEach(async () => {
 
 async function createHarness(
 	options: {
-		elicitationHandler?: (req: CreateElicitationRequest) => Promise<CreateElicitationResponse>;
+		elicitationHandler?: (req: CreateElicitationRequest, signal?: AbortSignal) => Promise<CreateElicitationResponse>;
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
@@ -669,7 +669,7 @@ async function createHarness(
 			updates.push(notification);
 		},
 		unstable_createElicitation: options.elicitationHandler
-			? async (req: CreateElicitationRequest) => options.elicitationHandler!(req)
+			? async (req: CreateElicitationRequest, signal?: AbortSignal) => options.elicitationHandler!(req, signal)
 			: undefined,
 		signal: abortController.signal,
 		closed: Promise.withResolvers<void>().promise,
@@ -1242,6 +1242,53 @@ describe("ACP agent", () => {
 			),
 		).toBe(false);
 
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("plan-proposal handler settles as refine and withdraws the dialog when the turn is cancelled", async () => {
+		const elicitationSignals: Array<AbortSignal | undefined> = [];
+		const elicitationOpened = Promise.withResolvers<void>();
+		const { promise: never } = Promise.withResolvers<CreateElicitationResponse>();
+		const harness = await createHarness({
+			elicitationHandler: (_request, signal) => {
+				elicitationSignals.push(signal);
+				elicitationOpened.resolve();
+				return never;
+			},
+		});
+		cfgPlanEnabled.set(Settings.instance, true);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), "# Words Counter\n\nFile contents.");
+		const finishPrompt = holdPromptStreaming(session);
+		const prompt = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "plan it" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+
+		const proposal = session.planProposalHandler!("words-counter") as Promise<{
+			content: Array<{ type: string; text: string }>;
+		}>;
+		await elicitationOpened.promise;
+		expect(elicitationSignals[0]?.aborted).toBe(false);
+		await harness.agent.cancel({ sessionId: created.sessionId });
+
+		const result = await proposal;
+		expect(result.content[0]?.text).toMatch(/refinement requested/i);
+		expect(session.planModeState?.enabled).toBe(true);
+		expect(elicitationSignals[0]?.aborted).toBe(true);
+		expect((await prompt).stopReason).toBe("cancelled");
+
+		finishPrompt();
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
@@ -4417,15 +4464,18 @@ describe("ACP agent", () => {
 		function createElicitConnection(handler: (req: CreateElicitationRequest) => Promise<CreateElicitationResponse>): {
 			connection: AgentSideConnection;
 			calls: CreateElicitationRequest[];
+			signals: Array<AbortSignal | undefined>;
 		} {
 			const calls: CreateElicitationRequest[] = [];
+			const signals: Array<AbortSignal | undefined> = [];
 			const connection = {
-				unstable_createElicitation: async (req: CreateElicitationRequest) => {
+				unstable_createElicitation: async (req: CreateElicitationRequest, signal?: AbortSignal) => {
 					calls.push(req);
+					signals.push(signal);
 					return handler(req);
 				},
 			} as unknown as AgentSideConnection;
-			return { connection, calls };
+			return { connection, calls, signals };
 		}
 
 		/** Narrows `CreateElicitationRequest` to the `mode: "form"` branch; the SDK's `mode: string` catch-all arm otherwise defeats literal narrowing on `mode !== "form"`. */
@@ -4952,6 +5002,43 @@ describe("ACP agent", () => {
 			// Resolve the never-promise so the bridge's `.then(finish)` chain settles
 			// and Bun's promise tracker doesn't flag a leaked pending promise.
 			resolve({ action: "decline" });
+		});
+
+		it("withdraws the client request when dialogOptions.signal aborts mid-flight", async () => {
+			const { promise: never } = Promise.withResolvers<CreateElicitationResponse>();
+			const { connection, signals } = createElicitConnection(() => never);
+			const ctx = createAcpExtensionUiContext(connection, () => "session-withdraw-abort", FORM_CAPABILITIES);
+			const controller = new AbortController();
+
+			const pending = ctx.select("X", ["a"], { signal: controller.signal });
+			await Promise.resolve();
+			expect(signals[0]?.aborted).toBe(false);
+			controller.abort();
+
+			expect(await pending).toBeUndefined();
+			expect(signals[0]?.aborted).toBe(true);
+		});
+
+		it("withdraws the client request when dialogOptions.timeout expires", async () => {
+			const { promise: never } = Promise.withResolvers<CreateElicitationResponse>();
+			const { connection, signals } = createElicitConnection(() => never);
+			const ctx = createAcpExtensionUiContext(connection, () => "session-withdraw-timeout", FORM_CAPABILITIES);
+
+			expect(await ctx.select("Pick", ["a"], { timeout: 1 })).toBeUndefined();
+			expect(signals[0]?.aborted).toBe(true);
+		});
+
+		it("does not withdraw an elicitation the client answered", async () => {
+			const { connection, signals } = createElicitConnection(async () => ({
+				action: "accept",
+				content: { value: "a" },
+			}));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-answered", FORM_CAPABILITIES);
+			const controller = new AbortController();
+
+			expect(await ctx.select("Pick", ["a"], { signal: controller.signal, timeout: 60_000 })).toBe("a");
+			controller.abort();
+			expect(signals[0]?.aborted).toBe(false);
 		});
 
 		it("returns the stub fallback when the client sends a wrong-typed accept payload", async () => {
