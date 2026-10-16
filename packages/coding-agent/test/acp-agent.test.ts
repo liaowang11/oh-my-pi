@@ -31,6 +31,10 @@ import type {
 	AgentSessionEvent,
 	UsageFallbackConfirmation,
 } from "@oh-my-pi/pi-coding-agent/session/agent-session";
+import { AgentLifecycleManager } from "@oh-my-pi/pi-coding-agent/registry/agent-lifecycle";
+import { AgentRegistry } from "@oh-my-pi/pi-coding-agent/registry/agent-registry";
+import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
+import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
@@ -41,6 +45,8 @@ import {
 	TASK_SUBAGENT_PROGRESS_CHANNEL,
 	TaskTool,
 } from "@oh-my-pi/pi-coding-agent/task";
+import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
+import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
 import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
@@ -5913,6 +5919,228 @@ describe("ACP subagent sessions", () => {
 
 		expect(harness.updates.slice(before)).toEqual([]);
 		harness.abortController.abort();
+	});
+
+	describe("cancel one subagent", () => {
+		afterEach(() => {
+			vi.restoreAllMocks();
+			AgentLifecycleManager.resetGlobalForTests();
+			AgentRegistry.resetGlobalForTests();
+		});
+
+		/** A transcript path whose directory exists, so the kill tombstone can be written. */
+		async function transcriptDir(): Promise<string> {
+			const dir = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-cancel-"));
+			cleanupRoots.push(dir);
+			return dir;
+		}
+
+		/** Register a live subagent whose session records abort/dispose calls. */
+		function registerLiveAgent(id: string, sessionFile: string, calls: string[]): void {
+			AgentRegistry.global().register({
+				id,
+				displayName: id,
+				kind: "sub",
+				session: {
+					abort: async () => {
+						calls.push(`abort:${id}`);
+					},
+					dispose: async () => {
+						calls.push(`dispose:${id}`);
+					},
+				} as never,
+				sessionFile,
+				status: "running",
+			});
+		}
+
+		function childPatches(harness: AgentHarness, child: string) {
+			return harness.updates.flatMap(n =>
+				n.update.sessionUpdate === "subagent_update" && n.update.sessionId === child ? [n.update] : [],
+			);
+		}
+
+		it("advertises cancel on a running child and clears it at idle", async () => {
+			const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const child = `${created.sessionId}:subagent:Worker`;
+			const dir = await transcriptDir();
+
+			lifecycle(bus, "Worker", "started", { sessionFile: path.join(dir, "Worker.jsonl") });
+			lifecycle(bus, "Worker", "completed");
+			await Bun.sleep(0);
+
+			const patches = childPatches(harness, child);
+			expect(patches.map(update => [update.state, update.capabilities])).toEqual([
+				[{ state: "running" }, { cancel: {} }],
+				[{ state: "idle", stopReason: "end_turn" }, null],
+			]);
+			expectAcpNotifications(harness.updates);
+			harness.abortController.abort();
+		});
+
+		it("cancels only the targeted child while the parent turn keeps running", async () => {
+			const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const bus = harness.eventBuses.at(-1)!;
+			const dir = await transcriptDir();
+			const calls: string[] = [];
+			for (const id of ["Worker", "Sibling"]) {
+				lifecycle(bus, id, "started", { sessionFile: path.join(dir, `${id}.jsonl`) });
+				registerLiveAgent(id, path.join(dir, `${id}.jsonl`), calls);
+			}
+			const finishPrompt = holdPromptStreaming(session);
+			const parentTurn = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "delegate" }],
+			} as PromptRequest);
+			await Bun.sleep(0);
+
+			await harness.agent.cancel({ sessionId: `${created.sessionId}:subagent:Worker` });
+			// A second cancel of the same child is a no-op.
+			await harness.agent.cancel({ sessionId: `${created.sessionId}:subagent:Worker` });
+
+			expect(calls).toEqual(["abort:Worker", "dispose:Worker"]);
+			expect(AgentRegistry.global().get("Worker")?.status).toBe("aborted");
+			expect(AgentRegistry.global().get("Sibling")?.status).toBe("running");
+			expect(session.isStreaming).toBe(true);
+			const parentSettled = await Promise.race([parentTurn.then(() => true), Bun.sleep(0).then(() => false)]);
+			expect(parentSettled).toBe(false);
+
+			finishPrompt();
+			expect((await parentTurn).stopReason).toBe("end_turn");
+			harness.abortController.abort();
+		});
+
+		it("settles a cancelled task run as aborted and reports the child idle/cancelled", async () => {
+			const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const artifactsDir = await transcriptDir();
+			const id = "Worker";
+			const child = `${created.sessionId}:subagent:${id}`;
+			const promptEntered = Promise.withResolvers<void>();
+			// Minimal session whose turn never finishes on its own: only a cancel can end the run.
+			const subagentSession = {
+				state: { messages: [] },
+				agent: { state: { systemPrompt: ["test"] } },
+				model: undefined,
+				extensionRunner: undefined,
+				sessionManager: { appendSessionInit: () => {} },
+				getActiveToolNames: () => ["read", "yield"],
+				getEnabledToolNames: () => ["read", "yield"],
+				getToolByName: () => undefined,
+				setActiveToolsByName: async () => {},
+				setWorkPoolYieldItems: () => {},
+				subscribe: () => () => {},
+				prompt: async () => {
+					promptEntered.resolve();
+					await Promise.withResolvers<never>().promise;
+				},
+				waitForIdle: async () => {},
+				isAdvisorActive: () => false,
+				prepareForHeadlessAdvisorDrain: () => {},
+				waitForAdvisorCatchup: async () => true,
+				getLastAssistantMessage: () => undefined,
+				hasPendingAsyncWork: () => false,
+				getAsyncJobSnapshot: () => ({ running: [], recent: [] }),
+				settleAsyncWork: async () => {},
+				abort: async () => {},
+				dispose: async () => {},
+				setIrcWakeTurnObserver: () => {},
+				trackIrcReply: () => {},
+				holdIrcWakes: () => () => {},
+				subscribeRunState: () => () => {},
+				addDisposer: () => {},
+			} as unknown as AgentSession;
+			AgentRegistry.global().register({
+				id,
+				displayName: id,
+				kind: "sub",
+				session: subagentSession,
+				sessionFile: path.join(artifactsDir, `${id}.jsonl`),
+				status: "running",
+			});
+			vi.spyOn(sdkModule, "createAgentSession").mockResolvedValue({
+				session: subagentSession,
+				extensionsResult: {},
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} as unknown as CreateAgentSessionResult);
+			const agentDefinition: AgentDefinition = {
+				name: "task",
+				description: "test",
+				systemPrompt: "test",
+				source: "bundled",
+			};
+
+			const run = runSubprocess({
+				cwd: artifactsDir,
+				agent: agentDefinition,
+				task: "work",
+				index: 0,
+				id,
+				eventBus: bus,
+				artifactsDir,
+			});
+			await promptEntered.promise;
+			await harness.agent.cancel({ sessionId: child });
+
+			expect((await run).aborted).toBe(true);
+			await Bun.sleep(0);
+			expect(childPatches(harness, child).at(-1)).toEqual({
+				sessionUpdate: "subagent_update",
+				sessionId: child,
+				state: { state: "idle", stopReason: "cancelled" },
+				capabilities: null,
+			});
+			harness.abortController.abort();
+		});
+
+		it("ignores cancel for unknown and finished children", async () => {
+			const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const dir = await transcriptDir();
+			const calls: string[] = [];
+			lifecycle(bus, "Done", "started", { sessionFile: path.join(dir, "Done.jsonl") });
+			lifecycle(bus, "Done", "completed");
+			// The registry still holds a running ref under that id (e.g. a rerun the relay has not seen).
+			registerLiveAgent("Done", path.join(dir, "Done.jsonl"), calls);
+
+			await harness.agent.cancel({ sessionId: `${created.sessionId}:subagent:Done` });
+			await harness.agent.cancel({ sessionId: `${created.sessionId}:subagent:Missing` });
+
+			expect(calls).toEqual([]);
+			expect(AgentRegistry.global().get("Done")?.status).toBe("running");
+			harness.abortController.abort();
+		});
+
+		it("neither advertises nor honors child cancel for a JetBrains AIR client", async () => {
+			const harness = await createHarness({
+				clientCapabilities: {
+					subagents: {},
+					_meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+				} as ClientCapabilities,
+			});
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const dir = await transcriptDir();
+			const calls: string[] = [];
+			const child = `${created.sessionId}:subagent:Worker`;
+			lifecycle(bus, "Worker", "started", { sessionFile: path.join(dir, "Worker.jsonl") });
+			registerLiveAgent("Worker", path.join(dir, "Worker.jsonl"), calls);
+
+			await harness.agent.cancel({ sessionId: child });
+			lifecycle(bus, "Worker", "completed");
+			await Bun.sleep(0);
+
+			expect(calls).toEqual([]);
+			expect(childPatches(harness, child).some(update => "capabilities" in update)).toBe(false);
+			harness.abortController.abort();
+		});
 	});
 });
 
