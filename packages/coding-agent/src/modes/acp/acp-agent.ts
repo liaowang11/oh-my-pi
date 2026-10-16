@@ -88,6 +88,7 @@ import {
 } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
+import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import {
 	bashExecutionToText,
@@ -2384,6 +2385,9 @@ export class AcpAgent implements Agent {
 				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
 				// AIR never offers child cancel (claude-agent-acp parity).
 				cancellable: !isAirClient(this.#clientCapabilities),
+				airClient: isAirClient(this.#clientCapabilities),
+				// A child mounts its parent's MCP tools under the same names.
+				lookupTool: name => session.getToolByName(name),
 			});
 		}
 		// Secondary in-process sessions own no job manager (issue #1923): no relay.
@@ -2727,6 +2731,8 @@ export class AcpAgent implements Agent {
 			getToolArgs: toolCallId => record.toolArgsById.get(toolCallId),
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
+			airClient: isAirClient(this.#clientCapabilities),
+			lookupTool: name => record.session.getToolByName(name),
 		})) {
 			const delivery = this.#connection.sessionUpdate(
 				this.#withPlanFilePath(record, this.#stampBackgroundedToolCall(record, notification)),
@@ -4598,7 +4604,7 @@ export class AcpAgent implements Agent {
 								args,
 							},
 							sessionId,
-							{ cwd },
+							{ cwd, ...this.#replayToolMetaOptions(sessionId) },
 						),
 					);
 					replayedToolCallIds.add(toolItem.id);
@@ -4675,15 +4681,35 @@ export class AcpAgent implements Agent {
 				errorMessage: message.errorMessage,
 			},
 		};
+		const metaOptions = this.#replayToolMetaOptions(sessionId);
 		const notifications = mapAgentSessionEventToAcpSessionUpdates(endEvent, sessionId, {
 			cwd,
+			...metaOptions,
 			getToolArgs: toolCallId => (toolCallId === message.toolCallId ? options.toolArgs : undefined),
 			resolveImageData: (data, _mimeType) => resolveImageDataSync(this.#blobs, data),
 		});
 		if (options.includeStart === false) {
 			return notifications;
 		}
-		return [...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, { cwd }), ...notifications];
+		return [
+			...mapAgentSessionEventToAcpSessionUpdates(startEvent, sessionId, { cwd, ...metaOptions }),
+			...notifications,
+		];
+	}
+
+	/**
+	 * The tool-call `_meta` options of a replay: an MCP call is tagged only while
+	 * the open session still has its tool registered.
+	 */
+	#replayToolMetaOptions(sessionId: string): {
+		airClient: boolean;
+		lookupTool: (toolName: string) => MountedMCPToolRouteSource | undefined;
+	} {
+		const session = this.#sessions.get(sessionId)?.session;
+		return {
+			airClient: isAirClient(this.#clientCapabilities),
+			lookupTool: name => session?.getToolByName(name),
+		};
 	}
 
 	#buildReplayToolArgs(details: unknown): { path?: string } {

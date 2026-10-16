@@ -1302,3 +1302,88 @@ describe("ACP event mapper", () => {
 		});
 	});
 });
+
+describe("ACP tool-call _meta", () => {
+	const metaOf = (notifications: SessionNotification[]): Record<string, unknown> | null | undefined => {
+		const { update } = notifications[0]!;
+		if (update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") {
+			throw new Error(`Expected a tool call update, got ${update.sessionUpdate}`);
+		}
+		return update._meta;
+	};
+	const start = (toolName: string, intent?: string): AgentSessionEvent => ({
+		type: "tool_execution_start",
+		toolCallId: "call-1",
+		toolName,
+		args: { command: "bun test" },
+		intent,
+	});
+	const end = (toolName: string, details: unknown, isError = true): AgentSessionEvent => ({
+		type: "tool_execution_end",
+		toolCallId: "call-1",
+		toolName,
+		result: { content: [{ type: "text", text: "Tool call rejected by user (bash)" }], details },
+		isError,
+	});
+	const mcpLookup = (name: string) => (name === "docs_search" ? { name, mcpServerName: "docs" } : { name });
+
+	it("names the omp tool on the start, progress, and final updates for every client", () => {
+		const progress: AgentSessionEvent = {
+			type: "tool_execution_update",
+			toolCallId: "call-1",
+			toolName: "bash",
+			args: { command: "bun test" },
+			partialResult: { content: [{ type: "text", text: "running" }] },
+		};
+		for (const event of [start("bash", "Run the tests"), progress, end("bash", {}, false)]) {
+			const notifications = mapAgentSessionEventToAcpSessionUpdates(event, "session-1");
+			expectAcpNotifications(notifications);
+			expect(metaOf(notifications)).toEqual({ claudeCode: { toolName: "bash" } });
+		}
+	});
+
+	it("gives an AIR client the command title, subagent flag, and MCP tag on the tool call", () => {
+		const air = { airClient: true, lookupTool: mcpLookup };
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("bash", "Run the tests"), "s", air))).toEqual({
+			claudeCode: { toolName: "bash" },
+			jetbrains: { air: { version: 1, commandTitle: "Run the tests" } },
+		});
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("task", "Review the diff"), "s", air))).toEqual({
+			claudeCode: { toolName: "task" },
+			jetbrains: { air: { version: 1, subagent: true } },
+		});
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("docs_search"), "s", air))).toEqual({
+			claudeCode: { toolName: "docs_search" },
+			is_mcp_tool_call: true,
+		});
+		// The name looks like an MCP tool, but the registry says it is not one.
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("mcp__fake_tool"), "s", air))).toEqual({
+			claudeCode: { toolName: "mcp__fake_tool" },
+		});
+		// A plain client gets only the tool name, even with a registry to look in.
+		const plain = { lookupTool: mcpLookup };
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("bash", "Run the tests"), "s", plain))).toEqual({
+			claudeCode: { toolName: "bash" },
+		});
+		expect(metaOf(mapAgentSessionEventToAcpSessionUpdates(start("docs_search"), "s", plain))).toEqual({
+			claudeCode: { toolName: "docs_search" },
+		});
+	});
+
+	it("says why a failed call never ran, and stays silent on a real failure", () => {
+		const kindOf = (event: AgentSessionEvent) => {
+			const claudeCode = metaOf(mapAgentSessionEventToAcpSessionUpdates(event, "s"))?.claudeCode as
+				| { nonExecutionKind?: string }
+				| undefined;
+			return claudeCode?.nonExecutionKind;
+		};
+		expect(kindOf(end("bash", { nonExecution: "user-rejected" }))).toBe("user-rejected");
+		expect(kindOf(end("bash", { __synthetic: true, source: "assistant_stop_aborted", executed: false }))).toBe(
+			"interrupted",
+		);
+		expect(kindOf(end("bash", {}))).toBeUndefined();
+		expect(kindOf(end("bash", { exitCode: 1 }))).toBeUndefined();
+		// A completed call never reports a non-execution, whatever its details hold.
+		expect(kindOf(end("bash", { nonExecution: "user-rejected" }, false))).toBeUndefined();
+	});
+});
