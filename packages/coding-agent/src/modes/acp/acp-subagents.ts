@@ -7,6 +7,7 @@ import type {
 import { logger } from "@oh-my-pi/pi-utils";
 import { cancelLiveSubagent } from "../../registry/cancel-subagent";
 import type { AgentSessionEvent } from "../../session/agent-session";
+import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import {
 	type SubagentEventPayload,
 	type SubagentLifecyclePayload,
@@ -74,6 +75,10 @@ export interface AcpSubagentRelayOptions {
 	resolveImageData?: (data: string, mimeType: string | undefined) => string;
 	/** Whether the client may cancel a running child with `session/cancel` on its id. */
 	cancellable: boolean;
+	/** Whether the client is an AIR client (see the event mapper's option). */
+	airClient?: boolean;
+	/** Registered tool lookup for the MCP tag (see the event mapper's option). */
+	lookupTool?: (toolName: string) => MountedMCPToolRouteSource | undefined;
 }
 
 const IDLE_STATE: Record<Exclude<SubagentLifecyclePayload["status"], "started">, SubagentWorkState> = {
@@ -292,6 +297,8 @@ export class AcpSubagentRelay {
 			getToolArgs: toolCallId => child.toolArgsById.get(toolCallId),
 			cwd: this.#options.getCwd(),
 			resolveImageData: this.#options.resolveImageData,
+			airClient: this.#options.airClient,
+			lookupTool: this.#options.lookupTool,
 		});
 		if (event.type === "tool_execution_end") child.toolArgsById.delete(event.toolCallId);
 		if (event.type === "message_end" && event.message.role === "assistant") {
