@@ -454,6 +454,7 @@
 - ACP clients now see context compactions, automatic and `/compact`: a `compaction_update` lifecycle carrying the summary when they declare `session.compaction`, otherwise a "Compact conversation" tool call that shows the summary (a skipped compaction shows "Compaction skipped" rather than failing); `session/load` replays past compactions the same way, and JetBrains AIR clients get the token counts and duration.
 - ACP clients that declare `plan` now get an approved plan-mode plan as a markdown `plan_update`; JetBrains AIR clients can declare `planFile` to have the plan proposal name the plan file and clear it on approval.
 - JetBrains AIR clients can set or clear a session's goal with `_session/goal` (setting on a running turn changes the goal without interrupting it) and see the goal's state in `session_info_update`.
+- JetBrains AIR clients with `sessionIndex` can subscribe to a project's session list with `_session/list/subscribe` and get `_session/list/changes` notifications as sessions are created, run, renamed, archived or deleted (`sessionListSubscribe`).
 
 ## [18.11.1] - 2026-10-15
 

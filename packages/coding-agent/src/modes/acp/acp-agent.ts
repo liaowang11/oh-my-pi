@@ -103,7 +103,7 @@ import {
 	type SessionInfo as StoredSessionInfo,
 } from "../../session/session-listing";
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
-import { isAgentManagedWorktree } from "../../session/session-paths";
+import { isAgentManagedWorktree, worktreeSessionDirs } from "../../session/session-paths";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
@@ -166,6 +166,7 @@ import {
 	textNotice,
 } from "./acp-notices";
 import {
+	type ArchivedFilter,
 	clientSupportsSessionIndex,
 	compareSessionIndexPositions,
 	decodeSessionIndexCursor,
@@ -183,6 +184,15 @@ import {
 	sessionIndexCapabilities,
 	sessionNotFound,
 } from "./acp-session-index";
+import {
+	LIST_CHANGES_METHOD,
+	LIST_SUBSCRIBE_METHOD,
+	LIST_UNSUBSCRIBE_METHOD,
+	parseListSubscribeRequest,
+	parseListUnsubscribeRequest,
+	SessionListSubscriptions,
+	type SessionListTiming,
+} from "./acp-session-list-subscriptions";
 import {
 	AcpAsyncTaskRelay,
 	ASYNC_TASK_STOP_METHOD,
@@ -1188,6 +1198,9 @@ export class AcpAgent implements Agent {
 	/** Serializes rename/archive/unarchive, so two of them never interleave on one session's title slot. */
 	#sessionIndexQueue: Promise<void> = Promise.resolve();
 	#cancelCleanupTimeoutMs = ACP_CANCEL_CLEANUP_TIMEOUT_MS;
+	#sessionListTiming: SessionListTiming = {};
+	/** `_session/list/subscribe` state; set up for a `sessionIndex` client at its first subscribe. */
+	#listSubscriptions: SessionListSubscriptions | undefined;
 	#blobs = new BlobStore(getBlobsDir());
 
 	constructor(connection: AgentSideConnection, createSession: CreateAcpSession, initialSession?: AgentSession) {
@@ -1198,6 +1211,11 @@ export class AcpAgent implements Agent {
 
 	setCancelCleanupTimeoutForTesting(timeoutMs: number): void {
 		this.#cancelCleanupTimeoutMs = Math.max(1, timeoutMs);
+	}
+
+	/** Shorten the live session list's coalescing and rescan intervals; applies to later subscriptions. */
+	setSessionListTimingForTesting(timing: SessionListTiming): void {
+		this.#sessionListTiming = timing;
 	}
 
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
@@ -1283,6 +1301,7 @@ export class AcpAgent implements Agent {
 	async newSession(params: NewSessionRequest): Promise<NewSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#createNewSessionRecord(params.cwd, params.mcpServers);
+		this.#sessionListChanged();
 		const response: NewSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
@@ -1353,6 +1372,7 @@ export class AcpAgent implements Agent {
 	async unstable_forkSession(params: ForkSessionRequest): Promise<ForkSessionResponse> {
 		this.#assertAbsoluteCwd(params.cwd);
 		const record = await this.#forkManagedSession(params);
+		this.#sessionListChanged();
 		const response: ForkSessionResponse = {
 			sessionId: record.session.sessionId,
 			configOptions: this.#buildConfigOptions(record.session),
@@ -1383,7 +1403,7 @@ export class AcpAgent implements Agent {
 	async deleteSession(params: DeleteSessionRequest): Promise<DeleteSessionResponse> {
 		const { sessionId } = params;
 		if (isSubagentSessionId(sessionId)) return {};
-		return await this.#runSessionIndexOperation(async () => {
+		const result = await this.#runSessionIndexOperation(async () => {
 			if (!this.#sessionIndex && isAirClient(this.#clientCapabilities)) {
 				try {
 					return await this.#setSessionArchived(sessionId, true);
@@ -1394,6 +1414,8 @@ export class AcpAgent implements Agent {
 			}
 			return await this.#deleteStoredSession(sessionId);
 		});
+		this.#sessionListChanged();
+		return result;
 	}
 
 	async #deleteStoredSession(sessionId: string): Promise<{ [key: string]: unknown }> {
@@ -1556,6 +1578,7 @@ export class AcpAgent implements Agent {
 
 				// A client prompt starts a fresh continuation chain, as a typed TUI message does.
 				record.goalContinuation.pendingTurns = 0;
+				this.#sessionListChanged();
 				record.promptTurn.unsubscribe = record.session.subscribe(event => {
 					this.#trackPromptEvent(record, event);
 				});
@@ -1949,14 +1972,29 @@ export class AcpAgent implements Agent {
 			case SESSION_RENAME_METHOD: {
 				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
 				const request = parseRenameSessionRequest(params);
-				return await this.#runSessionIndexOperation(() => this.#renameSession(request));
+				const result = await this.#runSessionIndexOperation(() => this.#renameSession(request));
+				this.#sessionListChanged();
+				return result;
 			}
 			case SESSION_ARCHIVE_METHOD:
 			case SESSION_UNARCHIVE_METHOD: {
 				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
 				const { sessionId } = parseSessionIdRequest(params);
 				const archived = method === SESSION_ARCHIVE_METHOD;
-				return await this.#runSessionIndexOperation(() => this.#setSessionArchived(sessionId, archived));
+				const result = await this.#runSessionIndexOperation(() => this.#setSessionArchived(sessionId, archived));
+				this.#sessionListChanged();
+				return result;
+			}
+			case LIST_SUBSCRIBE_METHOD: {
+				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
+				const { cwd } = parseListSubscribeRequest(params);
+				return await this.#sessionListSubscriptions().subscribe(cwd);
+			}
+			case LIST_UNSUBSCRIBE_METHOD: {
+				if (!this.#sessionIndex) throw RequestError.methodNotFound(method);
+				const { subscriptionId } = parseListUnsubscribeRequest(params);
+				this.#listSubscriptions?.unsubscribe(subscriptionId);
+				return {};
 			}
 			case GOAL_CONTROL_METHOD:
 				if (!isAirClient(this.#clientCapabilities)) throw RequestError.methodNotFound(method);
@@ -3073,6 +3111,7 @@ export class AcpAgent implements Agent {
 		}
 		promptTurn.settled = true;
 		promptTurn.unsubscribe?.();
+		this.#sessionListChanged();
 		// Keep the slot occupied until cancel cleanup finishes — `#runCancelCleanup`
 		// evicts the slot in its finally block once both flags say it's safe.
 		if (!promptTurn.cleanup && record.promptTurn === promptTurn) {
@@ -3759,6 +3798,26 @@ export class AcpAgent implements Agent {
 		const requestCwd = params.cwd ?? undefined;
 		const scope = { cwd: requestCwd ?? null, includeWorktrees: options.includeWorktrees, archived: options.archived };
 		const after = params.cursor ? decodeSessionIndexCursor(params.cursor, scope) : undefined;
+		const rows = await this.#collectSessionIndexRows(requestCwd, options);
+		const remaining = after ? rows.filter(row => compareSessionIndexPositions(row.position, after) > 0) : rows;
+		const page = remaining.slice(0, options.limit);
+		const last = page.at(-1);
+		const agentWorktrees = new Map<string, boolean>();
+		return {
+			sessions: page.map(row => this.#toSessionIndexRow(row.session, row.updatedAtMs, agentWorktrees)),
+			nextCursor:
+				last && remaining.length > page.length ? encodeSessionIndexCursor(last.position, scope) : undefined,
+		};
+	}
+
+	/**
+	 * Every `sessionIndex` row of `requestCwd` (all projects without one) in
+	 * list order, for `session/list` pages and the live list alike.
+	 */
+	async #collectSessionIndexRows(
+		requestCwd: string | undefined,
+		options: { includeWorktrees: boolean; archived: ArchivedFilter },
+	): Promise<Array<{ session: StoredSessionInfo; position: SessionIndexPosition; updatedAtMs: number }>> {
 		const stored = (
 			requestCwd ? await SessionManager.listForPicker(requestCwd) : await SessionManager.listAllForPicker()
 		).sort((left, right) => right.modified.getTime() - left.modified.getTime());
@@ -3782,18 +3841,50 @@ export class AcpAgent implements Agent {
 			rows.push({ session, updatedAtMs, position: { orderAtMs, sessionId: session.id } });
 		}
 		rows.sort((left, right) => compareSessionIndexPositions(left.position, right.position));
-		const remaining = after ? rows.filter(row => compareSessionIndexPositions(row.position, after) > 0) : rows;
-		const page = remaining.slice(0, options.limit);
-		const last = page.at(-1);
-		return {
-			sessions: page.map(row => this.#toSessionIndexRow(row.session, row.updatedAtMs)),
-			nextCursor:
-				last && remaining.length > page.length ? encodeSessionIndexCursor(last.position, scope) : undefined,
-		};
+		return rows;
 	}
 
-	/** A list row with its AIR fields; a session loaded here reports its live state, model and cost. */
-	#toSessionIndexRow(session: StoredSessionInfo, updatedAtMs: number): SessionInfo {
+	/** The live list's view of `cwd`: the `session/list` rows of every archive state, worktrees included. */
+	async #sessionListRows(cwd: string): Promise<SessionInfo[]> {
+		for (const record of this.#sessions.values()) {
+			await record.session.sessionManager.flush();
+		}
+		const rows = await this.#collectSessionIndexRows(cwd, { includeWorktrees: true, archived: "all" });
+		const agentWorktrees = new Map<string, boolean>();
+		return rows.map(row => this.#toSessionIndexRow(row.session, row.updatedAtMs, agentWorktrees));
+	}
+
+	/** The session directories behind {@link #sessionListRows}: the cwd's own and its worktrees'. */
+	async #sessionListDirs(cwd: string): Promise<string[]> {
+		const own = SessionManager.getDefaultSessionDir(cwd);
+		return [own, ...(await worktreeSessionDirs(cwd, own))];
+	}
+
+	#sessionListSubscriptions(): SessionListSubscriptions {
+		this.#listSubscriptions ??= new SessionListSubscriptions({
+			...this.#sessionListTiming,
+			rows: cwd => this.#sessionListRows(cwd),
+			dirs: cwd => this.#sessionListDirs(cwd),
+			notify: changes => this.#connection.extNotification(LIST_CHANGES_METHOD, changes),
+		});
+		return this.#listSubscriptions;
+	}
+
+	/** One of this connection's sessions changed its list row: live list subscribers recompute. */
+	#sessionListChanged(): void {
+		this.#listSubscriptions?.markDirty();
+	}
+
+	/**
+	 * A list row with its AIR fields; a session loaded here reports its live state, model and cost.
+	 * `agentWorktrees` memoizes the worktree check per cwd for one list build only, so a
+	 * removed worktree is noticed on the next build.
+	 */
+	#toSessionIndexRow(
+		session: StoredSessionInfo,
+		updatedAtMs: number,
+		agentWorktrees: Map<string, boolean>,
+	): SessionInfo {
 		const base = this.#toSessionInfo(session);
 		const record = this.#sessions.get(session.id);
 		const activity = session.activity;
@@ -3808,7 +3899,14 @@ export class AcpAgent implements Agent {
 		if (activity?.lastTurnEndedAt) fields.lastTurnEndedAt = activity.lastTurnEndedAt;
 		const cost = record?.session.sessionManager.getUsageStatistics().cost ?? 0;
 		if (cost > 0) fields.cost = { amount: cost, currency: "USD" };
-		if (session.cwd && isAgentManagedWorktree(session.cwd)) fields.agentWorktree = true;
+		if (session.cwd) {
+			let agentWorktree = agentWorktrees.get(session.cwd);
+			if (agentWorktree === undefined) {
+				agentWorktree = isAgentManagedWorktree(session.cwd);
+				agentWorktrees.set(session.cwd, agentWorktree);
+			}
+			if (agentWorktree) fields.agentWorktree = true;
+		}
 		return {
 			...base,
 			updatedAt: new Date(updatedAtMs).toISOString(),
@@ -4867,6 +4965,7 @@ export class AcpAgent implements Agent {
 		this.#sessions.delete(sessionId);
 		await this.#cancelPromptForClose(record);
 		await this.#disposeSessionRecord(record);
+		this.#sessionListChanged();
 	}
 
 	async #cancelPromptForClose(record: ManagedSessionRecord): Promise<void> {
@@ -4918,6 +5017,8 @@ export class AcpAgent implements Agent {
 		}
 
 		this.#disposePromise = (async () => {
+			this.#listSubscriptions?.dispose();
+			this.#listSubscriptions = undefined;
 			const records = Array.from(this.#sessions.entries());
 			this.#sessions.clear();
 			await Promise.all(
