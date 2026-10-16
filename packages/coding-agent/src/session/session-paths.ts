@@ -254,6 +254,21 @@ export async function worktreeSessionDirs(cwd: string, sessionDir: string): Prom
 	}
 }
 
+/**
+ * Whether `cwd` sits in a worktree omp made: under the agent worktree base
+ * (`/wt`, PR checkouts, task isolation all live there) and, right now, inside
+ * a linked git worktree. A removed worktree's path no longer exists, so it
+ * fails; nothing is cached.
+ */
+export function isAgentManagedWorktree(cwd: string): boolean {
+	try {
+		if (!pathIsWithin(resolveEquivalentPath(getWorktreesDir()), fs.realpathSync(cwd))) return false;
+		return Boolean(vcs.git(cwd)?.linkedWorktree());
+	} catch {
+		return false;
+	}
+}
+
 /** Stand-in worktree name: encoding a path through it yields the name around any managed worktree's. */
 const WORKTREE_NAME_PROBE = "{worktree}";
 
