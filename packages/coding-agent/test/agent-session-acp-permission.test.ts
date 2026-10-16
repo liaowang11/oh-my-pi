@@ -12,6 +12,7 @@ import { createMockModel, type MockModelOptions } from "@oh-my-pi/pi-ai/provider
 import { AssistantMessageEventStream } from "@oh-my-pi/pi-ai/utils/event-stream";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
 import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { createAcpClientBridge } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-client-bridge";
 import { EditTool } from "@oh-my-pi/pi-coding-agent/edit";
 import { callSessionTool } from "@oh-my-pi/pi-coding-agent/eval/js/tool-bridge";
 import type { ExtensionRunner } from "@oh-my-pi/pi-coding-agent/extensibility/extensions/runner";
@@ -31,6 +32,7 @@ import { EvalTool } from "@oh-my-pi/pi-coding-agent/tools/eval";
 import { computerTurnInFlight, registerComputerController } from "@oh-my-pi/pi-coding-agent/tools/computer/supervisor";
 import { dispatchXdevTool, resolveMountedXdevExecutable, type XdevState } from "@oh-my-pi/pi-coding-agent/tools/xdev";
 import { TempDir, withTimeout } from "@oh-my-pi/pi-utils";
+import { AgentSideConnection, type AnyMessage } from "@oh-my-pi/pi-utils/acp";
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -1082,6 +1084,43 @@ it("tags an aborted permission request as cancelled", async () => {
 	expect(await nonExecutionOf(execution)).toBe("cancelled");
 	expect(await nonExecutionOf(call(AbortSignal.abort()))).toBe("cancelled");
 	pending.resolve({ outcome: "cancelled" });
+});
+
+it("cancelling a turn withdraws its open ACP permission request and tags the call cancelled", async () => {
+	const toClient = new TransformStream<AnyMessage, AnyMessage>();
+	const fromClient = new TransformStream<AnyMessage, AnyMessage>();
+	const connection = new AgentSideConnection(
+		() => ({
+			initialize: params => ({ protocolVersion: params.protocolVersion }),
+			newSession: async () => ({ sessionId: "s" }),
+			prompt: async () => ({ stopReason: "end_turn" }),
+			cancel: async () => {},
+		}),
+		{ writable: toClient.writable, readable: fromClient.readable },
+	);
+	const reader = toClient.readable.getReader();
+	const bashTool = makeFakeTool("bash");
+	session = await createSessionWithMockModel([bashTool], createAcpClientBridge(connection, "s", {}), [
+		{ content: [{ type: "toolCall", id: "call-rm", name: "bash", arguments: { command: "rm -rf build" } }] },
+		{ content: ["done"] },
+	]);
+	const results: unknown[] = [];
+	session.subscribe(event => {
+		if (event.type === "tool_execution_end") results.push(event.result);
+	});
+
+	const prompt = session.prompt("clean up").catch(() => {});
+	const sent = await reader.read();
+	if (sent.done || !("id" in sent.value) || !("method" in sent.value)) throw new Error("Expected a request");
+	expect(sent.value.method).toBe("session/request_permission");
+
+	await session.abort();
+	const cancel = await reader.read();
+	expect(cancel.value).toEqual({ jsonrpc: "2.0", method: "$/cancel_request", params: { requestId: sent.value.id } });
+	await prompt;
+	expect(results).toEqual([expect.objectContaining({ details: { nonExecution: "cancelled" } })]);
+	expect(bashTool.executeCalls).toBe(0);
+	reader.releaseLock();
 });
 
 it("unknown selected permission option ID fails closed without executing", async () => {
