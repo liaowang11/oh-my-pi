@@ -68,6 +68,7 @@ import {
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
+	withNonExecution,
 } from "./acp-permission-gate";
 import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
 import { type BuildSystemPromptResult, toolReadsSkillUris } from "../system-prompt";
@@ -1256,7 +1257,9 @@ export class SessionTools {
 							restrictions,
 							ctx,
 						);
-						if (resolved.policy === "deny") throw denyError(resolved, target.name);
+						if (resolved.policy === "deny") {
+							throw withNonExecution(denyError(resolved, target.name), "permission-rule");
+						}
 						if (resolved.policy === "allow") {
 							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
 						}
@@ -1284,10 +1287,10 @@ export class SessionTools {
 						return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
 					}
 					if (persisted === "reject_always") {
-						throw new ToolError(`Tool call rejected by user (preference)`);
+						throw withNonExecution(new ToolError(`Tool call rejected by user (preference)`), "permission-rule");
 					}
 					if (signal?.aborted) {
-						throw new ToolAbortError("Permission request cancelled");
+						throw withNonExecution(new ToolAbortError("Permission request cancelled"), "cancelled");
 					}
 					type PermissionRaceResult =
 						| { kind: "permission"; outcome: ClientBridgePermissionOutcome }
@@ -1427,11 +1430,11 @@ export class SessionTools {
 						throw new ToolAbortError("Permission request superseded by user steering");
 					}
 					if (raced.kind === "aborted" || signal?.aborted) {
-						throw new ToolAbortError("Permission request cancelled");
+						throw withNonExecution(new ToolAbortError("Permission request cancelled"), "cancelled");
 					}
 					const outcome = raced.outcome;
 					if (outcome.outcome === "cancelled") {
-						throw new ToolAbortError("Permission request cancelled");
+						throw withNonExecution(new ToolAbortError("Permission request cancelled"), "cancelled");
 					}
 					const selectedOption = PERMISSION_OPTIONS_BY_ID.get(outcome.optionId);
 					if (!selectedOption) {
@@ -1443,7 +1446,10 @@ export class SessionTools {
 						this.#acpPermissionDecisions.set(permissionIntent.cacheKey, "reject_always");
 					}
 					if (selectedOption.kind === "reject_once" || selectedOption.kind === "reject_always") {
-						throw new ToolError(`Tool call rejected by user (${target.name})`);
+						throw withNonExecution(
+							new ToolError(`Tool call rejected by user (${target.name})`),
+							selectedOption.kind === "reject_once" ? "user-rejected" : "permission-rule",
+						);
 					}
 					return await target.execute(toolCallId, args as never, signal, onUpdate, approvedCtx);
 				};

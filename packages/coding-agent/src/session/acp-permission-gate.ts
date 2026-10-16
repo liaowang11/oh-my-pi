@@ -3,6 +3,21 @@ import { isRecord, stringProperty } from "@oh-my-pi/pi-utils";
 import { resolveToCwd } from "../tools/path-utils";
 import type { ClientBridgePermissionOption } from "./client-bridge";
 
+/**
+ * Why a gated call never ran, in claude-agent-acp's `nonExecutionKind` terms:
+ * the user rejected it once, a decision or policy refused it, or the request
+ * was cancelled.
+ */
+export type PermissionNonExecutionKind = "user-rejected" | "permission-rule" | "cancelled";
+
+/**
+ * Tag a permission refusal with its {@link PermissionNonExecutionKind}. The
+ * agent loop keeps the tag as the failed result's `details.nonExecution`.
+ */
+export function withNonExecution<E extends Error>(error: E, kind: PermissionNonExecutionKind): E {
+	return Object.assign(error, { nonExecution: kind });
+}
+
 /** Tools that require user permission before execution when an ACP client is connected. */
 export const PERMISSION_REQUIRED_TOOLS: Record<string, true> = {
 	bash: true,
