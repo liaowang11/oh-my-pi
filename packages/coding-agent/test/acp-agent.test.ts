@@ -397,6 +397,7 @@ class FakeAgentSession {
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
 
 	contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
+	configWarnings: string[] = [];
 	getContextUsage(): { tokens: number; contextWindow: number; percent: number } | undefined {
 		return this.contextUsage;
 	}
@@ -2342,6 +2343,91 @@ describe("ACP agent", () => {
 		const manual = harness.updates.length;
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
 		expect(usageUpdates(manual)).toEqual([12_000]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("sends session notices as `notice` updates to a client that declares session.notices", async () => {
+		const harness = await createHarness({ clientCapabilities: { session: { notices: {} } } });
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const before = harness.updates.length;
+		const emit = (event: unknown) => {
+			for (const listener of session.listeners()) listener(event as AgentSessionEvent);
+		};
+		emit({ type: "notice", level: "info", message: "Plan autosaved.", source: "plan-yolo" });
+		emit({ type: "retry_fallback_applied", from: "a/one", to: "b/two", role: "default", reason: "rate limited" });
+		emit({ type: "auto_retry_end", success: false, attempt: 3, finalError: "overloaded" });
+		emit({ type: "auto_retry_end", success: true, attempt: 2 });
+		session.configWarnings.push("retry.fallbackChains names unknown model x/y");
+		emit({ type: "config_warnings_changed" });
+		emit({ type: "config_warnings_changed" });
+		await Bun.sleep(0);
+
+		const sent = harness.updates.slice(before).filter(update => update.sessionId === created.sessionId);
+		expectAcpNotifications(sent);
+		expect(sent.map(update => update.update)).toEqual([
+			{ sessionUpdate: "notice", severity: "info", title: "plan-yolo: Plan autosaved." },
+			{
+				sessionUpdate: "notice",
+				severity: "warning",
+				title: "Fallback: a/one -> b/two",
+				description: "rate limited",
+			},
+			{
+				sessionUpdate: "notice",
+				severity: "error",
+				title: "Retry failed after 3 attempts",
+				description: "overloaded",
+			},
+			{ sessionUpdate: "notice", severity: "warning", title: "retry.fallbackChains names unknown model x/y" },
+		]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("sends a session notice as its own bold message line to a client without session.notices", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const message = makeAssistantMessage("Before and after.");
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			const emit = (event: unknown) => {
+				for (const listener of session.listeners()) listener(event as AgentSessionEvent);
+			};
+			emit({ type: "message_start", message });
+			emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "Before " } });
+			emit({ type: "notice", level: "warning", message: "Usage reserve reached." });
+			emit({ type: "message_update", message, assistantMessageEvent: { type: "text_delta", delta: "and after." } });
+			emit({ type: "message_end", message });
+			emit({ type: "agent_end", messages: [message] });
+			session.isStreaming = false;
+			return true;
+		};
+
+		const before = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "go" }] });
+		const chunks = harness.updates
+			.slice(before)
+			.filter(update => update.sessionId === created.sessionId)
+			.map(update => update.update)
+			.filter(update => update.sessionUpdate === "agent_message_chunk") as Array<{
+			content: { text: string };
+			messageId?: string;
+		}>;
+		expect(chunks.map(chunk => chunk.content.text)).toEqual(["Before ", "**Usage reserve reached.**", "and after."]);
+		expect(chunks[0]!.messageId).toBe(chunks[2]!.messageId);
+		expect(chunks[1]!.messageId).toBeString();
+		expect(chunks[1]!.messageId).not.toBe(chunks[0]!.messageId);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -4462,6 +4548,31 @@ describe("ACP agent", () => {
 		expect(messages).toEqual(["Spend a saved reset?"]);
 
 		await harness.agent.dispose();
+	});
+
+	it("sends an extension ui.notify to the client as a notice, or as a bold line without session.notices", async () => {
+		const sent: SessionNotification[] = [];
+		const connection = {
+			sessionUpdate: async (notification: SessionNotification) => {
+				sent.push(notification);
+			},
+		} as unknown as AgentSideConnection;
+		createAcpExtensionUiContext(connection, () => "s-notices", { session: { notices: {} } }).notify(
+			"Index rebuilt\nTook 3s",
+			"warning",
+		);
+		createAcpExtensionUiContext(connection, () => "s-plain", undefined).notify("Index rebuilt");
+		await Bun.sleep(0);
+
+		expectAcpNotifications(sent);
+		expect(sent[0]).toEqual({
+			sessionId: "s-notices",
+			update: { sessionUpdate: "notice", severity: "warning", title: "Index rebuilt", description: "Took 3s" },
+		});
+		expect(sent[1]).toMatchObject({
+			sessionId: "s-plain",
+			update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "**Index rebuilt**" } },
+		});
 	});
 
 	describe("ACP elicitation bridge", () => {

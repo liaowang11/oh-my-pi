@@ -134,6 +134,14 @@ import {
 	withAirMeta,
 } from "./acp-air";
 import {
+	clientSupportsNotices,
+	mapSessionNoticeEvent,
+	newConfigWarningNotices,
+	noticeOrTranscriptUpdate,
+	type SessionNotice,
+	textNotice,
+} from "./acp-notices";
+import {
 	clientSupportsSessionIndex,
 	compareSessionIndexPositions,
 	decodeSessionIndexCursor,
@@ -475,6 +483,8 @@ type ManagedSessionRecord = {
 	// The `usage_update` values last sent, so a reading that did not change
 	// since the last assistant message, compaction, or bootstrap is not repeated.
 	sentUsage: string | undefined;
+	// Config warnings already sent as notices, so each reaches the client once.
+	sentConfigWarnings: Set<string>;
 	// Goal auto-continuation bookkeeping, same rule as the TUI: a continuation
 	// turn that did no tool work, or repeated the previous one, stops the chain
 	// until the user speaks again.
@@ -919,6 +929,7 @@ export function createAcpExtensionUiContext(
 ): ExtensionUIContext {
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
 	const airClient = isAirClient(clientCapabilities);
+	const supportsNotices = clientSupportsNotices(clientCapabilities);
 	return {
 		supportsEditor: false,
 		select: async (title, options, dialogOptions) => {
@@ -1072,7 +1083,12 @@ export function createAcpExtensionUiContext(
 			};
 		},
 		notify: (message, type) => {
-			logger.debug("ACP extension notification", { message, type });
+			const update = noticeOrTranscriptUpdate(textNotice(message, type), supportsNotices);
+			void Promise.resolve(connection.sessionUpdate({ sessionId: getSessionId(), update })).catch(
+				(error: unknown) => {
+					logger.warn("Failed to send ACP extension notification", { error });
+				},
+			);
 		},
 		onTerminalInput: () => () => {},
 		rerenderMessage: () => {},
@@ -2331,6 +2347,7 @@ export class AcpAgent implements Agent {
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
 			sentUsage: undefined,
+			sentConfigWarnings: new Set(),
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 			vibeMode: undefined,
 		};
@@ -2578,6 +2595,10 @@ export class AcpAgent implements Agent {
 			onDelivery?.(delivery);
 			await delivery;
 		}
+		const notices = this.#sessionNotices(record, event);
+		// Await only when there is something to send: an idle await here would
+		// delay the usage reading below past later synchronous session events.
+		if (notices.length > 0) await this.#sendSessionNotices(record, notices, onDelivery);
 		if (
 			(event.type === "message_end" && event.message.role === "assistant") ||
 			(event.type === "auto_compaction_end" && event.result !== undefined && !event.aborted)
@@ -2588,6 +2609,36 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	/** The session notices an event carries. */
+	#sessionNotices(record: ManagedSessionRecord, event: AgentSessionEvent): SessionNotice[] {
+		if (event.type === "config_warnings_changed") {
+			return newConfigWarningNotices(record.session.configWarnings, record.sentConfigWarnings);
+		}
+		const notice = mapSessionNoticeEvent(event);
+		return notice ? [notice] : [];
+	}
+
+	/**
+	 * Send notices: a `notice` to a client that declares `session.notices`,
+	 * else a bold-label line under its own `messageId`, so it never merges
+	 * into the live assistant message.
+	 */
+	async #sendSessionNotices(
+		record: ManagedSessionRecord,
+		notices: SessionNotice[],
+		onDelivery?: (delivery: Promise<void>) => void,
+	): Promise<void> {
+		const supportsNotices = clientSupportsNotices(this.#clientCapabilities);
+		for (const notice of notices) {
+			const delivery = this.#connection.sessionUpdate({
+				sessionId: record.session.sessionId,
+				update: noticeOrTranscriptUpdate(notice, supportsNotices),
+			});
+			onDelivery?.(delivery);
+			await delivery;
+		}
 	}
 
 	/**
