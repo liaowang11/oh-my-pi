@@ -1,7 +1,6 @@
 import * as fs from "node:fs/promises";
 import { isEnoent } from "@oh-my-pi/pi-utils";
-import { type AgentRef, AgentRegistry } from "../../registry/agent-registry";
-import type { AgentSession } from "../../session/agent-session";
+import { cancelLiveSubagent, type LiveSubagent, resolveLiveSubagent } from "../../registry/cancel-subagent";
 import type { FileEntry, SessionMessageEntry } from "../../session/session-entries";
 import { parseSessionEntries } from "../../session/session-loader";
 import { type AgentProgress } from "@oh-my-pi/pi-tui/tools/task";
@@ -278,35 +277,44 @@ export class RpcSubagentRegistry {
 	}
 }
 
-/** A running subagent from this session's roster, bound to its live registry ref. */
-export interface RpcOwnedSubagent {
-	ref: AgentRef;
-	session: AgentSession;
+/**
+ * The transcript file of a `get_subagents` id this session reports as running,
+ * or `undefined` when the host must not reach it (unknown or finished).
+ * Progress can briefly report a terminal status before the terminal lifecycle
+ * frame prunes the snapshot; that counts as not running.
+ */
+function ownedRunningSessionFile(
+	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
+	subagentId: string,
+): string | undefined {
+	const snapshot = subagentRegistry.getSubagents().find(candidate => candidate.id === subagentId);
+	if (snapshot?.status !== "running" && snapshot?.status !== "pending") return undefined;
+	return snapshot.sessionFile || undefined;
 }
 
 /**
  * Resolve a `get_subagents` id to its running, live registry ref, or
  * `undefined` when the host must not reach it (unknown, finished, accepted,
- * parked, aborted, or another session's agent).
- *
- * Agent ids are unique only within one parent session's artifacts scope, and
- * the process-global registry keeps the latest ref per id, so the ref must
- * carry the transcript file this session's roster recorded
- * (`<artifactsDir>/<id>.jsonl`). The ref must also still be `running`: it goes
- * `idle` once the parent accepts its result, before the terminal lifecycle
- * frame prunes the roster, and a running ref always holds a live session.
+ * parked, aborted, or another session's agent). The ref must carry the
+ * transcript file this session's roster recorded; see {@link resolveLiveSubagent}.
  */
 export function resolveOwnedLiveSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
 	subagentId: string,
-): RpcOwnedSubagent | undefined {
-	const snapshot = subagentRegistry.getSubagents().find(candidate => candidate.id === subagentId);
-	// Progress can briefly report a terminal status before the terminal
-	// lifecycle frame prunes the snapshot; treat that as not running.
-	if ((snapshot?.status !== "running" && snapshot?.status !== "pending") || !snapshot.sessionFile) return undefined;
-	const ref = AgentRegistry.global().get(subagentId);
-	if (ref?.kind !== "sub" || ref.status !== "running" || !ref.session || ref.sessionFile !== snapshot.sessionFile) {
-		return undefined;
-	}
-	return { ref, session: ref.session };
+): LiveSubagent | undefined {
+	const sessionFile = ownedRunningSessionFile(subagentRegistry, subagentId);
+	return sessionFile ? resolveLiveSubagent(subagentId, sessionFile) : undefined;
+}
+
+/**
+ * Hard-kill one of this session's running subagents (see
+ * {@link cancelLiveSubagent}). Only ids this session reported as running are
+ * reachable; `false` (a no-op) otherwise.
+ */
+export async function cancelOwnedSubagent(
+	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
+	subagentId: string,
+): Promise<boolean> {
+	const sessionFile = ownedRunningSessionFile(subagentRegistry, subagentId);
+	return sessionFile ? cancelLiveSubagent(subagentId, sessionFile) : false;
 }
