@@ -4,7 +4,7 @@
  * `sessionIndex` gets the paged `session/list` with AIR row metadata and the
  * `_session/rename` / `_session/archive` / `_session/unarchive` methods.
  */
-import { afterEach, beforeEach, describe, expect, it } from "bun:test";
+import { afterEach, beforeEach, describe, expect, it, spyOn } from "bun:test";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -20,6 +20,7 @@ import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-ind
 import { findSessionFiles, sessionIdFromSessionPath } from "@oh-my-pi/pi-coding-agent/session/session-listing";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { createSessionWorktree } from "@oh-my-pi/pi-coding-agent/session/session-worktree";
+import * as vcs from "@oh-my-pi/pi-natives/vcs";
 import { getConfigRootDir, removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
@@ -170,6 +171,7 @@ describe("ACP AIR sessionIndex", () => {
 			"sessionIndex",
 			"sessionArchive",
 			"sessionRename",
+			"sessionListSubscribe",
 			"sessionWorktrees",
 		]);
 		expect(advertised(without._meta)).toEqual(["asyncTasks", "planFile"]);
@@ -547,6 +549,36 @@ describe("ACP AIR sessionIndex", () => {
 			const moved = rows.find(row => row.sessionId === inManaged.getSessionId());
 			expect(moved?.cwd).toBe(cwd);
 			expect(air(moved).agentWorktree).toBeUndefined();
+		});
+
+		it("checks a shared worktree cwd once per list rebuild, never caching across rebuilds", async () => {
+			const { path: managed } = await createSessionWorktree(cwd, Settings.isolated(), "wt/shared");
+			const ids: string[] = [];
+			for (const text of ["first", "second", "third"]) {
+				const inManaged = SessionManager.create(cwd);
+				inManaged.appendMessage({ role: "user", content: text, timestamp: Date.now() });
+				inManaged.appendMessage({ ...makeAssistantMessage(), model: MODEL_ID });
+				await inManaged.flush();
+				await inManaged.moveTo(managed);
+				await inManaged.close();
+				ids.push(inManaged.getSessionId());
+			}
+			const agent = await createAgent();
+			const gitCalls = spyOn(vcs, "git");
+			try {
+				const managedChecks = () => gitCalls.mock.calls.filter(([dir]) => dir === managed).length;
+				const flags = async () => {
+					const rows = (await list(agent, { includeWorktrees: true })).sessions;
+					return ids.map(id => air(rows.find(row => row.sessionId === id)).agentWorktree);
+				};
+
+				expect(await flags()).toEqual([true, true, true]);
+				expect(managedChecks()).toBe(1);
+				expect(await flags()).toEqual([true, true, true]);
+				expect(managedChecks()).toBe(2);
+			} finally {
+				gitCalls.mockRestore();
+			}
 		});
 	});
 });
