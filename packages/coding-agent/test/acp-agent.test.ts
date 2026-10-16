@@ -540,7 +540,9 @@ class FakeAgentSession {
 
 	async sendUserMessage(_content: string, _options?: unknown): Promise<void> {}
 
-	async compact(_instructions?: string, _options?: unknown): Promise<void> {}
+	async compact(_instructions?: string, _options?: unknown): Promise<unknown> {
+		return { summary: "Compacted.", firstKeptEntryId: "x", tokensBefore: 0 };
+	}
 
 	async fork(entryId?: string): Promise<boolean> {
 		await this.sessionManager.flush();
@@ -2339,6 +2341,7 @@ describe("ACP agent", () => {
 		// Manual /compact runs as a builtin command, with no agent turn.
 		session.compact = async () => {
 			session.contextUsage = { tokens: 12_000, contextWindow: 200_000, percent: 6 };
+			return { summary: "Compacted.", firstKeptEntryId: "x", tokensBefore: 150_000 };
 		};
 		const manual = harness.updates.length;
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
@@ -2346,6 +2349,296 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	describe("context compaction", () => {
+		const COMPACTION_CAPS: ClientCapabilities = { session: { compaction: {} } };
+		const AIR_CAPS: ClientCapabilities = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
+		const compactionResult = (summary: string, tokensBefore: number) =>
+			({ summary, shortSummary: "short", firstKeptEntryId: "x", tokensBefore }) as unknown;
+
+		async function bootSession(clientCapabilities?: ClientCapabilities) {
+			const harness = await createHarness({ clientCapabilities });
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			const emit = (event: unknown) => {
+				for (const listener of session.listeners()) listener(event as AgentSessionEvent);
+			};
+			const sentSince = (from: number) =>
+				harness.updates
+					.slice(from)
+					.filter(update => update.sessionId === created.sessionId)
+					.map(update => update.update);
+			return { harness, created, session, emit, sentSince };
+		}
+
+		it("reports auto compaction as one compaction_update lifecycle per compaction", async () => {
+			const { harness, emit, sentSince } = await bootSession(COMPACTION_CAPS);
+			const from = harness.updates.length;
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			emit({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: compactionResult("Kept the plan.", 150_000),
+				aborted: false,
+				willRetry: false,
+			});
+			emit({ type: "auto_compaction_start", reason: "overflow", action: "remote" });
+			emit({
+				type: "auto_compaction_end",
+				action: "remote",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				errorMessage: "provider rejected the request",
+			});
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "snapcompact" });
+			emit({
+				type: "auto_compaction_end",
+				action: "snapcompact",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			});
+			// A benign skip stays `cancelled` for a compaction_update client.
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			emit({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				skipped: true,
+			});
+			// Handoff and shake are not compactions.
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "handoff" });
+			emit({ type: "auto_compaction_end", action: "handoff", result: undefined, aborted: false, willRetry: false });
+			await Bun.sleep(0);
+
+			const updates = sentSince(from).filter(update => update.sessionUpdate === "compaction_update");
+			expectAcpNotifications(updates.map(update => ({ sessionId: "s", update })));
+			expect(updates.map(update => ({ ...update, compactionId: undefined }))).toEqual([
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: undefined,
+					status: "completed",
+					summary: [{ type: "text", text: "Kept the plan." }],
+				},
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: undefined,
+					status: "failed",
+					error: "provider rejected the request",
+				},
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "cancelled" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "cancelled" },
+			]);
+			const ids = updates.map(update => (update as { compactionId: string }).compactionId);
+			expect(ids[0]).toMatch(/^compaction:/);
+			expect([ids[0] === ids[1], ids[2] === ids[3], ids[4] === ids[5], ids[6] === ids[7]]).toEqual([
+				true,
+				true,
+				true,
+				true,
+			]);
+			expect(new Set(ids).size).toBe(4);
+
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		});
+
+		it("reports auto compaction as a Compact conversation tool call to a client without session.compaction", async () => {
+			for (const [caps, air] of [
+				[undefined, false],
+				[AIR_CAPS, true],
+			] as const) {
+				const { harness, session, emit, sentSince } = await bootSession(caps);
+				const from = harness.updates.length;
+				emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+				session.contextUsage = { tokens: 9_000, contextWindow: 200_000, percent: 4.5 };
+				emit({
+					type: "auto_compaction_end",
+					action: "context-full",
+					result: compactionResult("Kept the plan.", 150_000),
+					aborted: false,
+					willRetry: false,
+				});
+				await Bun.sleep(0);
+
+				const updates = sentSince(from).filter(
+					update => update.sessionUpdate === "tool_call" || update.sessionUpdate === "tool_call_update",
+				);
+				expectAcpNotifications(updates.map(update => ({ sessionId: "s", update })));
+				const toolCallId = (updates[0] as { toolCallId: string }).toolCallId;
+				const summaryContent = [
+					{ type: "content" as const, content: { type: "text" as const, text: "Kept the plan." } },
+				];
+				const facts = {
+					trigger: "automatic",
+					preTokens: 150_000,
+					postTokens: 9_000,
+					durationMs: expect.any(Number),
+				};
+				expect(updates).toEqual([
+					{
+						sessionUpdate: "tool_call",
+						toolCallId,
+						title: "Compact conversation",
+						kind: "think",
+						status: "in_progress",
+						_meta: air
+							? { jetbrains: { air: { version: 1, contextCompaction: { version: 1 } } } }
+							: { claudeCode: { toolName: "compact" } },
+					},
+					air
+						? {
+								sessionUpdate: "tool_call_update",
+								toolCallId,
+								status: "completed",
+								content: summaryContent,
+								_meta: { jetbrains: { air: { version: 1, contextCompaction: { version: 1, ...facts } } } },
+							}
+						: {
+								sessionUpdate: "tool_call_update",
+								toolCallId,
+								status: "completed",
+								content: summaryContent,
+								rawOutput: facts,
+								_meta: { claudeCode: { toolName: "compact" } },
+							},
+				]);
+				harness.abortController.abort();
+				await Bun.sleep(0);
+			}
+		});
+
+		it("closes a skipped compaction as a completed Compact conversation tool call", async () => {
+			const { harness, emit, sentSince } = await bootSession();
+			const from = harness.updates.length;
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			emit({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				skipped: true,
+			});
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			emit({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: false,
+				willRetry: false,
+				skipped: true,
+				errorMessage: "no model available",
+			});
+			emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			emit({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			});
+			await Bun.sleep(0);
+
+			const finished = sentSince(from).filter(update => update.sessionUpdate === "tool_call_update");
+			expectAcpNotifications(finished.map(update => ({ sessionId: "s", update })));
+			const text = (update: SessionNotification["update"]) =>
+				(update as { content?: { content: { text: string } }[] }).content?.map(block => block.content.text);
+			expect(finished.map(update => [(update as { status: string }).status, text(update)])).toEqual([
+				["completed", ["Compaction skipped"]],
+				["completed", ["Compaction skipped: no model available"]],
+				["failed", ["Compaction cancelled"]],
+			]);
+
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		});
+
+		it("cancels a compaction still in progress when the turn is cancelled", async () => {
+			const { harness, created, session, emit, sentSince } = await bootSession(COMPACTION_CAPS);
+			const finishPrompt = holdPromptStreaming(session);
+			const from = harness.updates.length;
+			const prompt = harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "go" }] });
+			await Bun.sleep(0);
+			emit({ type: "auto_compaction_start", reason: "overflow", action: "context-full" });
+			await Bun.sleep(0);
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await prompt).stopReason).toBe("cancelled");
+
+			const updates = sentSince(from).filter(update => update.sessionUpdate === "compaction_update");
+			expect(updates.map(update => (update as { status: string }).status)).toEqual(["in_progress", "cancelled"]);
+			expect((updates[1] as { compactionId: string }).compactionId).toBe(
+				(updates[0] as { compactionId: string }).compactionId,
+			);
+
+			finishPrompt();
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		});
+
+		it("reports a manual /compact as a manual compaction lifecycle instead of command text", async () => {
+			const { harness, created, session, sentSince } = await bootSession({
+				...COMPACTION_CAPS,
+				...AIR_CAPS,
+			});
+			session.contextUsage = { tokens: 120_000, contextWindow: 200_000, percent: 60 };
+			session.compact = (async () => {
+				session.contextUsage = { tokens: 8_000, contextWindow: 200_000, percent: 4 };
+				return compactionResult("Manual summary.", 120_000);
+			}) as unknown as typeof session.compact;
+			const from = harness.updates.length;
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
+			session.compact = (async () => {
+				throw new Error("Nothing to compact");
+			}) as unknown as typeof session.compact;
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
+
+			const sent = sentSince(from);
+			expectAcpNotifications(sent.map(update => ({ sessionId: "s", update })));
+			expect(sent.filter(update => update.sessionUpdate === "agent_message_chunk")).toEqual([]);
+			expect(sent.some(update => update.sessionUpdate === "usage_update")).toBe(true);
+			const updates = sent.filter(update => update.sessionUpdate === "compaction_update");
+			const meta = (facts: Record<string, unknown>) => ({
+				jetbrains: { air: { version: 1, contextCompaction: { version: 1, ...facts } } },
+			});
+			expect(updates.map(update => ({ ...update, compactionId: undefined }))).toEqual([
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress", _meta: meta({}) },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: undefined,
+					status: "completed",
+					summary: [{ type: "text", text: "Manual summary." }],
+					_meta: meta({
+						trigger: "manual",
+						preTokens: 120_000,
+						postTokens: 8_000,
+						durationMs: expect.any(Number),
+					}),
+				},
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress", _meta: meta({}) },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: undefined,
+					status: "failed",
+					error: "Nothing to compact",
+					_meta: meta({ trigger: "manual", durationMs: expect.any(Number) }),
+				},
+			]);
+
+			harness.abortController.abort();
+			await Bun.sleep(0);
+		});
 	});
 
 	it("sends session notices as `notice` updates to a client that declares session.notices", async () => {
@@ -2732,6 +3025,95 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
+
+	it("replays the compaction and user shell runs on session/load", async () => {
+		for (const clientCapabilities of [undefined, { session: { compaction: {} } }]) {
+			await replayCompactionAndShellRuns(clientCapabilities);
+		}
+	});
+
+	async function replayCompactionAndShellRuns(clientCapabilities: ClientCapabilities | undefined): Promise<void> {
+		const harness = await createHarness({ clientCapabilities });
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "old question", timestamp: Date.now() });
+		stored.sessionManager.appendMessage(makeAssistantMessage("old answer"));
+		const keptId = stored.sessionManager.appendMessage({
+			role: "user",
+			content: "kept question",
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendCompaction("Summary of the earlier work", "Earlier work", keptId, 1234);
+		stored.sessionManager.appendMessage({
+			role: "bashExecution",
+			command: "ls",
+			output: "README.md",
+			cancelled: false,
+			truncated: false,
+			exitCode: 0,
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendMessage({
+			role: "pythonExecution",
+			code: "print(1)",
+			output: "1",
+			cancelled: false,
+			truncated: false,
+			exitCode: 0,
+			timestamp: Date.now(),
+		});
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+
+		const userTexts = harness.updates
+			.filter(
+				notification =>
+					notification.sessionId === stored.sessionId &&
+					notification.update.sessionUpdate === "user_message_chunk",
+			)
+			.map(notification => {
+				const update = notification.update as { content: { type: string; text?: string } };
+				return update.content.text ?? "";
+			});
+		// The summary is not user text: it replays as the compaction itself.
+		expect(userTexts.some(text => text.includes("Summary of the earlier work"))).toBe(false);
+		const replayed = harness.updates
+			.filter(notification => notification.sessionId === stored.sessionId)
+			.map(notification => notification.update);
+		if (clientCapabilities) {
+			const compactions = replayed.filter(update => update.sessionUpdate === "compaction_update");
+			expect(compactions).toEqual([
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: expect.stringMatching(/^compaction:\d+$/),
+					status: "completed",
+					summary: [{ type: "text", text: "Summary of the earlier work" }],
+				},
+			]);
+		} else {
+			const toolCalls = replayed.filter(update => update.sessionUpdate === "tool_call");
+			expect(toolCalls).toEqual([
+				{
+					sessionUpdate: "tool_call",
+					toolCallId: expect.stringMatching(/^compaction:\d+$/),
+					title: "Compact conversation",
+					kind: "think",
+					status: "completed",
+					content: [{ type: "content", content: { type: "text", text: "Summary of the earlier work" } }],
+					rawOutput: { preTokens: 1234 },
+					_meta: { claudeCode: { toolName: "compact" } },
+				},
+			]);
+		}
+		expect(userTexts.some(text => text.includes("Ran `ls`") && text.includes("README.md"))).toBe(true);
+		expect(userTexts.some(text => text.includes("print(1)"))).toBe(true);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	}
 
 	it("replays assistant tool calls and matching results without duplicating the start", async () => {
 		const harness = await createHarness();
