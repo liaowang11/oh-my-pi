@@ -22,6 +22,23 @@ export function resolvePlanFilePath(
 	return located;
 }
 
+/**
+ * The on-disk path of a plan when it resolves to an existing regular file,
+ * else undefined. Synchronous, so a caller can use it while forwarding events
+ * in order; never throws.
+ */
+export function existingPlanFileSync(
+	planFilePath: string,
+	options: { localProtocolOptions: LocalProtocolOptions; cwd: string },
+): string | undefined {
+	try {
+		const resolvedPath = resolvePlanFilePath(planFilePath, options);
+		return fs.statSync(resolvedPath).isFile() ? resolvedPath : undefined;
+	} catch {
+		return undefined;
+	}
+}
+
 /** Reads a plan from an internal URL or cwd-relative filesystem path. */
 export async function readPlanFile(
 	planFilePath: string,
