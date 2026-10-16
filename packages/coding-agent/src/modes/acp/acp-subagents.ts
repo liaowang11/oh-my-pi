@@ -5,6 +5,7 @@ import type {
 	SubagentWorkState,
 } from "@oh-my-pi/pi-utils/acp";
 import { logger } from "@oh-my-pi/pi-utils";
+import { cancelLiveSubagent } from "../../registry/cancel-subagent";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import {
 	type SubagentEventPayload,
@@ -54,6 +55,9 @@ type ChildSession = {
 	description: string | undefined;
 	announced: boolean;
 	running: boolean;
+	// The current run's transcript, from its `started` frame; it pins the
+	// registry ref a cancel may kill. Unset for a restored child until it runs.
+	sessionFile: string | undefined;
 	// Whether the current run's assignment went out as a `session_message`.
 	promptSent: boolean;
 	prompts: number;
@@ -68,6 +72,8 @@ export interface AcpSubagentRelayOptions {
 	send: (notification: SessionNotification) => Promise<void>;
 	getCwd: () => string;
 	resolveImageData?: (data: string, mimeType: string | undefined) => string;
+	/** Whether the client may cancel a running child with `session/cancel` on its id. */
+	cancellable: boolean;
 }
 
 const IDLE_STATE: Record<Exclude<SubagentLifecyclePayload["status"], "started">, SubagentWorkState> = {
@@ -131,6 +137,7 @@ export class AcpSubagentRelay {
 		this.#children.set(id, {
 			...child,
 			running: false,
+			sessionFile: undefined,
 			promptSent: false,
 			liveMessageId: undefined,
 			liveMessageProgress: undefined,
@@ -145,8 +152,9 @@ export class AcpSubagentRelay {
 			if (known) {
 				this.#announce(known);
 				known.running = true;
+				known.sessionFile = payload.sessionFile;
 				known.promptSent = false;
-				this.#patch(known, { state: { state: "running" } });
+				this.#patch(known, { state: { state: "running" }, ...this.#cancelCapability(known) });
 				this.#sendPrompt(known, payload.assignment);
 				return;
 			}
@@ -159,6 +167,7 @@ export class AcpSubagentRelay {
 				description: payload.description?.trim() || undefined,
 				announced: true,
 				running: true,
+				sessionFile: payload.sessionFile,
 				promptSent: false,
 				prompts: 0,
 				liveMessageId: undefined,
@@ -170,6 +179,7 @@ export class AcpSubagentRelay {
 				title: payload.id,
 				...(child.description ? { description: child.description } : {}),
 				state: { state: "running" },
+				...this.#cancelCapability(child),
 			});
 			this.#sendPrompt(child, payload.assignment);
 			return;
@@ -177,8 +187,39 @@ export class AcpSubagentRelay {
 		const child = this.#children.get(payload.id);
 		if (!child?.running) return;
 		this.#sendPrompt(child, payload.assignment);
+		const cancelAdvertised = this.#canCancel(child);
 		child.running = false;
-		this.#patch(child, { ...this.#descriptionPatch(child, payload.description), state: IDLE_STATE[payload.status] });
+		this.#patch(child, {
+			...this.#descriptionPatch(child, payload.description),
+			state: IDLE_STATE[payload.status],
+			...(cancelAdvertised ? { capabilities: null } : {}),
+		});
+	}
+
+	/**
+	 * Hard-kills the running subagent behind child session `childSessionId`, as
+	 * RPC `cancel_subagent` does. The child goes idle/cancelled through its real
+	 * `aborted` lifecycle frame, and the owning task call settles as aborted;
+	 * the parent turn keeps running. Resolves `false` (a no-op) for an unknown,
+	 * finished, or not cancellable child.
+	 */
+	cancelChild(childSessionId: string): Promise<boolean> {
+		for (const [id, child] of this.#children) {
+			if (child.sessionId !== childSessionId) continue;
+			if (!this.#canCancel(child) || !child.sessionFile) return Promise.resolve(false);
+			return cancelLiveSubagent(id, child.sessionFile);
+		}
+		return Promise.resolve(false);
+	}
+
+	// Cancel is advertised only when it can work: a running run whose
+	// transcript pins its registry ref, for a client that may cancel children.
+	#canCancel(child: ChildSession): boolean {
+		return this.#options.cancellable && child.running && child.sessionFile !== undefined;
+	}
+
+	#cancelCapability(child: ChildSession): Pick<SubagentUpdate, "capabilities"> {
+		return this.#canCancel(child) ? { capabilities: { cancel: {} } } : {};
 	}
 
 	#onProgress(payload: SubagentProgressPayload): void {
