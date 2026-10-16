@@ -10,6 +10,7 @@ import type {
 	AgentSideConnection,
 	ClientCapabilities,
 	RequestPermissionRequest,
+	RequestPermissionResponse,
 	ToolCallUpdate,
 } from "@oh-my-pi/pi-utils/acp";
 import type {
@@ -140,7 +141,14 @@ async function requestPermission(
 	if (signal?.aborted) {
 		return { outcome: "cancelled" };
 	}
-	const response = await connection.requestPermission(request);
+	let response: RequestPermissionResponse;
+	try {
+		// Aborting withdraws the open prompt on the client with `$/cancel_request`.
+		response = await connection.requestPermission(request, signal);
+	} catch (error) {
+		if (signal?.aborted) return { outcome: "cancelled" };
+		throw error;
+	}
 	const outcome = response.outcome;
 	if (outcome.outcome === "cancelled") {
 		return { outcome: "cancelled" };
