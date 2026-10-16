@@ -92,7 +92,12 @@ import {
 import { RpcSessionEventForwarder } from "./rpc-session-events";
 import { isSessionSettled } from "../../session/session-settle";
 import { RpcSessionSettleWatcher, watchedScheduledTurnProbe } from "./rpc-session-settle";
-import { RpcSubagentRegistry, readRpcSubagentTranscript, resolveOwnedLiveSubagent } from "./rpc-subagents";
+import {
+	cancelOwnedSubagent,
+	RpcSubagentRegistry,
+	readRpcSubagentTranscript,
+	resolveOwnedLiveSubagent,
+} from "./rpc-subagents";
 import type {
 	RpcAbortAndRestoreQueueResult,
 	RpcCommand,
@@ -782,35 +787,17 @@ export type RpcSubagentResetRegistry = Pick<RpcSubagentRegistry, "clear">;
 
 /**
  * Handle RPC `cancel_subagent`: hard-kill one of this session's running
- * subagents through the same path as the Agent Hub / collab `kill` command.
- * Aborting the live turn and releasing the registry ref as an `aborted`
- * tombstone settles the owning `task` call (foreground or background) with an
- * aborted result, and disposing the session cancels its nested children.
- *
- * Only ids this session reported as running are reachable (see
- * {@link resolveOwnedLiveSubagent}). Returns `false` (a no-op) for unknown,
- * finished, or already-cancelled subagents so hosts can treat cancelling a
- * vanished subagent as success. Rejects when the tombstone cannot be persisted
- * or the abort fails; the subagent is still detached and disposed.
+ * subagents (see {@link cancelOwnedSubagent}). Only ids this session reported
+ * as running are reachable. Returns `false` (a no-op) for unknown, finished,
+ * or already-cancelled subagents so hosts can treat cancelling a vanished
+ * subagent as success. Rejects when the tombstone cannot be persisted or the
+ * abort fails; the subagent is still detached and disposed.
  */
-export async function handleRpcCancelSubagent(
+export function handleRpcCancelSubagent(
 	subagentRegistry: Pick<RpcSubagentRegistry, "getSubagents">,
 	subagentId: string,
 ): Promise<boolean> {
-	const owned = resolveOwnedLiveSubagent(subagentRegistry, subagentId);
-	if (!owned) return false;
-	// Start the release first: it publishes the `aborted` tombstone synchronously,
-	// so the executor cannot accept the run's result (flipping the ref to idle)
-	// while the abort below is still settling. Settle both together so a failed
-	// tombstone write is reported here instead of escaping as an unhandled
-	// rejection while the abort is pending.
-	const [released, aborted] = await Promise.allSettled([
-		AgentLifecycleManager.global().release(subagentId, owned.ref, { tombstone: true }),
-		owned.session.abort({ reason: USER_INTERRUPT_LABEL }),
-	]);
-	if (released.status === "rejected") throw released.reason;
-	if (aborted.status === "rejected") throw aborted.reason;
-	return released.value;
+	return cancelOwnedSubagent(subagentRegistry, subagentId);
 }
 
 /**
