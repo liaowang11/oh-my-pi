@@ -80,7 +80,12 @@ import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
 import { theme } from "@oh-my-pi/pi-tui/theme";
-import { normalizePlanTitle, type PlanApprovalDetails, resolveApprovedPlan } from "../../plan-mode/approved-plan";
+import {
+	normalizePlanTitle,
+	type PlanApprovalDetails,
+	proposedPlanFileUrl,
+	resolveApprovedPlan,
+} from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
@@ -108,7 +113,8 @@ import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { OTHER_OPTION } from "../../tools/ask";
-import { resolvePlanFilePath } from "../../plan-mode/plan-files";
+import { isProposeToolCall } from "../../tools/resolve";
+import { existingPlanFileSync, resolvePlanFilePath } from "../../plan-mode/plan-files";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
 	DEFAULT_TTS_SPEED,
@@ -134,8 +140,10 @@ import { AcpSubagentRelay, clientSupportsSubagents, isSubagentSessionId, subagen
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
 	AIR_CUSTOM_ANSWER_KEY,
+	AIR_PLAN_FILE_CAPABILITY,
 	airCapabilityMeta,
 	clientSupportsAsyncTasks,
+	clientSupportsPlanFile,
 	isAirClient,
 	withAirFields,
 	withAirMeta,
@@ -509,6 +517,13 @@ type ManagedSessionRecord = {
 	// Present while vibe mode is active: the owner scope and pre-vibe toolset
 	// `exitVibeMode` needs to kill workers and restore tools.
 	vibeMode: VibeModeHandle | undefined;
+	// The `xd://propose` call in flight, and for an AIR `planFile` client the
+	// plan file its input names. Read from the start event: the proposal
+	// handler can run before that event is forwarded.
+	planProposal: { toolCallId: string; planFilePath: string | undefined } | undefined;
+	// The plan the proposal handler approved, reported once the propose call's
+	// result reaches the client. Never set for a refined or failed proposal.
+	approvedPlan: { planContent: string; planFilePath: string | undefined } | undefined;
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
@@ -1236,7 +1251,11 @@ export class AcpAgent implements Agent {
 			_meta: {
 				steering: { supported: true },
 				...(isAirClient(params.clientCapabilities)
-					? airCapabilityMeta(AIR_ASYNC_TASKS_CAPABILITY, ...sessionIndexCapabilities(params.clientCapabilities))
+					? airCapabilityMeta(
+							AIR_ASYNC_TASKS_CAPABILITY,
+							AIR_PLAN_FILE_CAPABILITY,
+							...sessionIndexCapabilities(params.clientCapabilities),
+						)
 					: {}),
 			},
 		};
@@ -2397,6 +2416,8 @@ export class AcpAgent implements Agent {
 			),
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 			vibeMode: undefined,
+			planProposal: undefined,
+			approvedPlan: undefined,
 		};
 	}
 
@@ -2622,6 +2643,7 @@ export class AcpAgent implements Agent {
 		if (event.type === "tool_execution_start" || event.type === "tool_execution_update") {
 			record.toolArgsById.set(event.toolCallId, event.args);
 		}
+		if (event.type === "tool_execution_start") this.#trackPlanProposal(record, event);
 
 		this.#prepareLiveAssistantMessage(record, event);
 		const imageDataCache = new Map<string, string>();
@@ -2640,7 +2662,14 @@ export class AcpAgent implements Agent {
 			cwd: record.session.sessionManager.getCwd(),
 			resolveImageData: resolveImageDataForAcp,
 		})) {
-			const delivery = this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification));
+			const delivery = this.#connection.sessionUpdate(
+				this.#withPlanFilePath(record, this.#stampBackgroundedToolCall(record, notification)),
+			);
+			onDelivery?.(delivery);
+			await delivery;
+		}
+		if (event.type === "tool_execution_end" && record.planProposal?.toolCallId === event.toolCallId) {
+			const delivery = this.#reportApprovedPlan(record, event.toolCallId, event.isError === true);
 			onDelivery?.(delivery);
 			await delivery;
 		}
@@ -2666,6 +2695,83 @@ export class AcpAgent implements Agent {
 			record.toolArgsById.delete(event.toolCallId);
 		}
 		this.#clearLiveAssistantMessageAfterEvent(record, event);
+	}
+
+	/**
+	 * Note an `xd://propose` call as it starts. For an AIR `planFile` client,
+	 * the plan file is the one its title names, else the plan-mode state's,
+	 * when it exists; the approval may later settle on another file.
+	 */
+	#trackPlanProposal(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "tool_execution_start" }>,
+	): void {
+		const args = event.args as Record<string, unknown> | undefined;
+		if (!isProposeToolCall({ name: event.toolName, arguments: args })) return;
+		let planFilePath: string | undefined;
+		if (clientSupportsPlanFile(this.#clientCapabilities)) {
+			const { session } = record;
+			for (const url of [proposedPlanFileUrl(args?.content), session.getPlanModeState()?.planFilePath]) {
+				planFilePath = url ? this.#existingAcpPlanFile(session, url) : undefined;
+				if (planFilePath) break;
+			}
+		}
+		record.planProposal = { toolCallId: event.toolCallId, planFilePath };
+	}
+
+	/**
+	 * Name the plan file in the `rawInput` of the propose call's start and
+	 * result, for an AIR `planFile` client; the approved file wins once known.
+	 */
+	#withPlanFilePath(record: ManagedSessionRecord, notification: SessionNotification): SessionNotification {
+		const { update } = notification;
+		const proposal = record.planProposal;
+		if (
+			(update.sessionUpdate !== "tool_call" && update.sessionUpdate !== "tool_call_update") ||
+			update.toolCallId !== proposal?.toolCallId
+		) {
+			return notification;
+		}
+		const planFilePath = record.approvedPlan?.planFilePath ?? proposal.planFilePath;
+		if (!planFilePath) return notification;
+		const args = record.toolArgsById.get(update.toolCallId);
+		const input = typeof args === "object" && args !== null && !Array.isArray(args) ? args : {};
+		return { ...notification, update: { ...update, rawInput: { ...input, planFilePath } } };
+	}
+
+	/**
+	 * After the propose call's result: an approved plan becomes the session's
+	 * markdown plan for a `plan` client, and an AIR `planFile` client gets the
+	 * call that clears its plan file. A refined or failed proposal sends nothing.
+	 */
+	async #reportApprovedPlan(record: ManagedSessionRecord, toolCallId: string, isError: boolean): Promise<void> {
+		const approved = record.approvedPlan;
+		const planFilePath = approved?.planFilePath ?? record.planProposal?.planFilePath;
+		record.planProposal = undefined;
+		record.approvedPlan = undefined;
+		if (!approved || isError) return;
+		const { sessionId } = record.session;
+		if (planFilePath) {
+			await this.#connection.sessionUpdate({
+				sessionId,
+				update: {
+					sessionUpdate: "tool_call",
+					toolCallId: `${toolCallId}:plan-file-clear`,
+					title: "Exited Plan Mode",
+					kind: "switch_mode",
+					status: "completed",
+					rawInput: { planFilePath: "" },
+					content: [],
+				},
+			});
+		}
+		const content = approved.planContent.trim();
+		if (this.#clientCapabilities?.plan != null && content) {
+			await this.#connection.sessionUpdate({
+				sessionId,
+				update: { sessionUpdate: "plan_update", plan: { type: "markdown", planId: "plan-mode", content } },
+			});
+		}
 	}
 
 	#compactionReportOptions(): { presentation: "compaction_update" | "tool_call"; airClient: boolean } {
@@ -3410,6 +3516,10 @@ export class AcpAgent implements Agent {
 	 * a way out.
 	 */
 	async #handleAcpPlanProposal(session: AgentSession, title: string): Promise<AgentToolResult<unknown>> {
+		const record = this.#sessions.get(session.sessionId);
+		// An approval whose propose result never reached the client (a dropped
+		// turn's events) must not surface on this proposal.
+		if (record) record.approvedPlan = undefined;
 		const state = session.getPlanModeState();
 		if (!state?.enabled) {
 			throw new ToolError("Plan mode is not active.");
@@ -3426,7 +3536,7 @@ export class AcpAgent implements Agent {
 		});
 		// A turn cancel while the approval dialog is open settles as refine and
 		// withdraws the dialog.
-		const turnSignal = this.#sessions.get(session.sessionId)?.promptTurn?.abortController.signal;
+		const turnSignal = record?.promptTurn?.abortController.signal;
 		const approved = await this.#requestAcpPlanApprovalChoice(
 			session.sessionId,
 			resolvedTitle,
@@ -3459,6 +3569,14 @@ export class AcpAgent implements Agent {
 		// Approved. Set the plan reference so the next turn injects the plan
 		// content as context (the file keeps its agent-chosen name — no rename),
 		session.setPlanReferencePath(planFilePath);
+		if (record) {
+			record.approvedPlan = {
+				planContent,
+				planFilePath: clientSupportsPlanFile(this.#clientCapabilities)
+					? this.#existingAcpPlanFile(session, planFilePath)
+					: undefined,
+			};
+		}
 		session.setPlanProposalHandler?.(null);
 		session.setPlanModeState(undefined);
 		let autosaveFailed = false;
@@ -3503,6 +3621,16 @@ export class AcpAgent implements Agent {
 
 	#resolveAcpPlanFilePath(session: AgentSession, planFilePath: string): string {
 		return resolvePlanFilePath(planFilePath, {
+			localProtocolOptions: {
+				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+				getSessionId: () => session.sessionManager.getSessionId(),
+			},
+			cwd: session.sessionManager.getCwd(),
+		});
+	}
+
+	#existingAcpPlanFile(session: AgentSession, planFilePath: string): string | undefined {
+		return existingPlanFileSync(planFilePath, {
 			localProtocolOptions: {
 				getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
 				getSessionId: () => session.sessionManager.getSessionId(),
