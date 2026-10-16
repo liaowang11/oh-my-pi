@@ -90,6 +90,60 @@ describe("ACP JSON-RPC transport", () => {
 		writer.releaseLock();
 	});
 
+	it("withdraws an aborted request with $/cancel_request and ignores its late reply", async () => {
+		const toClient = new TransformStream<AnyMessage, AnyMessage>();
+		const fromClient = new TransformStream<AnyMessage, AnyMessage>();
+		const agent = new AgentSideConnection(
+			() => ({
+				initialize: params => ({ protocolVersion: params.protocolVersion }),
+				newSession: async () => ({ sessionId: "s" }),
+				prompt: async () => ({ stopReason: "end_turn" }),
+				cancel: async () => {},
+			}),
+			{ writable: toClient.writable, readable: fromClient.readable },
+		);
+		const reader = toClient.readable.getReader();
+		const writer = fromClient.writable.getWriter();
+		const controller = new AbortController();
+		const elicitation = agent.unstable_createElicitation(
+			{ mode: "form", sessionId: "s", message: "Pick", requestedSchema: { type: "object", properties: {} } },
+			controller.signal,
+		);
+		const sent = await reader.read();
+		if (sent.done || !("id" in sent.value) || !("method" in sent.value)) throw new Error("Expected a request");
+		expect(sent.value.method).toBe("elicitation/create");
+
+		controller.abort();
+		await expect(elicitation).rejects.toMatchObject({ code: -32800 });
+		const cancel = await reader.read();
+		expect(cancel.value).toEqual({
+			jsonrpc: "2.0",
+			method: "$/cancel_request",
+			params: { requestId: sent.value.id },
+		});
+
+		// The client's late answer to the withdrawn request is dropped; the connection keeps working.
+		await writer.write({ jsonrpc: "2.0", id: sent.value.id, result: { action: "accept", content: {} } });
+		const next = agent.request<string>("ping");
+		const ping = await reader.read();
+		if (ping.done || !("id" in ping.value)) throw new Error("Expected a request");
+		await writer.write({ jsonrpc: "2.0", id: ping.value.id, result: "pong" });
+		await expect(next).resolves.toBe("pong");
+
+		// An already-aborted signal rejects without sending anything.
+		await expect(agent.request("never", {}, { signal: AbortSignal.abort() })).rejects.toMatchObject({
+			code: -32800,
+		});
+		const probe = agent.request<string>("probe");
+		const probeFrame = await reader.read();
+		expect(probeFrame.value).toMatchObject({ method: "probe" });
+		if (probeFrame.done || !("id" in probeFrame.value)) throw new Error("Expected a request");
+		await writer.write({ jsonrpc: "2.0", id: probeFrame.value.id, result: "ok" });
+		await expect(probe).resolves.toBe("ok");
+		reader.releaseLock();
+		writer.releaseLock();
+	});
+
 	it("decodes split and batched NDJSON frames", async () => {
 		const bytes = new TransformStream<Uint8Array, Uint8Array>();
 		const output = new TransformStream<Uint8Array, Uint8Array>();
@@ -161,6 +215,39 @@ describe("ACP JSON-RPC transport", () => {
 		await writer.abort(new Error("broken pipe"));
 		await connection.closed;
 		hold.resolve();
+	});
+
+	it("routes session/delete to the agent and answers -32601 when the agent has none", async () => {
+		const deleted: string[] = [];
+		const connect = (deleteSession?: (params: { sessionId: string }) => Promise<{}>) => {
+			const pair = transportPair();
+			const client = new ClientSideConnection(
+				() => ({
+					requestPermission: async () => ({ outcome: { outcome: "cancelled" } }),
+					sessionUpdate: async () => {},
+				}),
+				pair.left,
+			);
+			new AgentSideConnection(
+				() => ({
+					initialize: params => ({ protocolVersion: params.protocolVersion }),
+					newSession: async () => ({ sessionId: "s" }),
+					prompt: async () => ({ stopReason: "end_turn" }),
+					cancel: async () => {},
+					deleteSession,
+				}),
+				pair.right,
+			);
+			return client;
+		};
+
+		const withDelete = connect(async params => {
+			deleted.push(params.sessionId);
+			return {};
+		});
+		await expect(withDelete.deleteSession({ sessionId: "gone" })).resolves.toEqual({});
+		expect(deleted).toEqual(["gone"]);
+		await expect(connect().deleteSession({ sessionId: "gone" })).rejects.toMatchObject({ code: -32601 });
 	});
 
 	it("matches the SDK error-code fixtures", () => {
@@ -414,6 +501,55 @@ describe("ACP runtime schemas", () => {
 		];
 		for (const bad of malformed) {
 			expect(schema.zSessionNotification.safeParse({ sessionId: "parent", update: bad }).success).toBe(false);
+		}
+	});
+
+	it("accepts unstable plan, notice, and compaction updates and rejects malformed fields", () => {
+		const valid = [
+			{ sessionUpdate: "plan_update", plan: { type: "markdown", planId: "plan-mode", content: "# Plan" } },
+			{ sessionUpdate: "plan_update", plan: { type: "file", planId: "p", uri: "file:///plan.md" } },
+			{
+				sessionUpdate: "plan_update",
+				plan: { type: "items", planId: "p", entries: [{ content: "a", priority: "high", status: "pending" }] },
+			},
+			{ sessionUpdate: "plan_removed", planId: "plan-mode" },
+			{ sessionUpdate: "notice", severity: "warning", title: "Fallback", description: "a -> b" },
+			{ sessionUpdate: "notice", severity: "info", title: "Retrying" },
+			{ sessionUpdate: "compaction_update", compactionId: "c1", status: "in_progress" },
+			{
+				sessionUpdate: "compaction_update",
+				compactionId: "c1",
+				status: "completed",
+				summary: [{ type: "text", text: "Summary" }],
+			},
+			{ sessionUpdate: "compaction_update", compactionId: "c1", status: "failed", error: "boom" },
+			{ sessionUpdate: "compaction_summary_chunk", compactionId: "c1", content: { type: "text", text: "Sum" } },
+			{ sessionUpdate: "subagent_update", sessionId: "child", capabilities: { cancel: {} } },
+			{ sessionUpdate: "subagent_update", sessionId: "child", capabilities: null },
+		];
+		for (const update of valid) {
+			expect(schema.zSessionNotification.safeParse({ sessionId: "s", update }).success).toBe(true);
+		}
+		const malformed = [
+			{ sessionUpdate: "plan_update", plan: { type: "markdown", planId: "p" } },
+			{ sessionUpdate: "plan_update", plan: { type: "file", planId: "p", uri: 1 } },
+			{ sessionUpdate: "plan_update", plan: { type: "items", planId: "p" } },
+			{ sessionUpdate: "plan_update", plan: { type: "markdown", content: "# Plan" } },
+			{ sessionUpdate: "plan_update", plan: { type: "html", planId: "p", content: "x" } },
+			{ sessionUpdate: "plan_removed" },
+			{ sessionUpdate: "notice", severity: "info" },
+			{ sessionUpdate: "notice", title: "No severity" },
+			{ sessionUpdate: "notice", severity: "info", title: "t", description: 1 },
+			{ sessionUpdate: "compaction_update", status: "completed" },
+			{ sessionUpdate: "compaction_update", compactionId: "c1" },
+			{ sessionUpdate: "compaction_update", compactionId: "c1", status: "completed", summary: [{ type: "text" }] },
+			{ sessionUpdate: "compaction_update", compactionId: "c1", status: "failed", error: 1 },
+			{ sessionUpdate: "compaction_summary_chunk", compactionId: "c1", content: { type: "text" } },
+			{ sessionUpdate: "compaction_summary_chunk", content: { type: "text", text: "Sum" } },
+			{ sessionUpdate: "subagent_update", sessionId: "child", capabilities: "cancel" },
+		];
+		for (const update of malformed) {
+			expect(schema.zSessionNotification.safeParse({ sessionId: "s", update }).success).toBe(false);
 		}
 	});
 

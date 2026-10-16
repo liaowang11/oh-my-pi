@@ -93,6 +93,30 @@ function subagentWorkState(value: unknown): boolean {
 	return typeof state.state === "string" && optionalString(state.stopReason);
 }
 
+function optionalObject(value: unknown): boolean {
+	return value === undefined || value === null || (typeof value === "object" && !Array.isArray(value));
+}
+
+function optionalContentBlocks(value: unknown): boolean {
+	return value === undefined || value === null || (Array.isArray(value) && value.every(contentBlock));
+}
+
+function planUpdateContent(value: unknown): boolean {
+	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+	const plan = value as Record<string, unknown>;
+	if (typeof plan.planId !== "string") return false;
+	switch (plan.type) {
+		case "items":
+			return Array.isArray(plan.entries);
+		case "file":
+			return typeof plan.uri === "string";
+		case "markdown":
+			return typeof plan.content === "string";
+		default:
+			return false;
+	}
+}
+
 function sessionNotification(value: unknown): boolean {
 	if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
 	const notification = value as Record<string, unknown>;
@@ -118,19 +142,37 @@ function sessionNotification(value: unknown): boolean {
 				typeof update.sessionId === "string" &&
 				optionalString(update.title) &&
 				optionalString(update.description) &&
-				(update.state === undefined || update.state === null || subagentWorkState(update.state))
+				(update.state === undefined || update.state === null || subagentWorkState(update.state)) &&
+				optionalObject(update.capabilities)
 			);
 		case "session_message":
 			return (
 				typeof update.messageId === "string" &&
 				optionalString(update.senderSessionId) &&
 				optionalString(update.recipientSessionId) &&
-				(update.content === undefined ||
-					update.content === null ||
-					(Array.isArray(update.content) && update.content.every(contentBlock)))
+				optionalContentBlocks(update.content)
 			);
 		case "plan":
 			return Array.isArray(update.entries);
+		case "plan_update":
+			return planUpdateContent(update.plan);
+		case "plan_removed":
+			return typeof update.planId === "string";
+		case "notice":
+			return (
+				typeof update.severity === "string" &&
+				typeof update.title === "string" &&
+				optionalString(update.description)
+			);
+		case "compaction_update":
+			return (
+				typeof update.compactionId === "string" &&
+				typeof update.status === "string" &&
+				optionalContentBlocks(update.summary) &&
+				optionalString(update.error)
+			);
+		case "compaction_summary_chunk":
+			return typeof update.compactionId === "string" && contentBlock(update.content);
 		case "current_mode_update":
 			return typeof update.currentModeId === "string";
 		case "available_commands_update":

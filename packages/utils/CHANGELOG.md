@@ -58,6 +58,8 @@
 
 - Fixed an unhandled rejection when a subprocess is spawned with an already-aborted signal ([#15750](https://github.com/can1357/oh-my-pi/pull/15750) by [@harshaygadekar](https://github.com/harshaygadekar))
 - Added ACP subagents-RFD `subagent_update` and `session_message` types with runtime validation.
+- Added ACP `session/delete`, `subagent_update.capabilities`, and the unstable `plan_update`, `plan_removed`, `notice`, `compaction_update`, and `compaction_summary_chunk` session updates with their client capabilities and runtime validation.
+- Added request withdrawal to the ACP connection: aborting the signal passed to `request()` or `unstable_createElicitation()` sends `$/cancel_request` and rejects with a request-cancelled error.
 
 ## [18.10.0] - 2026-10-12
 
