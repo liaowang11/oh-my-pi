@@ -77,6 +77,7 @@ const SessionUpdate = type({
 		sessionId: "string",
 		"title?": "string | null | undefined",
 		"description?": "string | null | undefined",
+		"capabilities?": type("object").narrow(notArray).or("null | undefined"),
 		"state?": type({ state: "string", "stopReason?": "string | null | undefined" }).narrow(notArray).or("null | undefined"),
 	})
 	.or({
@@ -87,6 +88,22 @@ const SessionUpdate = type({
 		"content?": ContentBlock.array().or("null | undefined"),
 	})
 	.or({ sessionUpdate: "'plan'", entries: "unknown[]" })
+	.or({
+		sessionUpdate: "'plan_update'",
+		plan: type({ type: "'items'", planId: "string", entries: "unknown[]" })
+			.or({ type: "'file'", planId: "string", uri: "string" })
+			.or({ type: "'markdown'", planId: "string", content: "string" }).narrow(notArray),
+	})
+	.or({ sessionUpdate: "'plan_removed'", planId: "string" })
+	.or({ sessionUpdate: "'notice'", severity: "string", title: "string", "description?": "string | null | undefined" })
+	.or({
+		sessionUpdate: "'compaction_update'",
+		compactionId: "string",
+		status: "string",
+		"summary?": ContentBlock.array().or("null | undefined"),
+		"error?": "string | null | undefined",
+	})
+	.or({ sessionUpdate: "'compaction_summary_chunk'", compactionId: "string", content: ContentBlock })
 	.or({ sessionUpdate: "'current_mode_update'", currentModeId: "string" })
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
 	.or({ sessionUpdate: "'config_option_update'", configOptions: "unknown[]" })
