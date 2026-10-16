@@ -1,7 +1,8 @@
 /**
  * The JetBrains AIR `sessionIndex` ACP extension: `session/list` as a bounded
  * page ordered by last prompt, with AIR row metadata and an archive filter,
- * plus `_session/rename`, `_session/archive` and `_session/unarchive`.
+ * plus `_session/rename`, `_session/archive` and `_session/unarchive`, and
+ * the live list of `acp-session-list-subscriptions.ts`.
  *
  * Only an AIR client that lists `sessionIndex` gets any of it; every other
  * client keeps the plain `session/list`. Wire shapes match claude-agent-acp's
@@ -19,6 +20,8 @@ export const AIR_SESSION_INDEX_CAPABILITY = "sessionIndex";
 export const AIR_SESSION_ARCHIVE_CAPABILITY = "sessionArchive";
 /** Advertised with {@link AIR_SESSION_INDEX_CAPABILITY}: `_session/rename`. */
 export const AIR_SESSION_RENAME_CAPABILITY = "sessionRename";
+/** Advertised with {@link AIR_SESSION_INDEX_CAPABILITY}: `_session/list/subscribe` and `_session/list/unsubscribe`. */
+export const AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY = "sessionListSubscribe";
 /** Advertised with {@link AIR_SESSION_INDEX_CAPABILITY}: list rows mark sessions in an agent-made worktree. */
 export const AIR_SESSION_WORKTREES_CAPABILITY = "sessionWorktrees";
 
@@ -77,6 +80,7 @@ export function sessionIndexCapabilities(capabilities: ClientCapabilities | unde
 				AIR_SESSION_INDEX_CAPABILITY,
 				AIR_SESSION_ARCHIVE_CAPABILITY,
 				AIR_SESSION_RENAME_CAPABILITY,
+				AIR_SESSION_LIST_SUBSCRIBE_CAPABILITY,
 				AIR_SESSION_WORKTREES_CAPABILITY,
 			]
 		: [];
