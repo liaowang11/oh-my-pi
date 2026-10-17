@@ -47,6 +47,7 @@ import {
 	type SubagentWorkState,
 	type Usage,
 } from "@oh-my-pi/pi-utils/acp";
+import { normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { disableProvider, enableProvider } from "../../capability";
 import {
 	applyModelPreset,
@@ -2516,9 +2517,11 @@ export class AcpAgent implements Agent {
 	}
 
 	#assertMatchingCwd(session: AgentSession, cwd: string): void {
+		// Equivalent physical directories (symlinks or macOS /private aliases) are the
+		// same workspace; the resolved spellings stay in the error for the client.
 		const expected = path.resolve(cwd);
 		const actual = path.resolve(session.sessionManager.getCwd());
-		if (actual !== expected) {
+		if (normalizePathForComparison(expected) !== normalizePathForComparison(actual)) {
 			throw new Error(`ACP session ${session.sessionId} is already loaded for ${actual}, not ${expected}`);
 		}
 	}
