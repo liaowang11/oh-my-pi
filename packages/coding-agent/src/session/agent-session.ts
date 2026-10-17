@@ -119,6 +119,7 @@ import {
 	withFileLock,
 } from "@oh-my-pi/pi-utils";
 import { writeArchive } from "@oh-my-pi/pi-utils/ar";
+import { normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { frameDataBytesBudget, readerIncludesThinking } from "@oh-my-pi/snapcompact";
 import type { AdvisorConfig } from "../advisor/advisor-config-types";
 import type { ModelRoleLookup } from "../modes/view-model/overlays/model-browser";
@@ -15018,11 +15019,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (options?.preserveLocalCwd) {
 				this.sessionManager.setCwdWithoutRelocation(previousSessionState.cwd);
 			} else {
-				if (!options?.onCwdChange && path.resolve(recordedCwd) !== path.resolve(previousSessionState.cwd)) {
+				const previousCwdIdentity = normalizePathForComparison(previousSessionState.cwd);
+				const recordedCwdIdentity = normalizePathForComparison(recordedCwd);
+				if (!options?.onCwdChange && recordedCwdIdentity !== previousCwdIdentity) {
 					throw SESSION_CWD_CHANGE_REJECTED;
 				}
 				if (options?.onCwdChange) {
-					if (path.resolve(newCwd) !== path.resolve(previousSessionState.cwd)) {
+					const newCwdIdentity = newCwd === recordedCwd ? recordedCwdIdentity : normalizePathForComparison(newCwd);
+					if (newCwdIdentity !== previousCwdIdentity) {
 						cwdChangeTarget = newCwd;
 						if (!(await options.onCwdChange(newCwd, previousSessionState.cwd))) {
 							throw SESSION_CWD_CHANGE_REJECTED;
