@@ -1,4 +1,6 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "bun:test";
+import * as fs from "node:fs/promises";
+import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { Model } from "@oh-my-pi/pi-ai";
 import { getBundledModel } from "@oh-my-pi/pi-catalog/models";
@@ -184,6 +186,41 @@ describe("AgentSession.switchSession previous-context build", () => {
 		expect(sessionManager.getSessionFile()).toBe(previousSessionFile);
 		expect(sessionManager.getCwd()).toBe(sourceDir.path());
 	});
+	for (const withCallback of [false, true]) {
+		it.skipIf(process.platform === "win32")(
+			withCallback
+				? "restores an aliased directory without requesting a cwd change"
+				: "restores an aliased directory without a cwd callback",
+			async () => {
+				const root = TempDir.createSync("@pi-switch-cwd-alias-");
+				tempDirs.push(root);
+				const realCwd = path.join(root.path(), "project");
+				const aliasCwd = path.join(root.path(), "alias");
+				await fs.mkdir(realCwd);
+				await fs.symlink(realCwd, aliasCwd, "dir");
+				const target = SessionManager.create(realCwd, root.path());
+				target.appendMessage({ role: "user", content: "restore through alias", timestamp: 1 });
+				await target.ensureOnDisk();
+				await target.flush();
+				const targetFile = target.getSessionFile()!;
+				const targetId = target.getSessionId();
+				await target.close();
+				const saved = await Bun.file(targetFile).text();
+				const { session, sessionManager } = buildSession(root);
+				sessionManager.setCwdWithoutRelocation(aliasCwd);
+				const onCwdChange = vi.fn(async () => false);
+
+				expect(await session.switchSession(targetFile, withCallback ? { onCwdChange } : undefined)).toBe(true);
+				expect(session.sessionId).toBe(targetId);
+				expect(sessionManager.buildSessionContext().messages).toMatchObject([
+					{ role: "user", content: "restore through alias" },
+				]);
+				expect(onCwdChange).not.toHaveBeenCalled();
+				expect(await Bun.file(targetFile).text()).toBe(saved);
+			},
+		);
+	}
+
 	it("rejects callback-free switches across project directories", async () => {
 		const sourceDir = TempDir.createSync("@pi-switch-no-callback-source-");
 		const targetDir = TempDir.createSync("@pi-switch-no-callback-target-");
