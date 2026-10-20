@@ -1313,7 +1313,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
+		this.#scheduleBootstrapUpdates(record);
 		return response;
 	}
 
@@ -1325,7 +1325,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
+		this.#scheduleBootstrapUpdates(record);
 		return response;
 	}
 
@@ -1371,7 +1371,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
+		this.#scheduleBootstrapUpdates(record);
 		return response;
 	}
 
@@ -1384,7 +1384,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record.session.sessionId);
+		this.#scheduleBootstrapUpdates(record);
 		return response;
 	}
 
@@ -4002,7 +4002,8 @@ export class AcpAgent implements Agent {
 		};
 	}
 
-	#scheduleBootstrapUpdates(sessionId: string): void {
+	#scheduleBootstrapUpdates(record: ManagedSessionRecord): void {
+		const sessionId = record.session.sessionId;
 		// Defer first notifications until the response has reached the client.
 		// Zed's agent-client-protocol reader dispatches responses and
 		// notifications to different async tasks; sending the first
@@ -4023,11 +4024,7 @@ export class AcpAgent implements Agent {
 		// reported in the response's `configOptions`, so deferring the
 		// notification loses no state.
 		setTimeout(() => {
-			if (this.#connection.signal.aborted) {
-				return;
-			}
-			const record = this.#sessions.get(sessionId);
-			if (!record) {
+			if (this.#connection.signal.aborted || this.#sessions.get(sessionId) !== record) {
 				return;
 			}
 			if (!record.lifetimeUnsubscribe) {
@@ -4052,7 +4049,27 @@ export class AcpAgent implements Agent {
 				});
 			}
 			void this.#emitBootstrapUpdates(sessionId, record);
+			void this.#emitDiscoveredModelOptions(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
+	}
+
+	async #emitDiscoveredModelOptions(sessionId: string, record: ManagedSessionRecord): Promise<void> {
+		try {
+			// Discovery is independent of the command/title/usage bootstrap above,
+			// which must stay responsive when a provider is slow or never starts.
+			await record.session.modelRegistry.awaitBackgroundRefresh();
+			if (this.#connection.signal.aborted || this.#sessions.get(sessionId) !== record) {
+				return;
+			}
+			// Build after discovery so selections changed while it was pending are
+			// reflected in the snapshot sent to the client.
+			await this.#pushConfigOptionUpdate(record);
+		} catch (error) {
+			logger.warn("Failed to publish ACP model options after background discovery", {
+				sessionId,
+				error: String(error),
+			});
+		}
 	}
 
 	async #emitBootstrapUpdates(sessionId: string, record: ManagedSessionRecord): Promise<void> {
