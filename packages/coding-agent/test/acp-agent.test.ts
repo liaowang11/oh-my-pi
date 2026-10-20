@@ -655,6 +655,8 @@ async function createHarness(
 		authStorage?: AuthStorage;
 		/** Background job manager handed to every factory-created session. */
 		asyncJobManager?: AsyncJobManager;
+		/** Model catalog every session reports as available. */
+		models?: Model[];
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -688,10 +690,10 @@ async function createHarness(
 		closed: Promise.withResolvers<void>().promise,
 	} as unknown as AgentSideConnection;
 
-	const initialSession = new FakeAgentSession(cwdA);
+	const initialSession = new FakeAgentSession(cwdA, options.models);
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
-		const session = new FakeAgentSession(cwd);
+		const session = new FakeAgentSession(cwd, options.models);
 		if (options.authStorage) session.authStorage = options.authStorage;
 		if (options.extensionRunners) {
 			session.extensionRunner = new ExtensionRunner(
@@ -1822,6 +1824,20 @@ describe("ACP agent", () => {
 		vi.useRealTimers();
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("labels same-named models from different providers distinctly in the model picker", async () => {
+		const sapModel = buildModel({ ...TEST_MODELS[0]!, provider: "sap-ai-core" });
+		const harness = await createHarness({ models: [TEST_MODELS[0]!, sapModel] });
+		const session = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		const modelOption = session.configOptions?.find(option => option.id === "model") as
+			| { options: Array<{ value: string; name: string }> }
+			| undefined;
+		expect(modelOption?.options.map(option => option.name)).toEqual([
+			"anthropic/Claude Sonnet",
+			"sap-ai-core/Claude Sonnet",
+		]);
 	});
 
 	it("lists role selectors for ACP mobile voice settings", async () => {

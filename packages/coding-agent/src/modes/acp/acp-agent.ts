@@ -3282,7 +3282,7 @@ export class AcpAgent implements Agent {
 				currentValue: currentModel ? this.#toModelId(currentModel) : this.#toModelId(models[0]),
 				options: models.map(model => ({
 					value: this.#toModelId(model),
-					name: model.name,
+					name: `${model.provider}/${model.name}`,
 					description: `${model.provider}/${model.id}`,
 				})),
 			});
