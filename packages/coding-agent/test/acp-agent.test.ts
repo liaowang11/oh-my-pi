@@ -56,6 +56,7 @@ import type {
 	CreateElicitationRequest,
 	CreateElicitationResponse,
 	PromptRequest,
+	SessionConfigOption,
 	SessionNotification,
 	Validator,
 } from "@oh-my-pi/pi-utils/acp";
@@ -76,6 +77,18 @@ import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/p
 function expectAcpStructure(schema: Validator<unknown>, value: unknown): void {
 	const result = schema.safeParse(value);
 	expect(result.success, result.success ? undefined : JSON.stringify(result.error.issues, null, 2)).toBe(true);
+}
+
+function getSessionConfigOption(
+	configOptions: SessionConfigOption[] | null | undefined,
+	id: string,
+): SessionConfigOption | undefined {
+	return configOptions?.find(option => option.id === id);
+}
+
+function getModelSelectors(configOptions: SessionConfigOption[] | null | undefined): string[] {
+	const option = getSessionConfigOption(configOptions, "model");
+	return option?.type === "select" ? option.options.map(model => model.value) : [];
 }
 
 const TEST_MODELS: Model[] = [
@@ -104,6 +117,23 @@ const TEST_MODELS: Model[] = [
 		maxTokens: 8_192,
 	}),
 ];
+
+function makeDiscoveredModel(id: string): Model {
+	return buildModel({
+		id,
+		name: id,
+		api: "openai-responses",
+		provider: "discovery-test",
+		baseUrl: "https://example.invalid",
+		reasoning: true,
+		input: ["text", "image"],
+		cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+		contextWindow: 200_000,
+		maxTokens: 8_192,
+	});
+}
+
+const DISCOVERED_MODEL = makeDiscoveredModel("fresh-model");
 
 function createTaskSession(cwd: string): ToolSession {
 	return {
@@ -213,15 +243,16 @@ class FakeAgentSession {
 	promptHook: (() => Promise<void>) | undefined;
 	asyncJobManager: AsyncJobManager | undefined;
 	#listeners = new Set<(event: AgentSessionEvent) => void>();
+	#backgroundRefresh: Promise<void> | undefined;
+	availableModels: Model[];
+	backgroundRefreshStarted = Promise.withResolvers<void>();
 
 	getAgentId(): string {
 		return "Main";
 	}
 
-	constructor(
-		cwd: string,
-		private readonly models: Model[] = TEST_MODELS,
-	) {
+	constructor(cwd: string, models: Model[] = TEST_MODELS) {
+		this.availableModels = [...models];
 		this.sessionManager = SessionManager.create(cwd);
 		this.sessionId = this.sessionManager.getSessionId();
 		this.agent = {
@@ -259,16 +290,27 @@ class FakeAgentSession {
 		getApiKey: (model: Model) => Promise<string>;
 		hasConfiguredAuth: (model: Model) => boolean;
 		authStorage?: AuthStorage;
+		awaitBackgroundRefresh: () => Promise<void>;
 	} {
 		return {
 			getApiKey: async (_model: Model) => "test-key",
 			hasConfiguredAuth: (_model: Model) => true,
+			awaitBackgroundRefresh: async () => {
+				this.backgroundRefreshStarted.resolve();
+				await this.#backgroundRefresh;
+			},
 			...(this.authStorage ? { authStorage: this.authStorage } : {}),
 		};
 	}
 
+	holdBackgroundRefresh(): { resolve: () => void; reject: (error?: unknown) => void } {
+		const refresh = Promise.withResolvers<void>();
+		this.#backgroundRefresh = refresh.promise;
+		return { resolve: refresh.resolve, reject: refresh.reject };
+	}
+
 	getAvailableModels(): Model[] {
-		return this.models;
+		return this.availableModels;
 	}
 
 	getAvailableEffortSelectors(): ReadonlyArray<string> {
@@ -657,6 +699,8 @@ async function createHarness(
 		asyncJobManager?: AsyncJobManager;
 		/** Model catalog every session reports as available. */
 		models?: Model[];
+		/** Configures test controls before a factory-created session is registered. */
+		configureSession?: (session: FakeAgentSession) => void;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -694,6 +738,7 @@ async function createHarness(
 	sessions.push(initialSession);
 	const factory = async (cwd: string, factoryOptions?: { interactivePrompts?: boolean }) => {
 		const session = new FakeAgentSession(cwd, options.models);
+		options.configureSession?.(session);
 		if (options.authStorage) session.authStorage = options.authStorage;
 		if (options.extensionRunners) {
 			session.extensionRunner = new ExtensionRunner(
@@ -742,6 +787,22 @@ async function createHarness(
 async function advanceBootstrapGuard(): Promise<void> {
 	vi.advanceTimersByTime(ACP_BOOTSTRAP_RACE_GUARD_MS);
 	await Promise.resolve();
+	// Let the warm-registry config snapshot land before event tests take their baselines.
+	await flushMicrotasks();
+}
+
+async function flushMicrotasks(): Promise<void> {
+	await Promise.resolve();
+	await Promise.resolve();
+}
+
+async function createStoredSession(harness: AgentHarness): Promise<FakeAgentSession> {
+	const session = new FakeAgentSession(harness.cwdA);
+	harness.sessions.push(session);
+	session.sessionManager.appendMessage({ role: "user", content: "stored bootstrap source", timestamp: Date.now() });
+	await session.sessionManager.ensureOnDisk();
+	await session.sessionManager.flush();
+	return session;
 }
 
 describe("ACP agent", () => {
@@ -808,6 +869,381 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("publishes discovered model options without blocking session startup or bootstrap updates", async () => {
+		const selector = `${DISCOVERED_MODEL.provider}/${DISCOVERED_MODEL.id}`;
+		const discoveredUpdate = Promise.withResolvers<SessionNotification>();
+		const bootstrapTypes = new Set<string>();
+		const bootstrapReady = Promise.withResolvers<void>();
+
+		let releaseDiscovery: { resolve: () => void; reject: (error?: unknown) => void } | undefined;
+		const harness = await createHarness({
+			configureSession: session => {
+				releaseDiscovery = session.holdBackgroundRefresh();
+			},
+			sessionUpdateHook: notification => {
+				if (notification.sessionId !== sessionId) return;
+				if (notification.update.sessionUpdate === "config_option_update") {
+					const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+					if (modelOption?.type === "select" && modelOption.options.some(option => option.value === selector)) {
+						discoveredUpdate.resolve(notification);
+					}
+					return;
+				}
+				if (
+					notification.update.sessionUpdate === "available_commands_update" ||
+					notification.update.sessionUpdate === "session_info_update" ||
+					notification.update.sessionUpdate === "usage_update"
+				) {
+					bootstrapTypes.add(notification.update.sessionUpdate);
+					if (bootstrapTypes.size === 3) bootstrapReady.resolve();
+				}
+			},
+		});
+		vi.useFakeTimers();
+
+		// Discovery is already pending inside the factory-created session, yet
+		// session/new returns its partial response without waiting for it.
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const sessionId = created.sessionId;
+		const session = harness.findSession(created.sessionId)!;
+		session.contextUsage = { tokens: 4, contextWindow: 200_000, percent: 0.002 };
+		expect(getModelSelectors(created.configOptions)).toEqual(
+			TEST_MODELS.map(model => `${model.provider}/${model.id}`),
+		);
+		expect(session.promptCalls).toEqual([]);
+		expect(
+			harness.updates.filter(
+				notification =>
+					notification.sessionId === created.sessionId &&
+					notification.update.sessionUpdate === "config_option_update",
+			),
+		).toHaveLength(0);
+
+		await advanceBootstrapGuard();
+		await session.backgroundRefreshStarted.promise;
+		await bootstrapReady.promise;
+		// Commands, title, and usage are not held behind provider discovery.
+		expect(bootstrapTypes).toEqual(new Set(["available_commands_update", "session_info_update", "usage_update"]));
+		expect(
+			harness.updates.filter(
+				notification =>
+					notification.sessionId === created.sessionId &&
+					notification.update.sessionUpdate === "config_option_update",
+			),
+		).toHaveLength(0);
+
+		session.availableModels.push(DISCOVERED_MODEL);
+		if (!releaseDiscovery) throw new Error("model discovery was not configured");
+		releaseDiscovery.resolve();
+		const notification = await discoveredUpdate.promise;
+		expect(notification.sessionId).toBe(created.sessionId);
+		if (notification.update.sessionUpdate !== "config_option_update") {
+			throw new Error("expected config_option_update after model discovery");
+		}
+		expect(getModelSelectors(notification.update.configOptions)).toContain(selector);
+		expect(session.promptCalls).toEqual([]);
+
+		await harness.agent.dispose();
+	});
+
+	it("publishes models discovered before the ACP bootstrap guard", async () => {
+		const selector = `${DISCOVERED_MODEL.provider}/${DISCOVERED_MODEL.id}`;
+		const published = Promise.withResolvers<SessionNotification>();
+		let releaseDiscovery: { resolve: () => void; reject: (error?: unknown) => void } | undefined;
+
+		const harness = await createHarness({
+			configureSession: session => {
+				releaseDiscovery = session.holdBackgroundRefresh();
+			},
+			sessionUpdateHook: notification => {
+				if (notification.sessionId !== sessionId || notification.update.sessionUpdate !== "config_option_update")
+					return;
+				const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+				if (modelOption?.type === "select" && modelOption.options.some(option => option.value === selector))
+					published.resolve(notification);
+			},
+		});
+		vi.useFakeTimers();
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const sessionId = created.sessionId;
+		const session = harness.findSession(created.sessionId)!;
+		session.availableModels.push(DISCOVERED_MODEL);
+		if (!releaseDiscovery) throw new Error("model discovery was not configured");
+		releaseDiscovery.resolve();
+		expect(
+			harness.updates.filter(
+				notification =>
+					notification.sessionId === created.sessionId &&
+					notification.update.sessionUpdate === "config_option_update",
+			),
+		).toHaveLength(0);
+
+		await advanceBootstrapGuard();
+		const notification = await published.promise;
+		expect(notification.sessionId).toBe(created.sessionId);
+		await harness.agent.dispose();
+	});
+
+	it("publishes a config snapshot immediately when no model refresh is in flight", async () => {
+		const published = Promise.withResolvers<SessionNotification>();
+
+		const harness = await createHarness({
+			sessionUpdateHook: notification => {
+				if (notification.sessionId === sessionId && notification.update.sessionUpdate === "config_option_update") {
+					published.resolve(notification);
+				}
+			},
+		});
+		vi.useFakeTimers();
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const sessionId = created.sessionId;
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		const notification = await published.promise;
+		expect(notification.sessionId).toBe(created.sessionId);
+		if (notification.update.sessionUpdate !== "config_option_update") {
+			throw new Error("expected config_option_update for a warm registry");
+		}
+		expect(getModelSelectors(notification.update.configOptions)).toEqual(
+			TEST_MODELS.map(model => `${model.provider}/${model.id}`),
+		);
+		await session.backgroundRefreshStarted.promise;
+		await harness.agent.dispose();
+	});
+
+	it("retains model and effort selections made while model discovery is pending", async () => {
+		const selector = `${DISCOVERED_MODEL.provider}/${DISCOVERED_MODEL.id}`;
+		const published = Promise.withResolvers<SessionNotification>();
+
+		let releaseDiscovery: { resolve: () => void; reject: (error?: unknown) => void } | undefined;
+		const harness = await createHarness({
+			configureSession: session => {
+				releaseDiscovery = session.holdBackgroundRefresh();
+			},
+			sessionUpdateHook: notification => {
+				if (
+					notification.sessionId !== targetSessionId ||
+					notification.update.sessionUpdate !== "config_option_update"
+				) {
+					return;
+				}
+				const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+				if (modelOption?.type === "select" && modelOption.options.some(option => option.value === selector))
+					published.resolve(notification);
+			},
+		});
+		vi.useFakeTimers();
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const targetSessionId = created.sessionId;
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		await session.backgroundRefreshStarted.promise;
+		await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model",
+			value: `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`,
+		});
+		await harness.agent.setSessionConfigOption({ sessionId: created.sessionId, configId: "thinking", value: "high" });
+
+		session.availableModels.push(DISCOVERED_MODEL);
+		if (!releaseDiscovery) throw new Error("model discovery was not configured");
+		releaseDiscovery.resolve();
+		const notification = await published.promise;
+		if (notification.update.sessionUpdate !== "config_option_update") {
+			throw new Error("expected config_option_update after model discovery");
+		}
+		const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+		const thinkingOption = getSessionConfigOption(notification.update.configOptions, "thinking");
+		expect(modelOption?.currentValue).toBe(`${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`);
+		expect(thinkingOption?.currentValue).toBe("high");
+		expect(getModelSelectors(notification.update.configOptions)).toContain(selector);
+		await harness.agent.dispose();
+	});
+
+	it("publishes refreshed model options through load, resume, and fork bootstrap paths", async () => {
+		const paths: Array<{
+			name: string;
+			attach: (harness: AgentHarness, stored: FakeAgentSession) => Promise<string>;
+		}> = [
+			{
+				name: "load",
+				attach: async (harness, stored) => {
+					await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+					return stored.sessionId;
+				},
+			},
+			{
+				name: "resume",
+				attach: async (harness, stored) => {
+					await harness.agent.resumeSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+					return stored.sessionId;
+				},
+			},
+			{
+				name: "fork",
+				attach: async (harness, stored) => {
+					const forked = await harness.agent.unstable_forkSession({
+						sessionId: stored.sessionId,
+						cwd: harness.cwdA,
+						mcpServers: [],
+					});
+					return forked.sessionId;
+				},
+			},
+		];
+
+		for (const attachment of paths) {
+			const selector = `${DISCOVERED_MODEL.provider}/${DISCOVERED_MODEL.id}`;
+			const published = Promise.withResolvers<SessionNotification>();
+
+			let releaseDiscovery: { resolve: () => void; reject: (error?: unknown) => void } | undefined;
+			const harness = await createHarness({
+				configureSession: session => {
+					releaseDiscovery = session.holdBackgroundRefresh();
+				},
+				sessionUpdateHook: notification => {
+					if (
+						notification.sessionId === targetSessionId &&
+						notification.update.sessionUpdate === "config_option_update"
+					) {
+						const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+						if (modelOption?.type === "select" && modelOption.options.some(option => option.value === selector))
+							published.resolve(notification);
+					}
+				},
+			});
+			vi.useFakeTimers();
+
+			const stored = await createStoredSession(harness);
+			const targetSessionId = await attachment.attach(harness, stored);
+			const session = harness.sessions.findLast(candidate => candidate.sessionId === targetSessionId);
+			if (!session) throw new Error(`${attachment.name} session was not attached`);
+			await advanceBootstrapGuard();
+			await session.backgroundRefreshStarted.promise;
+			expect(
+				harness.updates.filter(
+					notification =>
+						notification.sessionId === targetSessionId &&
+						notification.update.sessionUpdate === "config_option_update",
+				),
+			).toHaveLength(0);
+
+			session.availableModels.push(DISCOVERED_MODEL);
+			if (!releaseDiscovery) throw new Error(`${attachment.name} model discovery was not configured`);
+			releaseDiscovery.resolve();
+			const notification = await published.promise;
+			expect(notification.sessionId).toBe(targetSessionId);
+			expect(notification.update.sessionUpdate).toBe("config_option_update");
+			await harness.agent.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	it("drops model updates after a session or its ACP connection closes", async () => {
+		for (const close of ["session", "connection"] as const) {
+			let releaseDiscovery: { resolve: () => void; reject: (error?: unknown) => void } | undefined;
+			const harness = await createHarness({
+				configureSession: session => {
+					releaseDiscovery = session.holdBackgroundRefresh();
+				},
+			});
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			await session.backgroundRefreshStarted.promise;
+
+			if (close === "session") {
+				await harness.agent.closeSession({ sessionId: created.sessionId });
+			} else {
+				harness.abortController.abort();
+			}
+			session.availableModels.push(makeDiscoveredModel(`closed-${close}-model`));
+			if (!releaseDiscovery) throw new Error("model discovery was not configured");
+			releaseDiscovery.resolve();
+			await flushMicrotasks();
+			expect(
+				harness.updates.filter(
+					notification =>
+						notification.sessionId === created.sessionId &&
+						notification.update.sessionUpdate === "config_option_update",
+				),
+			).toHaveLength(0);
+			await harness.agent.dispose();
+			vi.useRealTimers();
+		}
+	});
+
+	it("does not publish a pending refresh for a replaced record with the same session id", async () => {
+		const staleModel = makeDiscoveredModel("stale-model");
+		const staleSelector = `${staleModel.provider}/${staleModel.id}`;
+		const replacementModel = makeDiscoveredModel("replacement-model");
+		const replacementSelector = `${replacementModel.provider}/${replacementModel.id}`;
+		const replacementPublished = Promise.withResolvers<SessionNotification>();
+		const publications: SessionNotification[] = [];
+
+		const releases: Array<{ session: FakeAgentSession; resolve: () => void; reject: (error?: unknown) => void }> = [];
+		const harness = await createHarness({
+			configureSession: session => {
+				const release = session.holdBackgroundRefresh();
+				releases.push({ session, ...release });
+			},
+			sessionUpdateHook: notification => {
+				if (
+					notification.sessionId !== targetSessionId ||
+					notification.update.sessionUpdate !== "config_option_update"
+				) {
+					return;
+				}
+				publications.push(notification);
+				const modelOption = getSessionConfigOption(notification.update.configOptions, "model");
+				if (
+					modelOption?.type === "select" &&
+					modelOption.options.some(option => option.value === replacementSelector)
+				) {
+					replacementPublished.resolve(notification);
+				}
+			},
+		});
+		vi.useFakeTimers();
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const targetSessionId = created.sessionId;
+		const original = harness.findSession(created.sessionId)!;
+		await original.sessionManager.ensureOnDisk();
+		await advanceBootstrapGuard();
+		await original.backgroundRefreshStarted.promise;
+		await harness.agent.closeSession({ sessionId: created.sessionId });
+
+		await harness.agent.resumeSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const replacement = harness.sessions.findLast(session => session.sessionId === created.sessionId)!;
+		await advanceBootstrapGuard();
+		await replacement.backgroundRefreshStarted.promise;
+
+		const staleRelease = releases.find(release => release.session === original);
+		const replacementRelease = releases.find(release => release.session === replacement);
+		if (!staleRelease || !replacementRelease) throw new Error("expected both discovery waiters");
+		staleRelease.session.availableModels.push(staleModel);
+		staleRelease.resolve();
+		await flushMicrotasks();
+		expect(publications).toHaveLength(0);
+
+		replacement.availableModels.push(replacementModel);
+		replacementRelease.resolve();
+		const notification = await replacementPublished.promise;
+		expect(notification.sessionId).toBe(created.sessionId);
+		if (notification.update.sessionUpdate !== "config_option_update") {
+			throw new Error("expected config_option_update for replacement session");
+		}
+		const values = getModelSelectors(notification.update.configOptions);
+		expect(values).toContain(replacementSelector);
+		expect(values).not.toContain(staleSelector);
+		await harness.agent.dispose();
 	});
 
 	it("writes no session file until the first prompt produces an assistant reply", async () => {
