@@ -364,7 +364,8 @@ export type SessionUpdate =
 	| ({ sessionUpdate: "session_message" } & SessionMessage)
 	| ({ sessionUpdate: "async_task_spawned" } & AsyncTaskSpawned)
 	| ({ sessionUpdate: "async_task_progress" } & AsyncTaskProgress)
-	| ({ sessionUpdate: "async_task_state_update" } & AsyncTaskStateUpdate);
+	| ({ sessionUpdate: "async_task_state_update" } & AsyncTaskStateUpdate)
+	| ({ sessionUpdate: "state_update" } & RunStateUpdate);
 /** Plan content carried by `plan_update` (unstable): entries, a file URI, or markdown. */
 export type PlanUpdateContent =
 	| ({ type: "items"; planId: string; entries: PlanEntry[] } & Meta)
@@ -398,6 +399,19 @@ export interface CompactionSummaryChunk extends Meta {
 	compactionId: string;
 	content: ContentBlock;
 }
+/**
+ * The session's foreground run state, ACP v2's `StateUpdate` carried on the
+ * v1 wire for a client that opts in (`clientCapabilities._meta.stateUpdate`).
+ */
+export type RunStateUpdate =
+	| ({ state: "running" } & Meta)
+	| ({ state: "requires_action" } & Meta)
+	| ({
+			state: "idle";
+			stopReason?: StopReason | "error" | null;
+			usage?: Usage | null;
+			error?: { code: number; message: string; data?: unknown } | null;
+	  } & Meta);
 /** Current-work snapshot of a subagent session (ACP subagents RFD). */
 export type SubagentWorkState =
 	| ({ state: "running" } & Meta)

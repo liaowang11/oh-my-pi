@@ -57,6 +57,8 @@
 - Fixed releasing or reaping a browser tab returning while Chromium still listed the page; the close now waits until Chromium reports the tab destroyed ([#16680](https://github.com/can1357/oh-my-pi/pull/16680) by [@H4vC](https://github.com/H4vC))
 - Fixed the advisor prompt forbidding all repeated advice, including real escalations: advisors may now re-raise a prior nit or concern as a blocker once new evidence makes it one ([#13887](https://github.com/can1357/oh-my-pi/issues/13887), [#16484](https://github.com/can1357/oh-my-pi/pull/16484) by [@pjh890321](https://github.com/pjh890321))
 - Fixed Esc no longer interrupting in the TUI after a second MCP OAuth login replaced an unfinished first one ([#16046](https://github.com/can1357/oh-my-pi/pull/16046) by [@marcintustin](https://github.com/marcintustin))
+- ACP clients that send `clientCapabilities._meta.stateUpdate: true` now receive ACP v2-style `state_update` session updates (`running`, `requires_action`, `idle` with its stop reason) for prompt turns and for turns the agent starts on its own
+
 ### Changed
 
 - ACP model picker labels now include the provider (`provider/Model Name`), so same-named models from different providers are distinguishable
