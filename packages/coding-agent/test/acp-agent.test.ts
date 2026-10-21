@@ -5378,7 +5378,10 @@ describe("ACP agent", () => {
 				} as AgentSessionEvent);
 			},
 			endForeignTurn: text => {
-				emit({ type: "agent_end", messages: [makeAssistantMessage(text)] } as AgentSessionEvent);
+				// The background turn's usage is persisted like any other turn's.
+				const message = makeAssistantMessage(text);
+				session.sessionManager.appendMessage(message);
+				emit({ type: "agent_end", messages: [message] } as AgentSessionEvent);
 				session.isStreaming = false;
 				session.waitForIdleBlocker = undefined;
 				idle.resolve();
@@ -5419,8 +5422,11 @@ describe("ACP agent", () => {
 		foreign.endForeignTurn("watcher finished");
 		await Bun.sleep(0);
 
-		// The autonomous turn's agent_end must not answer the user's prompt.
-		expect(await response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+		// The autonomous turn's agent_end must not answer the user's prompt, and
+		// its usage is not charged to it: only the prompt's own 18-token reply is.
+		const result = await response;
+		expect(result.stopReason).toBe("end_turn");
+		expect(result.usage?.totalTokens).toBe(18);
 		expect(settled).toBe(true);
 		expect(session.promptCalls).toEqual(["power cycle done"]);
 		expect(messageChunks(harness, created.sessionId, updatesBefore)).toEqual(["watcher finished", "pong"]);

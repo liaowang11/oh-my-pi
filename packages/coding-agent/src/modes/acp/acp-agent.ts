@@ -1851,11 +1851,19 @@ export class AcpAgent implements Agent {
 		text: string,
 		options: PromptOptions,
 	): Promise<boolean> {
-		while (true) {
+		for (let attempt = 0; ; attempt++) {
 			if (promptTurn) {
 				// Re-captured with no await before dispatch: a foreign turn may have
 				// started or ended since the turn was reserved.
 				promptTurn.inheritedForeignTurn = record.session.isStreaming;
+				if (attempt > 0) {
+					// The turns this prompt waited out are not its usage. A first attempt
+					// keeps the reservation baseline, which still counts a builtin's own
+					// work before its residual prompt.
+					const manager = record.session.sessionManager;
+					promptTurn.usageBaseline = this.#cloneUsageStatistics(manager.getUsageStatistics());
+					promptTurn.modelUsageBaseline = manager.getModelUsageStatistics();
+				}
 			}
 			try {
 				return await record.session.prompt(text, options);
