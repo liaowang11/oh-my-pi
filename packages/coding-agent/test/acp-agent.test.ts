@@ -4589,7 +4589,6 @@ describe("ACP agent", () => {
 		expect(customMessage.content).toContain("# Sample\nDo work.");
 		expect(customMessage.content).toContain(`[Skill directory: ${skillDir}]`);
 		expect(customMessage.content).toContain("User: extra context");
-		expect(session.customMessageOptions[0]).toEqual({ streamingBehavior: "steer" });
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -5364,6 +5363,11 @@ describe("ACP agent", () => {
 			if (session.isStreaming) throw new AgentBusyError();
 			return await original(text, options);
 		};
+		const originalCustom = session.promptCustomMessage.bind(session);
+		session.promptCustomMessage = async (message, options) => {
+			if (session.isStreaming && !options?.streamingBehavior) throw new AgentBusyError();
+			return await originalCustom(message, options);
+		};
 		const idle = Promise.withResolvers<void>();
 		session.waitForIdleBlocker = () => idle.promise;
 		const emit = (event: AgentSessionEvent): void => {
@@ -5475,6 +5479,42 @@ describe("ACP agent", () => {
 		foreign.endForeignTurn("second job");
 		expect(await response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
 		expect(session.promptCalls).toEqual(["power cycle done"]);
+	});
+
+	it("runs a skill command that arrives during an autonomous turn after that turn ends", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const skillDir = path.join(harness.cwdA, ".skills", "sample");
+		const skillPath = path.join(skillDir, "SKILL.md");
+		await fs.promises.mkdir(skillDir, { recursive: true });
+		await fs.promises.writeFile(skillPath, "---\ndescription: Sample skill\n---\n# Sample\nDo work.\n");
+		session.skills = [
+			{ name: "sample", description: "Sample skill", filePath: skillPath, baseDir: skillDir, source: "test" },
+		];
+		const foreign = guardBusyAndHoldIdle(session);
+		session.isStreaming = true;
+		const updatesBefore = harness.updates.length;
+
+		let settled = false;
+		const response = harness.agent
+			.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/skill:sample extra context" }],
+			} as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+		foreign.streamForeignChunk("watcher finished");
+		await Bun.sleep(0);
+		expect(session.customMessages).toEqual([]);
+		foreign.endForeignTurn("watcher finished");
+
+		expect((await response).stopReason).toBe("end_turn");
+		expect(settled).toBe(true);
+		expect(session.customMessages.map(message => message.customType)).toEqual(["skill-prompt"]);
+		expect(messageChunks(harness, created.sessionId, updatesBefore)).toEqual(["watcher finished", "skill pong"]);
 	});
 
 	it("cancels a prompt waiting behind an autonomous turn without dispatching it later", async () => {

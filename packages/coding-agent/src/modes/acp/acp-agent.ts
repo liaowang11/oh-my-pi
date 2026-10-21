@@ -87,7 +87,7 @@ import {
 	resolveApprovedPlan,
 } from "../../plan-mode/approved-plan";
 import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
-import type { AgentSession, AgentSessionEvent, PromptOptions } from "../../session/agent-session";
+import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import {
@@ -1795,10 +1795,9 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await this.#promptWhenIdle(record, promptTurn, builtinResult.prompt, {
-					images,
-					synthetic: builtinResult.synthetic,
-				});
+				const residualAgentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
+					record.session.prompt(builtinResult.prompt, { images, synthetic: builtinResult.synthetic }),
+				);
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1819,7 +1818,9 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
-		const agentInvoked = await this.#promptWhenIdle(record, promptTurn, text, { images });
+		const agentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
+			record.session.prompt(text, { images }),
+		);
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -1833,8 +1834,9 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * `session.prompt()` for an ACP prompt turn, run behind any agent turn no
-	 * `session/prompt` owns. A finished background job can start such a turn
+	 * Start an ACP prompt turn's agent turn via `dispatch` — `session.prompt()`
+	 * or `promptCustomMessage()` with no `streamingBehavior` — behind any agent
+	 * turn no `session/prompt` owns. A finished background job can start such a turn
 	 * after the previous prompt ended; a bare prompt would then hit
 	 * AgentSession's busy guard and the user's message would be lost. Instead
 	 * the prompt parks until the session is idle and retries, so it runs as the
@@ -1848,8 +1850,7 @@ export class AcpAgent implements Agent {
 	async #promptWhenIdle(
 		record: ManagedSessionRecord,
 		promptTurn: PromptTurnState | undefined,
-		text: string,
-		options: PromptOptions,
+		dispatch: () => Promise<boolean>,
 	): Promise<boolean> {
 		for (let attempt = 0; ; attempt++) {
 			if (promptTurn) {
@@ -1866,7 +1867,7 @@ export class AcpAgent implements Agent {
 				}
 			}
 			try {
-				return await record.session.prompt(text, options);
+				return await dispatch();
 			} catch (error) {
 				if (!promptTurn || !(error instanceof AgentBusyError)) throw error;
 			}
@@ -1898,15 +1899,14 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const built = await buildSkillPromptMessage(skill, parsed, "user");
-		await record.session.promptCustomMessage(
-			{
+		await this.#promptWhenIdle(record, record.promptTurn, () =>
+			record.session.promptCustomMessage({
 				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: built.message,
 				display: true,
 				details: built.details,
 				attribution: "user",
-			},
-			{ streamingBehavior: "steer" },
+			}),
 		);
 		return true;
 	}
