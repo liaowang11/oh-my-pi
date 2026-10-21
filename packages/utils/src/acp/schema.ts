@@ -108,7 +108,8 @@ const SessionUpdate = type({
 	.or({ sessionUpdate: "'available_commands_update'", availableCommands: "unknown[]" })
 	.or({ sessionUpdate: "'config_option_update'", configOptions: "unknown[]" })
 	.or({ sessionUpdate: "'session_info_update'", "title?": "string | null | undefined" })
-	.or({ sessionUpdate: "'usage_update'", size: "number", used: "number" });
+	.or({ sessionUpdate: "'usage_update'", size: "number", used: "number" })
+	.or({ sessionUpdate: "'state_update'", state: "'running' | 'requires_action' | 'idle'" });
 
 /** Validator for new-session responses. */
 export const zNewSessionResponse = validator<NewSessionResponse>(IdentifiedSessionResponse, "new session response");
