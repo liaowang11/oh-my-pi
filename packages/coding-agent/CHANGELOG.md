@@ -65,6 +65,7 @@
 
 - Fixed ACP clients keeping incomplete model options after background provider discovery, without delaying session startup
 - Fixed session resume through equivalent directory paths, including symlinks and macOS `/var` and `/private/var` aliases, without changing the saved session location.
+- Fixed ACP prompts sent while a finished background job was being processed failing with "Agent is already processing"; the prompt now runs after that work ends
 
 ## [18.12.5] - 2026-10-21
 

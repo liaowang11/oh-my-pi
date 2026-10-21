@@ -5350,31 +5350,145 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("maps agent-busy rejections to a typed session_busy error instead of internalError", async () => {
+	/**
+	 * Mirror AgentSession's admission contract on the fake: a bare prompt while
+	 * the session streams throws AgentBusyError. Returns controls for an
+	 * autonomous (background-job) turn that no ACP prompt owns.
+	 */
+	function guardBusyAndHoldIdle(session: FakeAgentSession): {
+		streamForeignChunk: (text: string) => void;
+		endForeignTurn: (text: string) => void;
+	} {
+		const original = session.prompt.bind(session);
+		session.prompt = async (text, options) => {
+			if (session.isStreaming) throw new AgentBusyError();
+			return await original(text, options);
+		};
+		const idle = Promise.withResolvers<void>();
+		session.waitForIdleBlocker = () => idle.promise;
+		const emit = (event: AgentSessionEvent): void => {
+			for (const listener of session.listeners()) listener(event);
+		};
+		return {
+			streamForeignChunk: text => {
+				emit({
+					type: "message_update",
+					message: makeAssistantMessage(text),
+					assistantMessageEvent: { type: "text_delta", delta: text },
+				} as AgentSessionEvent);
+			},
+			endForeignTurn: text => {
+				emit({ type: "agent_end", messages: [makeAssistantMessage(text)] } as AgentSessionEvent);
+				session.isStreaming = false;
+				session.waitForIdleBlocker = undefined;
+				idle.resolve();
+			},
+		};
+	}
+
+	function messageChunks(harness: AgentHarness, sessionId: string, from = 0): string[] {
+		return harness.updates
+			.slice(from)
+			.filter(update => update.sessionId === sessionId && update.update.sessionUpdate === "agent_message_chunk")
+			.map(update => {
+				const content = (update.update as { content: { type: string; text?: string } }).content;
+				return content.text ?? "";
+			});
+	}
+
+	it("runs a prompt that arrives during an autonomous turn after that turn ends", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
-		// Autonomous turns stream without an owning ACP promptTurn, so prompt()'s
-		// implicit-cancel guard never fires. Mirror AgentSession's contract: a
-		// bare prompt while streaming throws AgentBusyError.
+		const foreign = guardBusyAndHoldIdle(session);
+		// A finished background job started a turn of its own; no session/prompt owns it.
 		session.isStreaming = true;
-		session.prompt = async (): Promise<boolean> => {
-			if (session.isStreaming) throw new AgentBusyError();
-			return true;
-		};
+		const updatesBefore = harness.updates.length;
 
-		const error = await harness.agent
+		let settled = false;
+		const response = harness.agent
 			.prompt({
 				sessionId: created.sessionId,
-				prompt: [{ type: "text", text: "ping during autonomous turn" }],
+				prompt: [{ type: "text", text: "power cycle done" }],
 			} as PromptRequest)
-			.catch((reason: unknown) => reason);
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+		foreign.streamForeignChunk("watcher finished");
+		foreign.endForeignTurn("watcher finished");
+		await Bun.sleep(0);
 
-		expect(error).toBeInstanceOf(RequestError);
-		const requestError = error as RequestError;
-		expect(requestError.code).toBe(-32003);
-		expect(requestError.message).toContain("already processing");
-		expect(requestError.data).toEqual({ reason: "session_busy", hint: "steer|followUp|wait" });
+		// The autonomous turn's agent_end must not answer the user's prompt.
+		expect(await response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+		expect(settled).toBe(true);
+		expect(session.promptCalls).toEqual(["power cycle done"]);
+		expect(messageChunks(harness, created.sessionId, updatesBefore)).toEqual(["watcher finished", "pong"]);
+	});
+
+	it("keeps a prompt parked through autonomous turns that start before its dispatch", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const foreign = guardBusyAndHoldIdle(session);
+		const guarded = session.prompt;
+		// Idle when the prompt reserves its turn; a background-job delivery wins
+		// the race to the agent before the prompt is dispatched.
+		let raced = false;
+		session.prompt = async (text, options) => {
+			if (!raced) {
+				raced = true;
+				session.isStreaming = true;
+			}
+			return await guarded(text, options);
+		};
+
+		let settled = false;
+		const response = harness.agent
+			.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "power cycle done" }],
+			} as PromptRequest)
+			.finally(() => {
+				settled = true;
+			});
+		await Bun.sleep(0);
+		expect(raced).toBe(true);
+		// That turn ends and a queued delivery chains a second one before idle.
+		for (const listener of session.listeners()) {
+			listener({ type: "agent_end", messages: [makeAssistantMessage("first job")] } as AgentSessionEvent);
+		}
+		for (const listener of session.listeners()) {
+			listener({ type: "agent_start" } as AgentSessionEvent);
+		}
+		foreign.streamForeignChunk("second job");
+		await Bun.sleep(0);
+		expect(settled).toBe(false);
+		expect(session.promptCalls).toEqual([]);
+
+		foreign.endForeignTurn("second job");
+		expect(await response).toEqual(expect.objectContaining({ stopReason: "end_turn" }));
+		expect(session.promptCalls).toEqual(["power cycle done"]);
+	});
+
+	it("cancels a prompt waiting behind an autonomous turn without dispatching it later", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const foreign = guardBusyAndHoldIdle(session);
+		session.isStreaming = true;
+
+		const response = harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "never mind" }],
+		} as PromptRequest);
+		await Bun.sleep(0);
+		await harness.agent.cancel({ sessionId: created.sessionId });
+
+		expect(await response).toEqual(expect.objectContaining({ stopReason: "cancelled" }));
+		foreign.endForeignTurn("watcher finished");
+		await Bun.sleep(0);
+		expect(session.promptCalls).toEqual([]);
 	});
 
 	it("keeps closeSession gated while cancel cleanup is pending", async () => {
