@@ -312,6 +312,13 @@ type PromptTurnState = {
 	 * this prompt's own `agent_start` if the foreign turn ended unseen.
 	 */
 	inheritedForeignTurn: boolean;
+	/**
+	 * Dispatch was refused because the agent was busy with turns no
+	 * `session/prompt` owns; the prompt waits for idle before retrying. Every
+	 * event in that window is foreign, including the `agent_start`/`agent_end`
+	 * of chained background-job deliveries, so none can settle this prompt.
+	 */
+	parked: boolean;
 	usageBaseline: UsageStatistics;
 	modelUsageBaseline: Map<string, ModelTokenStatistics>;
 	unsubscribe: (() => void) | undefined;
@@ -1574,6 +1581,7 @@ export class AcpAgent implements Agent {
 					errorTextDelivery: undefined,
 					cleanup: undefined,
 					inheritedForeignTurn: record.session.isStreaming,
+					parked: false,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
 					modelUsageBaseline: record.session.sessionManager.getModelUsageStatistics(),
 					unsubscribe: undefined,
@@ -1787,10 +1795,9 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
-				const residualAgentInvoked = await record.session.prompt(builtinResult.prompt, {
-					images,
-					synthetic: builtinResult.synthetic,
-				});
+				const residualAgentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
+					record.session.prompt(builtinResult.prompt, { images, synthetic: builtinResult.synthetic }),
+				);
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -1811,7 +1818,9 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
-		const agentInvoked = await record.session.prompt(text, { images });
+		const agentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
+			record.session.prompt(text, { images }),
+		);
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -1821,6 +1830,59 @@ export class AcpAgent implements Agent {
 			await this.#waitForExtensionUserMessages(record, extensionPromptBaseline);
 			await this.#waitForPromptEventHandlers(record);
 			this.#finishPrompt(record, { stopReason: "end_turn" });
+		}
+	}
+
+	/**
+	 * Start an ACP prompt turn's agent turn via `dispatch` — `session.prompt()`
+	 * or `promptCustomMessage()` with no `streamingBehavior` — behind any agent
+	 * turn no `session/prompt` owns. A finished background job can start such a turn
+	 * after the previous prompt ended; a bare prompt would then hit
+	 * AgentSession's busy guard and the user's message would be lost. Instead
+	 * the prompt parks until the session is idle and retries, so it runs as the
+	 * next turn and settles on its own `agent_end`. Steering into the running
+	 * turn is not an option here: the agent loop drains steers and follow-ups
+	 * inside that turn, so no `agent_start` of this prompt's own would follow.
+	 *
+	 * A cancel while parked settles the prompt, aborts the foreign turn, and
+	 * never dispatches the message.
+	 */
+	async #promptWhenIdle(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState | undefined,
+		dispatch: () => Promise<boolean>,
+	): Promise<boolean> {
+		for (let attempt = 0; ; attempt++) {
+			if (promptTurn) {
+				// Re-captured with no await before dispatch: a foreign turn may have
+				// started or ended since the turn was reserved.
+				promptTurn.inheritedForeignTurn = record.session.isStreaming;
+				if (attempt > 0) {
+					// The turns this prompt waited out are not its usage. A first attempt
+					// keeps the reservation baseline, which still counts a builtin's own
+					// work before its residual prompt.
+					const manager = record.session.sessionManager;
+					promptTurn.usageBaseline = this.#cloneUsageStatistics(manager.getUsageStatistics());
+					promptTurn.modelUsageBaseline = manager.getModelUsageStatistics();
+				}
+			}
+			try {
+				return await dispatch();
+			} catch (error) {
+				if (!promptTurn || !(error instanceof AgentBusyError)) throw error;
+			}
+			promptTurn.parked = true;
+			try {
+				await record.session.waitForIdle();
+				// Idle can be reported while another submission is still in setup;
+				// yield a macrotask so the retry cannot spin on microtasks.
+				await Bun.sleep(0);
+			} finally {
+				promptTurn.parked = false;
+			}
+			// Cancelled while parked: the prompt is already settled. `true` tells the
+			// caller there is nothing left to settle.
+			if (promptTurn.cancelRequested || promptTurn.settled) return true;
 		}
 	}
 
@@ -1837,15 +1899,14 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const built = await record.session.buildUserSkillPrompt(skill, parsed);
-		await record.session.promptCustomMessage(
-			{
+		await this.#promptWhenIdle(record, record.promptTurn, () =>
+			record.session.promptCustomMessage({
 				customType: SKILL_PROMPT_MESSAGE_TYPE,
 				content: built.message,
 				display: true,
 				details: built.details,
 				attribution: "user",
-			},
-			{ streamingBehavior: "steer" },
+			}),
 		);
 		return true;
 	}
@@ -2560,6 +2621,10 @@ export class AcpAgent implements Agent {
 	async #handlePromptEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
 		const promptTurn = record.promptTurn;
 		if (!promptTurn || promptTurn.settled || promptTurn.cancelRequested) {
+			return;
+		}
+		if (promptTurn.parked) {
+			await this.#handleAutonomousEvent(record, event);
 			return;
 		}
 		if (promptTurn.inheritedForeignTurn) {
