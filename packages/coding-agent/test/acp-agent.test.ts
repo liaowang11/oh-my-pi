@@ -37,6 +37,7 @@ import type { CreateAgentSessionResult } from "@oh-my-pi/pi-coding-agent/sdk";
 import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	type SubagentLifecyclePayload,
@@ -56,6 +57,9 @@ import type {
 	CreateElicitationRequest,
 	CreateElicitationResponse,
 	PromptRequest,
+	PromptResponse,
+	RequestPermissionRequest,
+	RequestPermissionResponse,
 	SessionConfigOption,
 	SessionNotification,
 	Validator,
@@ -701,6 +705,11 @@ async function createHarness(
 		models?: Model[];
 		/** Configures test controls before a factory-created session is registered. */
 		configureSession?: (session: FakeAgentSession) => void;
+		/** Answers `session/request_permission`. */
+		requestPermissionHandler?: (
+			req: RequestPermissionRequest,
+			signal?: AbortSignal,
+		) => Promise<RequestPermissionResponse>;
 	} = {},
 ): Promise<AgentHarness> {
 	const root = await fs.promises.mkdtemp(path.join(os.tmpdir(), "omp-acp-test-"));
@@ -729,6 +738,19 @@ async function createHarness(
 		},
 		unstable_createElicitation: options.elicitationHandler
 			? async (req: CreateElicitationRequest, signal?: AbortSignal) => options.elicitationHandler!(req, signal)
+			: undefined,
+		requestPermission: options.requestPermissionHandler,
+		// The bridge always goes through the cancellable form so a steer or a
+		// cancel can withdraw an open dialog; the fake answers through the same
+		// handler with a signal the returned `cancel()` aborts.
+		requestPermissionWithCancel: options.requestPermissionHandler
+			? (req: RequestPermissionRequest) => {
+					const controller = new AbortController();
+					return {
+						promise: options.requestPermissionHandler!(req, controller.signal),
+						cancel: () => controller.abort(),
+					};
+				}
 			: undefined,
 		signal: abortController.signal,
 		closed: Promise.withResolvers<void>().promise,
@@ -6565,6 +6587,340 @@ describe("ACP agent", () => {
 			expect(first.sessionId).toBe("session-before-switch");
 			expect(second.sessionId).toBe("session-after-switch");
 			expect(third.sessionId).toBe("session-after-switch");
+		});
+	});
+
+	describe("state_update (clientCapabilities._meta.stateUpdate)", () => {
+		const STATE_UPDATE_CAPABILITIES = { _meta: { stateUpdate: true } } as ClientCapabilities;
+
+		function stateUpdates(harness: AgentHarness, sessionId: string, from = 0): Array<Record<string, unknown>> {
+			return harness.updates
+				.slice(from)
+				.filter(update => update.sessionId === sessionId && update.update.sessionUpdate === "state_update")
+				.map(update => {
+					const { sessionUpdate: _kind, ...rest } = update.update as unknown as Record<string, unknown>;
+					return rest;
+				});
+		}
+
+		function states(harness: AgentHarness, sessionId: string, from = 0): string[] {
+			return stateUpdates(harness, sessionId, from).map(update =>
+				update.state === "idle" ? `idle:${String(update.stopReason)}` : String(update.state),
+			);
+		}
+
+		it("sends nothing without the opt-in, even beside other _meta capabilities", async () => {
+			const harness = await createHarness({
+				clientCapabilities: {
+					_meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+				} as ClientCapabilities,
+			});
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "hi" }] });
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_start" } as AgentSessionEvent);
+			}
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [makeAssistantMessage("later")] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			await Bun.sleep(0);
+
+			expect(harness.updates.some(update => update.update.sessionUpdate === "state_update")).toBe(false);
+			harness.abortController.abort();
+		});
+
+		it("reports a prompt turn as running, then idle with its stop reason before the response", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+			let statesAtResponse: string[] = [];
+			const response = await harness.agent
+				.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "hi" }] })
+				.then(result => {
+					statesAtResponse = states(harness, created.sessionId);
+					return result;
+				});
+
+			expect(response.stopReason).toBe("end_turn");
+			expect(statesAtResponse).toEqual(["running", "idle:end_turn"]);
+			expect(states(harness, created.sessionId)).toEqual(["running", "idle:end_turn"]);
+			const idle = stateUpdates(harness, created.sessionId)[1];
+			expect(idle?.usage).toEqual(response.usage);
+			expectAcpNotifications(harness.updates);
+			harness.abortController.abort();
+		});
+
+		it("reports a cancelled prompt turn as idle with stopReason cancelled", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const finishPrompt = holdPromptStreaming(session);
+			const original = session.prompt;
+			session.prompt = async text => {
+				const running = original(text);
+				for (const listener of session.listeners()) {
+					listener({
+						type: "message_update",
+						message: makeAssistantMessage("partial"),
+						assistantMessageEvent: { type: "text_delta", delta: "partial" },
+					} as AgentSessionEvent);
+				}
+				return await running;
+			};
+
+			const response = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "stop me" }],
+			});
+			await Bun.sleep(0);
+			await harness.agent.cancel({ sessionId: created.sessionId });
+			expect((await response).stopReason).toBe("cancelled");
+			finishPrompt();
+			await Bun.sleep(0);
+
+			expect(states(harness, created.sessionId)).toEqual(["running", "idle:cancelled"]);
+			harness.abortController.abort();
+		});
+
+		it("reports a prompt turn that fails as idle with stopReason error", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			session.prompt = async () => {
+				throw new Error("provider exploded");
+			};
+
+			await expect(
+				harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "hi" }] }),
+			).rejects.toThrow("provider exploded");
+
+			expect(stateUpdates(harness, created.sessionId)).toEqual([
+				{ state: "running" },
+				{ state: "idle", stopReason: "error", error: { code: -32603, message: "provider exploded" } },
+			]);
+			harness.abortController.abort();
+		});
+
+		it("reports an autonomous run after end_turn as running then idle", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "bg job" }] });
+			const before = harness.updates.length;
+
+			const message = makeAssistantMessage("Background job finished");
+			session.isStreaming = true;
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_start" } as AgentSessionEvent);
+			}
+			for (const listener of session.listeners()) {
+				listener({
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: "text_delta", delta: "Background job finished" },
+				} as AgentSessionEvent);
+			}
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			await Bun.sleep(0);
+
+			const after = harness.updates.slice(before).filter(update => update.sessionId === created.sessionId);
+			const kinds = after.map(update =>
+				update.update.sessionUpdate === "state_update"
+					? `state:${String((update.update as { state: string }).state)}`
+					: update.update.sessionUpdate,
+			);
+			// running precedes the run's content; idle follows it.
+			expect(kinds[0]).toBe("state:running");
+			expect(kinds.at(-1)).toBe("state:idle");
+			expect(kinds).toContain("agent_message_chunk");
+			expect(states(harness, created.sessionId, before)).toEqual(["running", "idle:end_turn"]);
+			expectAcpNotifications(after);
+			harness.abortController.abort();
+		});
+
+		it("stays running from an autonomous run into the prompt that waited behind it", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const foreign = guardBusyAndHoldIdle(session);
+			session.isStreaming = true;
+
+			const response = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "after the job" }],
+			} as PromptRequest);
+			await Bun.sleep(0);
+			foreign.streamForeignChunk("watcher finished");
+			foreign.streamForeignChunk("still watching");
+			foreign.endForeignTurn("watcher finished");
+			expect((await response).stopReason).toBe("end_turn");
+
+			// The prompt's session/prompt is in flight throughout, so the foreign
+			// run's end is not the end of foreground work.
+			expect(states(harness, created.sessionId)).toEqual(["running", "idle:end_turn"]);
+			harness.abortController.abort();
+		});
+
+		it("does not open a second run for a steer drained inside the running turn", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const finishPrompt = holdPromptStreaming(session);
+
+			const response = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "long task" }],
+			});
+			await Bun.sleep(0);
+			await harness.agent.extMethod("_session/steering", {
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "also this" }],
+			});
+			finishPrompt();
+			expect((await response).stopReason).toBe("end_turn");
+
+			expect(states(harness, created.sessionId)).toEqual(["running", "idle:end_turn"]);
+			harness.abortController.abort();
+		});
+
+		describe("permission requests", () => {
+			async function permissionHarness(): Promise<{
+				harness: AgentHarness;
+				sessionId: string;
+				bridge: () => ClientBridge;
+				answer: () => void;
+				permissionAsked: Promise<AbortSignal | undefined>;
+				finishPrompt: () => void;
+				response: Promise<PromptResponse>;
+			}> {
+				let bridge: ClientBridge | undefined;
+				const answered = Promise.withResolvers<void>();
+				const asked = Promise.withResolvers<AbortSignal | undefined>();
+				const harness = await createHarness({
+					clientCapabilities: STATE_UPDATE_CAPABILITIES,
+					requestPermissionHandler: async (_request, signal) => {
+						asked.resolve(signal);
+						await Promise.race([
+							answered.promise,
+							new Promise<void>(resolve => signal?.addEventListener("abort", () => resolve())),
+						]);
+						if (signal?.aborted) throw new Error("withdrawn");
+						return { outcome: { outcome: "selected", optionId: "allow" } };
+					},
+					configureSession: session => {
+						session.setClientBridge = (value: unknown) => {
+							bridge = value as ClientBridge;
+						};
+					},
+				});
+				const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+				const session = harness.findSession(created.sessionId)!;
+				const finishPrompt = holdPromptStreaming(session);
+				const response = harness.agent.prompt({
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "edit the file" }],
+				});
+				await Bun.sleep(0);
+				return {
+					harness,
+					sessionId: created.sessionId,
+					bridge: () => bridge!,
+					answer: answered.resolve,
+					permissionAsked: asked.promise,
+					finishPrompt,
+					response,
+				};
+			}
+
+			const TOOL_CALL = { toolCallId: "call-1", toolName: "edit", title: "Edit file" };
+			const OPTIONS = [{ optionId: "allow", name: "Allow", kind: "allow_once" as const }];
+
+			it("reports requires_action while a permission request is open, then running", async () => {
+				const { harness, sessionId, bridge, answer, permissionAsked, finishPrompt, response } =
+					await permissionHarness();
+				const controller = new AbortController();
+				const outcome = bridge().requestPermission!(TOOL_CALL, OPTIONS, controller.signal);
+				await permissionAsked;
+				expect(states(harness, sessionId)).toEqual(["running", "requires_action"]);
+
+				answer();
+				expect((await outcome).outcome).toBe("selected");
+				expect(states(harness, sessionId)).toEqual(["running", "requires_action", "running"]);
+
+				finishPrompt();
+				await response;
+				expect(states(harness, sessionId)).toEqual(["running", "requires_action", "running", "idle:end_turn"]);
+				harness.abortController.abort();
+			});
+
+			it("ends at idle without a trailing running when the turn is cancelled mid-request", async () => {
+				const { harness, sessionId, bridge, permissionAsked, finishPrompt, response } = await permissionHarness();
+				const controller = new AbortController();
+				const outcome = bridge().requestPermission!(TOOL_CALL, OPTIONS, controller.signal);
+				await permissionAsked;
+
+				await harness.agent.cancel({ sessionId });
+				controller.abort();
+				expect((await outcome).outcome).toBe("cancelled");
+				expect((await response).stopReason).toBe("cancelled");
+				finishPrompt();
+				await Bun.sleep(0);
+
+				expect(states(harness, sessionId)).toEqual(["running", "requires_action", "idle:cancelled"]);
+				harness.abortController.abort();
+			});
+		});
+
+		it("sends nothing when loading an idle stored session", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const stored = await createStoredSession(harness);
+			vi.useFakeTimers();
+			await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+
+			expect(harness.updates.some(update => update.update.sessionUpdate === "state_update")).toBe(false);
+			harness.abortController.abort();
+		});
+
+		it("sends one running snapshot after loading a session whose turn is running", async () => {
+			const harness = await createHarness({ clientCapabilities: STATE_UPDATE_CAPABILITIES });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const finishPrompt = holdPromptStreaming(session);
+			const response = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "long task" }],
+			});
+			await Bun.sleep(0);
+			expect(states(harness, created.sessionId)).toEqual(["running"]);
+
+			vi.useFakeTimers();
+			await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+			const afterLoad = harness.updates.length;
+			expect(states(harness, created.sessionId, afterLoad)).toEqual([]);
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			expect(states(harness, created.sessionId, afterLoad)).toEqual(["running"]);
+
+			finishPrompt();
+			await response;
+			expect(states(harness, created.sessionId, afterLoad)).toEqual(["running", "idle:end_turn"]);
+			harness.abortController.abort();
 		});
 	});
 });

@@ -35,6 +35,7 @@ import {
 	RequestError,
 	type ResumeSessionRequest,
 	type ResumeSessionResponse,
+	type RunStateUpdate,
 	type SessionConfigOption,
 	type SessionInfo,
 	type SessionModeState,
@@ -478,6 +479,23 @@ function steeringQueueFromMeta(meta: unknown): "steering" | "followUp" {
 	return "steering";
 }
 
+/**
+ * Whether the client asked for ACP v2 `state_update`s on this v1 connection:
+ * `clientCapabilities._meta.stateUpdate === true`. Tolerates malformed `_meta`.
+ */
+function clientSupportsStateUpdates(capabilities: ClientCapabilities | undefined): boolean {
+	const meta = capabilities?._meta;
+	return typeof meta === "object" && meta !== null && (meta as Record<string, unknown>).stateUpdate === true;
+}
+
+/** The JSON-RPC error a failed prompt is answered with, for its `idle` state update. */
+function jsonRpcError(error: unknown): { code: number; message: string; data?: unknown } {
+	if (error instanceof RequestError) {
+		return { code: error.code, message: error.message, ...(error.data !== undefined ? { data: error.data } : {}) };
+	}
+	return { code: -32603, message: error instanceof Error ? error.message : String(error) };
+}
+
 type ManagedSessionRecord = {
 	session: AgentSession;
 	setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined;
@@ -553,6 +571,10 @@ type ManagedSessionRecord = {
 	closedError: RequestError | undefined;
 	promptEventHandlers: Set<Promise<void>>;
 	extensionUserMessageTasks: Set<Promise<void>>;
+	// The `state_update` state last sent (see `#setRunState`); a session starts idle.
+	runState: RunStateUpdate["state"];
+	// `session/request_permission` requests awaiting the client.
+	pendingPermissions: number;
 };
 
 type ReplayableMessage = {
@@ -1206,6 +1228,8 @@ export class AcpAgent implements Agent {
 	#disposePromise: Promise<void> | undefined;
 	#cleanupRegistered = false;
 	#clientCapabilities: ClientCapabilities | undefined;
+	/** The client sent `clientCapabilities._meta.stateUpdate: true`: run state goes out as `state_update`s. */
+	#stateUpdates = false;
 	/** The client declared AIR `sessionIndex`: list pages carry AIR rows and the `_session/*` index methods answer. */
 	#sessionIndex = false;
 	/** Serializes rename/archive/unarchive, so two of them never interleave on one session's title slot. */
@@ -1234,6 +1258,7 @@ export class AcpAgent implements Agent {
 	async initialize(params: InitializeRequest): Promise<InitializeResponse> {
 		this.#registerConnectionCleanup();
 		this.#clientCapabilities = params.clientCapabilities;
+		this.#stateUpdates = clientSupportsStateUpdates(params.clientCapabilities);
 		this.#sessionIndex = clientSupportsSessionIndex(params.clientCapabilities);
 		const authMethods: AuthMethod[] = [
 			{
@@ -1332,7 +1357,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record);
+		this.#scheduleBootstrapUpdates(record, { runStateSnapshot: true });
 		return response;
 	}
 
@@ -1378,7 +1403,7 @@ export class AcpAgent implements Agent {
 			configOptions: this.#buildConfigOptions(record.session),
 			modes: this.#buildModeState(record.session),
 		};
-		this.#scheduleBootstrapUpdates(record);
+		this.#scheduleBootstrapUpdates(record, { runStateSnapshot: true });
 		return response;
 	}
 
@@ -1590,6 +1615,7 @@ export class AcpAgent implements Agent {
 					promise: pendingPrompt.promise,
 				};
 
+				this.#setRunState(record, "running");
 				// A client prompt starts a fresh continuation chain, as a typed TUI message does.
 				record.goalContinuation.pendingTurns = 0;
 				this.#sessionListChanged();
@@ -2432,7 +2458,21 @@ export class AcpAgent implements Agent {
 		eventBus: EventBus | undefined,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext);
-		session.setClientBridge(createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities));
+		session.setClientBridge(
+			createAcpClientBridge(this.#connection, session.sessionId, this.#clientCapabilities, {
+				onPermissionPending: () => {
+					if (++record.pendingPermissions === 1 && record.runState === "running") {
+						this.#setRunState(record, "requires_action");
+					}
+				},
+				onPermissionSettled: () => {
+					// A cancelled run already went idle; its withdrawn request must not revive it.
+					if (--record.pendingPermissions === 0 && record.runState === "requires_action") {
+						this.#setRunState(record, "running");
+					}
+				},
+			}),
+		);
 		// Client-declared servers live in `record.mcpManager`, not the session's
 		// own (ACP sessions run with `enableMCP: false`); read it live so every
 		// reconfiguration's `refreshMCPTools` rebuild renders its instructions.
@@ -2537,6 +2577,8 @@ export class AcpAgent implements Agent {
 			vibeMode: undefined,
 			planProposal: undefined,
 			approvedPlan: undefined,
+			runState: "idle",
+			pendingPermissions: 0,
 		};
 	}
 
@@ -2757,6 +2799,11 @@ export class AcpAgent implements Agent {
 	 * only streamed thinking, or failed before streaming, still surfaces.
 	 */
 	async #handleAutonomousEvent(record: ManagedSessionRecord, event: AgentSessionEvent): Promise<void> {
+		// Any event of a running loop counts, not only `agent_start`: one that
+		// began before the lifetime subscription was installed has no start here.
+		if (event.type === "agent_start" || (event.type !== "agent_end" && record.session.isStreaming)) {
+			this.#setRunState(record, "running");
+		}
 		try {
 			await this.#forwardSessionEvent(record, event);
 			if (event.type === "agent_end") {
@@ -2770,6 +2817,31 @@ export class AcpAgent implements Agent {
 		} catch (error) {
 			logger.warn("ACP autonomous event handler failed", { sessionId: record.session.sessionId, error });
 		}
+		// A prompt waiting behind this run keeps foreground work going; its own
+		// settlement sends the idle.
+		if (event.type === "agent_end" && !isPromptTurnInFlight(record.promptTurn)) {
+			this.#setRunState(record, "idle", { stopReason: this.#resolveStopReason(event, false) });
+		}
+	}
+
+	/**
+	 * Send `state` as a `state_update` when the client opted in and it differs
+	 * from the last one sent; `force` repeats it as a snapshot. The state is
+	 * recorded synchronously so concurrent event handlers see the transition.
+	 */
+	#setRunState(
+		record: ManagedSessionRecord,
+		state: RunStateUpdate["state"],
+		idle?: Omit<Extract<RunStateUpdate, { state: "idle" }>, "state">,
+		force = false,
+	): void {
+		if (!this.#stateUpdates || (record.runState === state && !force)) return;
+		record.runState = state;
+		const update: SessionUpdate = { sessionUpdate: "state_update", state, ...(state === "idle" ? idle : {}) };
+		void this.#sendQuietly(
+			this.#connection.sessionUpdate({ sessionId: record.session.sessionId, update }),
+			"state update",
+		);
 	}
 
 	async #forwardSessionEvent(
@@ -3199,11 +3271,18 @@ export class AcpAgent implements Agent {
 		if (!promptTurn.cleanup && record.promptTurn === promptTurn) {
 			record.promptTurn = undefined;
 		}
+		// Sent before the response settles, so the client sees idle first.
 		if (error !== undefined) {
+			this.#setRunState(record, "idle", { stopReason: "error", error: jsonRpcError(error) });
 			promptTurn.reject(error);
 			return;
 		}
-		promptTurn.resolve(response ?? { stopReason: "end_turn" });
+		const settled = response ?? { stopReason: "end_turn" };
+		this.#setRunState(record, "idle", {
+			stopReason: settled.stopReason,
+			...(settled.usage ? { usage: settled.usage } : {}),
+		});
+		promptTurn.resolve(settled);
 	}
 
 	#resolveStopReason(
@@ -4067,7 +4146,7 @@ export class AcpAgent implements Agent {
 		};
 	}
 
-	#scheduleBootstrapUpdates(record: ManagedSessionRecord): void {
+	#scheduleBootstrapUpdates(record: ManagedSessionRecord, options: { runStateSnapshot?: boolean } = {}): void {
 		const sessionId = record.session.sessionId;
 		// Defer first notifications until the response has reached the client.
 		// Zed's agent-client-protocol reader dispatches responses and
@@ -4112,6 +4191,11 @@ export class AcpAgent implements Agent {
 				record.titleUnsubscribe = record.session.sessionManager.onSessionNameChanged(() => {
 					void this.#pushSessionInfoUpdate(record);
 				});
+			}
+			// A loaded or resumed session can be one this connection already runs;
+			// the client re-attaching to it gets the state again.
+			if (options.runStateSnapshot && (isPromptTurnInFlight(record.promptTurn) || record.session.isStreaming)) {
+				this.#setRunState(record, "running", undefined, true);
 			}
 			void this.#emitBootstrapUpdates(sessionId, record);
 			void this.#emitDiscoveredModelOptions(sessionId, record);

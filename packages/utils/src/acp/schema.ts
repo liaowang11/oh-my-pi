@@ -183,6 +183,8 @@ function sessionNotification(value: unknown): boolean {
 			return update.title === undefined || update.title === null || typeof update.title === "string";
 		case "usage_update":
 			return typeof update.size === "number" && typeof update.used === "number";
+		case "state_update":
+			return update.state === "running" || update.state === "requires_action" || update.state === "idle";
 		default:
 			return false;
 	}
