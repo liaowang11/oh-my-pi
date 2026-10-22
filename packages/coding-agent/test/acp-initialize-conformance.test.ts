@@ -256,7 +256,7 @@ describe("ACP initialize conformance", () => {
 		expect(response.agentInfo!.version).toBe(pkg.version);
 	});
 
-	it("advertises AIR asyncTasks and planFile only to a client that sent the AIR block", async () => {
+	it("advertises AIR asyncTasks, planFile and goal only to a client that sent the AIR block", async () => {
 		const agent = await createAgent();
 		// A JetBrains AIR client gates async_task_* rendering and
 		// `_session/async_task/stop` on this advertisement.
@@ -267,7 +267,13 @@ describe("ACP initialize conformance", () => {
 		);
 		expect(air._meta).toEqual({
 			steering: { supported: true },
-			jetbrains: { air: { version: 1, capabilities: ["asyncTasks", "planFile"] } },
+			jetbrains: {
+				air: {
+					version: 1,
+					capabilities: ["asyncTasks", "planFile"],
+					goal: { version: 1, controlMethod: "_session/goal", actions: ["set", "clear"] },
+				},
+			},
 		});
 		for (const clientCapabilities of [{}, { _meta: { jetbrains: { air: { version: 0 } } } }]) {
 			const other = await createAgent();
