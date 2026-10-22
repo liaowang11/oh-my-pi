@@ -3713,6 +3713,142 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 	});
 
+	describe("_session/goal", () => {
+		const AIR: ClientCapabilities = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
+
+		/** The `air.goal` payload of every goal `session_info_update`, in order. */
+		function goalUpdates(harness: AgentHarness, sessionId: string): Array<Record<string, unknown> | null> {
+			return harness.updates.flatMap(notification => {
+				const update = notification.update;
+				if (notification.sessionId !== sessionId || update.sessionUpdate !== "session_info_update") return [];
+				const air = (update._meta as { jetbrains?: { air?: Record<string, unknown> } } | undefined)?.jetbrains?.air;
+				return air && "goal" in air ? [air.goal as Record<string, unknown> | null] : [];
+			});
+		}
+
+		async function codeOf(promise: Promise<unknown>): Promise<number | undefined> {
+			try {
+				await promise;
+			} catch (error) {
+				return (error as { code?: number }).code;
+			}
+			return undefined;
+		}
+
+		/** An AIR session whose lifetime subscription is installed. */
+		async function airSession(): Promise<{ harness: AgentHarness; sessionId: string; session: FakeAgentSession }> {
+			const harness = await createHarness({ clientCapabilities: AIR });
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			await Bun.sleep(0);
+			return { harness, sessionId: created.sessionId, session: harness.findSession(created.sessionId)! };
+		}
+
+		it("answers -32601 to a client that is not AIR", async () => {
+			const plain = await createHarness({ clientCapabilities: {} });
+			const created = await plain.agent.newSession({ cwd: plain.cwdA, mcpServers: [] });
+			expect(
+				await codeOf(
+					plain.agent.extMethod("_session/goal", { sessionId: created.sessionId, action: "set", objective: "x" }),
+				),
+			).toBe(-32601);
+			expect(plain.findSession(created.sessionId)!.getGoalModeState()).toBeUndefined();
+			plain.abortController.abort();
+		});
+
+		it("sets a goal on an idle session with one turn and clears it without one", async () => {
+			const { harness, sessionId, session } = await airSession();
+
+			await harness.agent.extMethod("_session/goal", { sessionId, action: "set", objective: "  Ship the release " });
+			expect(session.getGoalModeState()?.goal.objective).toBe("Ship the release");
+			expect(session.promptCalls).toEqual(["Ship the release"]);
+			const afterSet = goalUpdates(harness, sessionId);
+			expect(afterSet[0]).toMatchObject({
+				objective: "Ship the release",
+				status: "active",
+				controlMethod: "_session/goal",
+				tokensUsed: 0,
+			});
+			for (let i = 1; i < afterSet.length; i++) expect(afterSet[i]).not.toEqual(afterSet[i - 1]);
+
+			await harness.agent.extMethod("_session/goal", { sessionId, action: "clear" });
+			expect(session.getGoalModeState()).toBeUndefined();
+			expect(session.getEnabledToolNames()).not.toContain("goal");
+			expect(session.promptCalls).toEqual(["Ship the release"]);
+			expect(goalUpdates(harness, sessionId).at(-1)).toBeNull();
+			expectAcpNotifications(harness.updates);
+			harness.abortController.abort();
+		});
+
+		it("sets a goal on a running turn without cancelling it or starting another", async () => {
+			const { harness, sessionId, session } = await airSession();
+			const finishPrompt = holdPromptStreaming(session);
+			const running = harness.agent.prompt({ sessionId, prompt: [{ type: "text", text: "work" }] } as PromptRequest);
+			await Bun.sleep(0);
+			expect(session.isStreaming).toBe(true);
+
+			await harness.agent.extMethod("_session/goal", { sessionId, action: "set", objective: "Ship it" });
+			expect(session.getGoalModeState()?.goal).toMatchObject({ objective: "Ship it", status: "active" });
+			expect(session.getEnabledToolNames()).toContain("goal");
+			expect(session.isStreaming).toBe(true);
+			expect(session.promptCalls).toEqual(["work"]);
+			expect(goalUpdates(harness, sessionId)[0]).toMatchObject({ objective: "Ship it", status: "active" });
+
+			finishPrompt();
+			expect((await running).stopReason).toBe("end_turn");
+			expect(session.promptCalls).toEqual(["work"]);
+			harness.abortController.abort();
+		});
+
+		it("rejects bad params, unknown sessions, and replacing a paused goal", async () => {
+			const { harness, sessionId, session } = await airSession();
+			expect(await codeOf(harness.agent.extMethod("_session/goal", { sessionId, action: "set" }))).toBe(-32602);
+			expect(
+				await codeOf(harness.agent.extMethod("_session/goal", { sessionId, action: "set", objective: "  " })),
+			).toBe(-32602);
+			expect(await codeOf(harness.agent.extMethod("_session/goal", { sessionId, action: "pause" }))).toBe(-32602);
+			expect(await codeOf(harness.agent.extMethod("_session/goal", { action: "clear" }))).toBe(-32602);
+			expect(
+				await codeOf(harness.agent.extMethod("_session/goal", { sessionId: "no-such-session", action: "clear" })),
+			).toBe(-32002);
+
+			await harness.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal Ship it" }] } as PromptRequest);
+			await harness.agent.prompt({ sessionId, prompt: [{ type: "text", text: "/goal pause" }] } as PromptRequest);
+			const calls = session.promptCalls.length;
+			expect(
+				await codeOf(harness.agent.extMethod("_session/goal", { sessionId, action: "set", objective: "Other" })),
+			).toBe(-32602);
+			expect(session.getGoalModeState()?.goal).toMatchObject({ objective: "Ship it", status: "paused" });
+			expect(session.promptCalls.length).toBe(calls);
+			expect(goalUpdates(harness, sessionId).at(-1)).toMatchObject({ objective: "Ship it", status: "paused" });
+			harness.abortController.abort();
+		});
+
+		it("reports a loaded session's paused goal at bootstrap", async () => {
+			const harness = await createHarness({ clientCapabilities: AIR });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			await harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "/goal Ship the release" }],
+			} as PromptRequest);
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			const from = harness.updates.length;
+
+			vi.useFakeTimers();
+			await harness.agent.loadSession({ sessionId: created.sessionId, cwd: harness.cwdA, mcpServers: [] });
+			await advanceBootstrapGuard();
+			vi.useRealTimers();
+			await Bun.sleep(10);
+
+			const loaded = goalUpdates({ ...harness, updates: harness.updates.slice(from) }, created.sessionId);
+			expect(loaded).toHaveLength(1);
+			expect(loaded[0]).toMatchObject({ objective: "Ship the release", status: "paused" });
+			harness.abortController.abort();
+		});
+	});
+
 	it("pauses a stored ACP goal on load and cleans up a completed goal after a turn", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
