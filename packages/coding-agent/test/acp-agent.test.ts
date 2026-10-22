@@ -390,8 +390,9 @@ class FakeAgentSession {
 
 	async refreshMCPTools(_tools: unknown[]): Promise<void> {}
 
-	getContextUsage(): undefined {
-		return undefined;
+	contextUsage: { tokens: number; contextWindow: number; percent: number } | undefined;
+	getContextUsage(): { tokens: number; contextWindow: number; percent: number } | undefined {
+		return this.contextUsage;
 	}
 
 	async switchSession(sessionPath: string): Promise<boolean> {
@@ -2052,6 +2053,103 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("reports the turn's spend per model in _meta.quota, subagents included", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const spend = (input: number, output: number, cacheRead: number, reasoningTokens = 0) => ({
+			input,
+			output,
+			cacheRead,
+			cacheWrite: 0,
+			reasoningTokens,
+			totalTokens: input + output + cacheRead,
+			cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: 0 },
+		});
+		// Spend recorded before the turn stays out of its quota.
+		session.sessionManager.appendMessage(makeAssistantMessage("earlier"));
+		session.promptHook = async () => {
+			const manager = session.sessionManager;
+			manager.appendModelUsage(
+				{
+					purpose: "compaction",
+					api: "openai-responses",
+					provider: "openai",
+					model: "gpt-5.4",
+					usage: spend(100, 20, 0, 4),
+					stopReason: "stop",
+				},
+				{ sessionId: manager.getSessionId(), parentId: manager.getLeafId() },
+			);
+			const attributed = spend(50, 10, 5);
+			const unattributed = spend(7, 3, 0);
+			manager.appendMessage({
+				role: "toolResult",
+				toolCallId: "call-task",
+				toolName: "task",
+				content: [{ type: "text", text: "done" }],
+				isError: false,
+				timestamp: Date.now(),
+				details: {
+					projectAgentsDir: null,
+					totalDurationMs: 1,
+					results: [
+						{ id: "Scout", resolvedModelIdentity: "openai/gpt-5.4", usage: attributed },
+						{ id: "Legacy", usage: unattributed },
+					],
+					usage: spend(57, 13, 5),
+				},
+			} as unknown as Parameters<SessionManager["appendMessage"]>[0]);
+		};
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "ping" }],
+		});
+		expectAcpStructure(zPromptResponse, response);
+
+		// `token_count` mirrors `usage`: everything the session recorded this
+		// turn. The rows split what carries a model; the subagent result with
+		// no resolved model is counted in the total but in no row.
+		expect(response._meta?.quota).toEqual({
+			token_count: {
+				totalTokens: 18 + 120 + 65 + 10,
+				inputTokens: 10 + 100 + 50 + 7,
+				cachedInputTokens: 2 + 5,
+				cachedWriteTokens: 1,
+				outputTokens: 5 + 20 + 10 + 3,
+				reasoningOutputTokens: 4,
+			},
+			model_usage: [
+				{
+					model: "openai/gpt-5.4",
+					token_count: {
+						totalTokens: 185,
+						inputTokens: 150,
+						cachedInputTokens: 5,
+						cachedWriteTokens: 0,
+						outputTokens: 30,
+						reasoningOutputTokens: 4,
+					},
+				},
+				{
+					model: "anthropic/claude-sonnet-4-20250514",
+					token_count: {
+						totalTokens: 18,
+						inputTokens: 10,
+						cachedInputTokens: 2,
+						cachedWriteTokens: 1,
+						outputTokens: 5,
+						reasoningOutputTokens: 0,
+					},
+				},
+			],
+		});
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("pushes each session title once and never an empty one", async () => {
 		const harness = await createHarness();
 		vi.useFakeTimers();
@@ -2079,6 +2177,172 @@ describe("ACP agent", () => {
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "two" }] });
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "three" }] });
 		expect(infoUpdates(titled)).toEqual(["Usage parity"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("sends usage_update as each assistant message ends, once per change", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const contextAt = (tokens: number) => ({ tokens, contextWindow: 200_000, percent: tokens / 2_000 });
+		const first = makeAssistantMessage("Reading the file.");
+		const second = makeAssistantMessage("Done.");
+		session.prompt = async (): Promise<boolean> => {
+			session.isStreaming = true;
+			for (const [message, text, tokens] of [
+				[first, "Reading the file.", 1_000],
+				[second, "Done.", 1_500],
+			] as const) {
+				for (const listener of session.listeners()) {
+					listener({
+						type: "message_update",
+						message,
+						assistantMessageEvent: { type: "text_delta", delta: text },
+					} as AgentSessionEvent);
+				}
+				session.sessionManager.appendMessage(message);
+				session.contextUsage = contextAt(tokens);
+				for (const listener of session.listeners()) {
+					listener({ type: "message_end", message } as AgentSessionEvent);
+				}
+			}
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [first, second] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const before = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "go" }] });
+		const turn = harness.updates.slice(before).filter(update => update.sessionId === created.sessionId);
+		expectAcpNotifications(turn);
+		const kinds = turn.map(update =>
+			update.update.sessionUpdate === "usage_update" ? `used:${update.update.used}` : update.update.sessionUpdate,
+		);
+		// The first reading reaches the client mid-turn, before the second
+		// message streams; agent_end's reading equals the last one, so it is
+		// not repeated.
+		expect(kinds.filter(kind => kind === "agent_message_chunk" || kind.startsWith("used:"))).toEqual([
+			"agent_message_chunk",
+			"used:1000",
+			"agent_message_chunk",
+			"used:1500",
+		]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("sends usage_update after a compaction, not after an aborted one", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.contextUsage = { tokens: 150_000, contextWindow: 200_000, percent: 75 };
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const usageUpdates = (from: number) =>
+			harness.updates
+				.slice(from)
+				.filter(update => update.sessionId === created.sessionId && update.update.sessionUpdate === "usage_update")
+				.map(update => (update.update as { used: number }).used);
+		// Bootstrap reports the starting reading.
+		for (let attempt = 0; attempt < 100 && usageUpdates(0).length === 0; attempt++) await Bun.sleep(5);
+		expect(usageUpdates(0)).toEqual([150_000]);
+
+		// Idle auto-compaction: no prompt owns it.
+		const idle = harness.updates.length;
+		session.contextUsage = { tokens: 40_000, contextWindow: 200_000, percent: 20 };
+		for (const listener of session.listeners()) {
+			listener({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: undefined,
+				aborted: true,
+				willRetry: false,
+			} as AgentSessionEvent);
+		}
+		await Bun.sleep(0);
+		expect(usageUpdates(idle)).toEqual([]);
+		for (const listener of session.listeners()) {
+			listener({
+				type: "auto_compaction_end",
+				action: "context-full",
+				result: { summary: "compacted", firstKeptEntryId: "x", tokensBefore: 150_000 },
+				aborted: false,
+				willRetry: false,
+			} as unknown as AgentSessionEvent);
+		}
+		await Bun.sleep(0);
+		expect(usageUpdates(idle)).toEqual([40_000]);
+
+		// Manual /compact runs as a builtin command, with no agent turn.
+		session.compact = async () => {
+			session.contextUsage = { tokens: 12_000, contextWindow: 200_000, percent: 6 };
+		};
+		const manual = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
+		expect(usageUpdates(manual)).toEqual([12_000]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("sends the context usage and title of a loaded session at bootstrap", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({ role: "user", content: "hello", timestamp: Date.now() });
+		stored.sessionManager.appendMessage(makeAssistantMessage("reply"));
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		vi.useFakeTimers();
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+		const loaded = harness.sessions.findLast(session => session.sessionId === stored.sessionId)!;
+		loaded.contextUsage = { tokens: 4_200, contextWindow: 200_000, percent: 2.1 };
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const sentUsage = () =>
+			harness.updates.some(
+				update => update.sessionId === stored.sessionId && update.update.sessionUpdate === "usage_update",
+			);
+		for (let attempt = 0; attempt < 100 && !sentUsage(); attempt++) await Bun.sleep(5);
+
+		const bootstrap = harness.updates.filter(update => update.sessionId === stored.sessionId);
+		expect(bootstrap.map(update => update.update)).toContainEqual({
+			sessionUpdate: "usage_update",
+			size: 200_000,
+			used: 4_200,
+		});
+		const infoUpdates = bootstrap.filter(update => update.update.sessionUpdate === "session_info_update");
+		expect(infoUpdates.map(update => (update.update as { title?: unknown }).title)).toEqual([loaded.sessionName]);
+
+		// The first turn's end reports neither again while nothing changed.
+		const turn = harness.updates.length;
+		loaded.prompt = async (): Promise<boolean> => {
+			for (const listener of loaded.listeners()) {
+				listener({ type: "agent_end", messages: [] } as AgentSessionEvent);
+			}
+			return true;
+		};
+		await harness.agent.prompt({ sessionId: stored.sessionId, prompt: [{ type: "text", text: "again" }] });
+		expect(
+			harness.updates
+				.slice(turn)
+				.filter(
+					update =>
+						update.sessionId === stored.sessionId &&
+						(update.update.sessionUpdate === "usage_update" ||
+							update.update.sessionUpdate === "session_info_update"),
+				),
+		).toEqual([]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
