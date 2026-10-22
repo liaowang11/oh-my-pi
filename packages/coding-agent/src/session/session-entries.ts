@@ -530,3 +530,13 @@ export interface UsageStatistics {
 	/** Own calls whose model declares a billing frame that never arrived; positive makes `aiuNano` a lower bound. */
 	aiuUnknownCalls: number;
 }
+
+/** Token counters one model spent, summed per `<provider>/<model>` by the session manager. */
+export interface ModelTokenStatistics {
+	input: number;
+	output: number;
+	reasoning: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+}
