@@ -36,7 +36,10 @@ function goalDetails(state: GoalModeState | undefined): string {
 	].join("\n");
 }
 
-async function setGoalToolEnabled(runtime: SlashCommandRuntime, enabled: boolean): Promise<void> {
+/** What the goal state helpers need from a slash-command runtime. */
+type GoalRuntimeContext = Pick<SlashCommandRuntime, "session" | "settings">;
+
+async function setGoalToolEnabled(runtime: GoalRuntimeContext, enabled: boolean): Promise<void> {
 	const tools = runtime.session.getEnabledToolNames().filter(name => name !== "goal");
 	await runtime.session.setActiveToolsByName(enabled ? [...tools, "goal"] : tools);
 }
@@ -85,31 +88,82 @@ export async function handleAcpGuidedGoalCommand(
 	return { prompt: kickoff, synthetic: true };
 }
 
+const PAUSED_GOAL_REFUSAL = "Resume the current goal first, or drop it before setting a new objective.";
+
+/** Create the goal, or replace an active one's objective. Returns why it refused, if it did. */
+async function setGoalState(objective: string, runtime: GoalRuntimeContext): Promise<string | undefined> {
+	const { session } = runtime;
+	const state = session.getGoalModeState();
+	if (state && !state.enabled) return PAUSED_GOAL_REFUSAL;
+	if (state?.enabled) {
+		await session.goalRuntime.replaceGoal({ objective });
+		return undefined;
+	}
+	await setGoalToolEnabled(runtime, true);
+	if (!session.getEnabledToolNames().includes("goal")) return "Goal tool is unavailable in this session.";
+	try {
+		await session.goalRuntime.createGoal({ objective });
+	} catch (error) {
+		await setGoalToolEnabled(runtime, false);
+		throw error;
+	}
+	return undefined;
+}
+
+/** Drop the goal, or stop a goal interview. Reports which, if either, there was. */
+async function dropGoalState(runtime: GoalRuntimeContext): Promise<"dropped" | "interview" | "none"> {
+	const { session } = runtime;
+	if (!session.getGoalModeState()) {
+		if (!isGoalInterviewActive(session)) return "none";
+		await setGoalToolEnabled(runtime, false);
+		return "interview";
+	}
+	await session.goalRuntime.dropGoal();
+	await setGoalToolEnabled(runtime, false);
+	return "dropped";
+}
+
+/** A goal change requested outside a slash command, as ACP `_session/goal` sends it. */
+export type AcpGoalAction = { action: "set"; objective: string } | { action: "clear" };
+
+/**
+ * Apply `action` as `/goal set <objective>` or `/goal drop` would, with the
+ * same checks, but without starting a turn. Returns why it refused, if it did;
+ * clearing when there is no goal is not a refusal.
+ */
+export async function applyAcpGoalAction(
+	runtime: GoalRuntimeContext,
+	action: AcpGoalAction,
+): Promise<string | undefined> {
+	const refusal = acpGoalActionRefusal(runtime, action);
+	if (refusal) return refusal;
+	if (action.action === "set") return await setGoalState(action.objective, runtime);
+	await dropGoalState(runtime);
+	return undefined;
+}
+
+/** Why `action` cannot run now, if it cannot; changes nothing. */
+export function acpGoalActionRefusal(runtime: GoalRuntimeContext, action: AcpGoalAction): string | undefined {
+	const { session } = runtime;
+	const state = session.getGoalModeState();
+	if (action.action === "set" && !cfgGoalEnabled.get(runtime.settings)) {
+		return "Goal mode is disabled. Enable it in settings (goal.enabled).";
+	}
+	if (session.getPlanModeState()?.enabled) return "Exit plan mode first.";
+	if (session.getVibeModeState()?.enabled) return "Exit vibe mode first.";
+	if (action.action === "set" && state && !state.enabled) return PAUSED_GOAL_REFUSAL;
+	return undefined;
+}
+
 async function setGoal(objective: string, runtime: SlashCommandRuntime): Promise<SlashCommandResult> {
 	if (!objective) {
 		await runtime.output("Usage: /goal set <objective>");
 		return;
 	}
-	const { session } = runtime;
-	const state = session.getGoalModeState();
-	if (state && !state.enabled) {
-		await runtime.output("Resume the current goal first, or drop it before setting a new objective.");
+	const refusal = await setGoalState(objective, runtime);
+	if (refusal) {
+		await runtime.output(refusal);
 		return;
-	}
-	if (state?.enabled) {
-		await session.goalRuntime.replaceGoal({ objective });
-	} else {
-		await setGoalToolEnabled(runtime, true);
-		if (!session.getEnabledToolNames().includes("goal")) {
-			await runtime.output("Goal tool is unavailable in this session.");
-			return;
-		}
-		try {
-			await session.goalRuntime.createGoal({ objective });
-		} catch (error) {
-			await setGoalToolEnabled(runtime, false);
-			throw error;
-		}
 	}
 	return { prompt: objective };
 }
@@ -179,18 +233,14 @@ export async function handleAcpGoalCommand(
 		return;
 	}
 	if (sub === "drop") {
-		if (!state) {
-			if (interviewing) {
-				await setGoalToolEnabled(runtime, false);
-				await runtime.output("Goal interview stopped.");
-			} else {
-				await runtime.output("No goal to drop.");
-			}
-			return;
-		}
-		await session.goalRuntime.dropGoal();
-		await setGoalToolEnabled(runtime, false);
-		await runtime.output("Goal dropped.");
+		const dropped = await dropGoalState(runtime);
+		await runtime.output(
+			dropped === "dropped"
+				? "Goal dropped."
+				: dropped === "interview"
+					? "Goal interview stopped."
+					: "No goal to drop.",
+		);
 		return;
 	}
 	if (!state?.enabled) {
