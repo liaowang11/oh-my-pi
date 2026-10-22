@@ -109,12 +109,14 @@ import { SessionManager, SessionMoveRefusedError } from "../../session/session-m
 import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
 import { buildAvailableSlashCommands, toAcpAvailableCommands } from "../../slash-commands/available-commands";
+import { acpGoalActionRefusal, applyAcpGoalAction } from "../../slash-commands/helpers/goal";
 import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { OTHER_OPTION } from "../../tools/ask";
 import { isProposeToolCall } from "../../tools/resolve";
 import { existingPlanFileSync, resolvePlanFilePath } from "../../plan-mode/plan-files";
+import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
 import { ToolError } from "@oh-my-pi/pi-tui/tools/tool-errors";
 import {
 	DEFAULT_TTS_SPEED,
@@ -136,10 +138,12 @@ import {
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
+import { GOAL_CONTROL_METHOD, type GoalRequest, goalCapability, parseGoalRequest, toGoalSnapshot } from "./acp-goal";
 import { AcpSubagentRelay, clientSupportsSubagents, isSubagentSessionId, subagentSessionId } from "./acp-subagents";
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
 	AIR_CUSTOM_ANSWER_KEY,
+	AIR_GOAL_KEY,
 	AIR_PLAN_FILE_CAPABILITY,
 	airCapabilityMeta,
 	clientSupportsAsyncTasks,
@@ -526,6 +530,9 @@ type ManagedSessionRecord = {
 	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
 	// re-sent at every turn end or by the rename that already pushed it.
 	sentTitle: string | undefined;
+	// The AIR goal snapshot (JSON) `#pushGoalUpdate` last sent, so an unchanged
+	// goal is not re-sent; `undefined` until one was sent.
+	sentGoal: string | undefined;
 	// The `usage_update` values last sent, so a reading that did not change
 	// since the last assistant message, compaction, or bootstrap is not repeated.
 	sentUsage: string | undefined;
@@ -1270,10 +1277,14 @@ export class AcpAgent implements Agent {
 			_meta: {
 				steering: { supported: true },
 				...(isAirClient(params.clientCapabilities)
-					? airCapabilityMeta(
-							AIR_ASYNC_TASKS_CAPABILITY,
-							AIR_PLAN_FILE_CAPABILITY,
-							...sessionIndexCapabilities(params.clientCapabilities),
+					? withAirMeta(
+							airCapabilityMeta(
+								AIR_ASYNC_TASKS_CAPABILITY,
+								AIR_PLAN_FILE_CAPABILITY,
+								...sessionIndexCapabilities(params.clientCapabilities),
+							),
+							AIR_GOAL_KEY,
+							goalCapability(),
 						)
 					: {}),
 			},
@@ -1965,6 +1976,9 @@ export class AcpAgent implements Agent {
 				const archived = method === SESSION_ARCHIVE_METHOD;
 				return await this.#runSessionIndexOperation(() => this.#setSessionArchived(sessionId, archived));
 			}
+			case GOAL_CONTROL_METHOD:
+				if (!isAirClient(this.#clientCapabilities)) throw RequestError.methodNotFound(method);
+				return await this.#controlGoal(parseGoalRequest(params));
 			case SPEECH_MODELS_LIST_METHOD:
 				return buildAcpSpeechModelsCatalog();
 			case "_omp/sessions/listAll": {
@@ -2449,6 +2463,7 @@ export class AcpAgent implements Agent {
 			asyncTaskRelay: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
+			sentGoal: undefined,
 			sentUsage: undefined,
 			sentConfigWarnings: new Set(),
 			compaction: new AcpCompactionLifecycle(
@@ -2463,6 +2478,10 @@ export class AcpAgent implements Agent {
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
+		if (event.type === "goal_updated") {
+			this.#trackLifetimeDelivery(record, event.type, this.#pushGoalUpdate(record, event.goal));
+			return;
+		}
 		if (event.type !== "thinking_level_changed" && event.type !== "model_changed" && !isPromptTurnInFlight(record.promptTurn)) {
 			this.#trackLifetimeDelivery(record, event.type, this.#handleAutonomousEvent(record, event));
 		}
@@ -4024,6 +4043,8 @@ export class AcpAgent implements Agent {
 		});
 		await this.#pushSessionInfoUpdate(record, record.session.sessionManager.getHeader()?.timestamp);
 		await this.#pushUsageUpdate(record);
+		const goal = record.session.getGoalModeState()?.goal;
+		if (goal) await this.#pushGoalUpdate(record, goal);
 	}
 
 	async #emitAvailableCommandsUpdate(record: ManagedSessionRecord): Promise<void> {
@@ -4091,6 +4112,47 @@ export class AcpAgent implements Agent {
 			sessionId: record.protocolSessionId,
 			update: { sessionUpdate: "session_info_update", title, updatedAt },
 		});
+	}
+
+	/** Sends an AIR client the session's goal snapshot (`null` once gone), unless it already has it. */
+	async #pushGoalUpdate(record: ManagedSessionRecord, goal: Goal | null | undefined): Promise<void> {
+		if (!isAirClient(this.#clientCapabilities)) return;
+		const snapshot = toGoalSnapshot(goal);
+		const sent = JSON.stringify(snapshot);
+		if (sent === record.sentGoal) return;
+		record.sentGoal = sent;
+		await this.#connection.sessionUpdate({
+			sessionId: record.session.sessionId,
+			update: { sessionUpdate: "session_info_update", _meta: withAirMeta(undefined, AIR_GOAL_KEY, snapshot) },
+		});
+	}
+
+	/**
+	 * `_session/goal`: set or clear a loaded session's goal, with `/goal`'s
+	 * checks; a refused change is `-32602`. Setting on an idle session runs
+	 * `/goal set <objective>` as a prompt and answers after that turn; setting
+	 * while a turn streams changes the goal in place, without cancelling the
+	 * turn or starting another, and goal continuation picks it up when the turn
+	 * ends. Clearing never starts a turn.
+	 */
+	async #controlGoal(request: GoalRequest): Promise<{ [key: string]: unknown }> {
+		const record = this.#sessions.get(request.sessionId);
+		if (!record) throw sessionNotFound(request.sessionId);
+		this.#throwIfRecordClosed(record);
+		const { session } = record;
+		const context = { session, settings: session.settings };
+		const refusal = acpGoalActionRefusal(context, request);
+		if (refusal) throw RequestError.invalidParams({ action: request.action }, refusal);
+		if (request.action === "set" && !session.isStreaming) {
+			await this.prompt({
+				sessionId: request.sessionId,
+				prompt: [{ type: "text", text: `/goal set ${request.objective}` }],
+			});
+			return {};
+		}
+		const failure = await applyAcpGoalAction(context, request);
+		if (failure) throw RequestError.invalidParams({ action: request.action }, failure);
+		return {};
 	}
 
 	#cloneUsageStatistics(usage: UsageStatistics): UsageStatistics {

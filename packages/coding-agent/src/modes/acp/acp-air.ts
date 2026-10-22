@@ -19,6 +19,11 @@ export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";
 /** Marks an ask form's free-text field as the custom answer of a select field. */
 export const AIR_CUSTOM_ANSWER_KEY = "customAnswer";
+/**
+ * `_meta.jetbrains.air` key of the goal extension: the `initialize` capability
+ * object and the `session_info_update` goal snapshot (see `acp-goal.ts`).
+ */
+export const AIR_GOAL_KEY = "goal";
 /** AIR extension version this agent speaks. */
 export const AIR_EXTENSION_VERSION = 1;
 
