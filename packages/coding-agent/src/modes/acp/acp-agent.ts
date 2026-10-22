@@ -82,7 +82,7 @@ import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { isSilentAbort, SKILL_PROMPT_MESSAGE_TYPE, USER_INTERRUPT_LABEL } from "../../session/messages";
-import type { SessionEntry, UsageStatistics } from "../../session/session-entries";
+import type { ModelTokenStatistics, SessionEntry, UsageStatistics } from "../../session/session-entries";
 import {
 	findSessionFiles,
 	readSessionInfo,
@@ -263,6 +263,7 @@ type PromptTurnState = {
 	 */
 	inheritedForeignTurn: boolean;
 	usageBaseline: UsageStatistics;
+	modelUsageBaseline: Map<string, ModelTokenStatistics>;
 	unsubscribe: (() => void) | undefined;
 	resolve: (value: PromptResponse) => void;
 	reject: (reason?: unknown) => void;
@@ -468,6 +469,9 @@ type ManagedSessionRecord = {
 	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
 	// re-sent at every turn end or by the rename that already pushed it.
 	sentTitle: string | undefined;
+	// The `usage_update` values last sent, so a reading that did not change
+	// since the last assistant message, compaction, or bootstrap is not repeated.
+	sentUsage: string | undefined;
 	// Goal auto-continuation bookkeeping, same rule as the TUI: a continuation
 	// turn that did no tool work, or repeated the previous one, stops the chain
 	// until the user speaks again.
@@ -561,6 +565,33 @@ function taskResultSubagents(details: unknown): Array<{ id: string; description:
 }
 
 /** The idle snapshot that ends a replayed child, from its last assistant message's stop reason. */
+/** One `_meta.quota` counter set, keyed as claude-agent-acp's `quotaTokenCount`. */
+interface AcpQuotaTokenCount {
+	totalTokens: number;
+	inputTokens: number;
+	cachedInputTokens: number;
+	cachedWriteTokens: number;
+	outputTokens: number;
+	reasoningOutputTokens: number;
+}
+
+/** `_meta.quota` on a prompt response: the turn's spend, whole and per model. */
+interface AcpQuota {
+	token_count: AcpQuotaTokenCount;
+	model_usage: Array<{ model: string; token_count: AcpQuotaTokenCount }>;
+}
+
+function quotaTokenCount(tokens: ModelTokenStatistics): AcpQuotaTokenCount {
+	return {
+		totalTokens: tokens.totalTokens,
+		inputTokens: tokens.input,
+		cachedInputTokens: tokens.cacheRead,
+		cachedWriteTokens: tokens.cacheWrite,
+		outputTokens: tokens.output,
+		reasoningOutputTokens: tokens.reasoning,
+	};
+}
+
 function replayedIdleState(stopReason: string | undefined): SubagentWorkState {
 	switch (stopReason) {
 		case undefined:
@@ -1390,6 +1421,7 @@ export class AcpAgent implements Agent {
 					cleanup: undefined,
 					inheritedForeignTurn: record.session.isStreaming,
 					usageBaseline: this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
+					modelUsageBaseline: record.session.sessionManager.getModelUsageStatistics(),
 					unsubscribe: undefined,
 					resolve: pendingPrompt.resolve,
 					reject: pendingPrompt.reject,
@@ -1603,14 +1635,9 @@ export class AcpAgent implements Agent {
 				}
 				return;
 			}
-			this.#finishPrompt(record, {
-				stopReason: "end_turn",
-				usage: this.#buildTurnUsage(
-					promptTurn?.usageBaseline ??
-						this.#cloneUsageStatistics(record.session.sessionManager.getUsageStatistics()),
-					record.session.sessionManager.getUsageStatistics(),
-				),
-			});
+			// A builtin such as /compact can change the context with no agent turn.
+			await this.#pushUsageUpdate(record);
+			this.#finishPrompt(record, { stopReason: "end_turn", ...this.#turnUsage(record, promptTurn) });
 			return;
 		}
 
@@ -1723,7 +1750,7 @@ export class AcpAgent implements Agent {
 		promptTurn.cleanup = cleanup;
 		this.#finishPrompt(record, {
 			stopReason: "cancelled",
-			usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+			...this.#turnUsage(record, promptTurn),
 		});
 		return cleanup;
 	}
@@ -2213,6 +2240,7 @@ export class AcpAgent implements Agent {
 			asyncTaskRelay: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
+			sentUsage: undefined,
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
 			vibeMode: undefined,
 		};
@@ -2329,7 +2357,7 @@ export class AcpAgent implements Agent {
 			record.liveMessageProgress = undefined;
 			const response: PromptResponse = {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
-				usage: this.#buildTurnUsage(promptTurn.usageBaseline, record.session.sessionManager.getUsageStatistics()),
+				...this.#turnUsage(record, promptTurn),
 			};
 			if (response.stopReason === "end_turn" && this.#continueGoalInPromptTurn(record, promptTurn, response)) {
 				return;
@@ -2459,6 +2487,12 @@ export class AcpAgent implements Agent {
 			const delivery = this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification));
 			onDelivery?.(delivery);
 			await delivery;
+		}
+		if (
+			(event.type === "message_end" && event.message.role === "assistant") ||
+			(event.type === "auto_compaction_end" && event.result !== undefined && !event.aborted)
+		) {
+			await this.#pushUsageUpdate(record);
 		}
 		if (event.type === "tool_execution_end") {
 			record.toolArgsById.delete(event.toolCallId);
@@ -3533,14 +3567,8 @@ export class AcpAgent implements Agent {
 				availableCommands: await this.#buildAvailableCommands(record.session),
 			},
 		});
-		await this.#connection.sessionUpdate({
-			sessionId,
-			update: {
-				sessionUpdate: "session_info_update",
-				title: record.session.sessionName,
-				updatedAt: record.session.sessionManager.getHeader()?.timestamp,
-			},
-		});
+		await this.#pushSessionInfoUpdate(record, record.session.sessionManager.getHeader()?.timestamp);
+		await this.#pushUsageUpdate(record);
 	}
 
 	async #emitAvailableCommandsUpdate(record: ManagedSessionRecord): Promise<void> {
@@ -3570,23 +3598,33 @@ export class AcpAgent implements Agent {
 	}
 
 	async #emitEndOfTurnUpdates(record: ManagedSessionRecord): Promise<void> {
-		const sessionId = record.session.sessionId;
-
-		const contextUsage = record.session.getContextUsage();
-		if (contextUsage) {
-			const usageStats = record.session.sessionManager.getUsageStatistics();
-			await this.#connection.sessionUpdate({
-				sessionId,
-				update: {
-					sessionUpdate: "usage_update",
-					size: contextUsage.contextWindow,
-					used: contextUsage.tokens ?? 0,
-					cost: usageStats.cost > 0 ? { amount: usageStats.cost, currency: "USD" } : undefined,
-				},
-			});
-		}
-
+		await this.#pushUsageUpdate(record);
 		await this.#pushSessionInfoUpdate(record);
+	}
+
+	/**
+	 * Sends the session's context usage and cost, unless they equal the values
+	 * last sent. Called at bootstrap, after each assistant message and each
+	 * compaction, and at the end of a turn, so the client's context gauge follows
+	 * the turn instead of jumping once at its end.
+	 */
+	async #pushUsageUpdate(record: ManagedSessionRecord): Promise<void> {
+		const contextUsage = record.session.getContextUsage();
+		if (!contextUsage) return;
+		const cost = record.session.sessionManager.getUsageStatistics().cost;
+		const used = contextUsage.tokens ?? 0;
+		const sent = `${contextUsage.contextWindow}:${used}:${cost}`;
+		if (sent === record.sentUsage) return;
+		record.sentUsage = sent;
+		await this.#connection.sessionUpdate({
+			sessionId: record.session.sessionId,
+			update: {
+				sessionUpdate: "usage_update",
+				size: contextUsage.contextWindow,
+				used,
+				cost: cost > 0 ? { amount: cost, currency: "USD" } : undefined,
+			},
+		});
 	}
 
 	/** Sends the session's title, unless it has none or the client already has it. */
@@ -3613,6 +3651,58 @@ export class AcpAgent implements Agent {
 			premiumRequests: usage.premiumRequests,
 			cost: usage.cost,
 			subagentCost: usage.subagentCost,
+		};
+	}
+
+	/**
+	 * The `usage` and `_meta.quota` of the turn `promptTurn` opened, from the
+	 * session's running totals against the baselines it took. `quota` follows
+	 * claude-agent-acp: `token_count` mirrors `usage`, and `model_usage` splits
+	 * the spend by `<provider>/<model>`, subagent results under the model they
+	 * resolved to. Spend with no model (a subagent result that never resolved
+	 * one) counts in `token_count` only, so the rows can sum to less.
+	 */
+	#turnUsage(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState | undefined,
+	): { usage: Usage | undefined; _meta: { quota: AcpQuota } } {
+		const manager = record.session.sessionManager;
+		const current = manager.getUsageStatistics();
+		const modelUsage = manager.getModelUsageStatistics();
+		const previous = promptTurn?.usageBaseline ?? current;
+		const previousModelUsage = promptTurn?.modelUsageBaseline ?? modelUsage;
+		const rows: Array<{ model: string; tokens: ModelTokenStatistics }> = [];
+		let reasoning = 0;
+		for (const [model, tokens] of modelUsage) {
+			const before = previousModelUsage.get(model);
+			const delta: ModelTokenStatistics = {
+				input: Math.max(0, tokens.input - (before?.input ?? 0)),
+				output: Math.max(0, tokens.output - (before?.output ?? 0)),
+				reasoning: Math.max(0, tokens.reasoning - (before?.reasoning ?? 0)),
+				cacheRead: Math.max(0, tokens.cacheRead - (before?.cacheRead ?? 0)),
+				cacheWrite: Math.max(0, tokens.cacheWrite - (before?.cacheWrite ?? 0)),
+				totalTokens: Math.max(0, tokens.totalTokens - (before?.totalTokens ?? 0)),
+			};
+			if (delta.totalTokens === 0 && delta.input === 0 && delta.output === 0) continue;
+			reasoning += delta.reasoning;
+			rows.push({ model, tokens: delta });
+		}
+		rows.sort((a, b) => b.tokens.totalTokens - a.tokens.totalTokens || a.model.localeCompare(b.model));
+		return {
+			usage: this.#buildTurnUsage(previous, current),
+			_meta: {
+				quota: {
+					token_count: quotaTokenCount({
+						input: Math.max(0, current.input - previous.input),
+						output: Math.max(0, current.output - previous.output),
+						reasoning,
+						cacheRead: Math.max(0, current.cacheRead - previous.cacheRead),
+						cacheWrite: Math.max(0, current.cacheWrite - previous.cacheWrite),
+						totalTokens: Math.max(0, current.totalTokens - previous.totalTokens),
+					}),
+					model_usage: rows.map(row => ({ model: row.model, token_count: quotaTokenCount(row.tokens) })),
+				},
+			},
 		};
 	}
 

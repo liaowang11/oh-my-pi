@@ -373,6 +373,7 @@
 - ACP clients can now load, resume, and fork sessions from removed git worktrees of the repository; loading moves the session into the current checkout, forking copies it there.
 - ACP `session/fork` can fork at an agent message (AIR's `_meta.jetbrains.air.fork`), name the fork with `_meta.sessionTitle`, and retitle it after its own first turn with `_meta.generateSessionTitle`
 - ACP clients that declare the JetBrains AIR `sessionIndex` extension get session lists ordered by last prompt with archive filtering and row details (model, state, fork parent), and can rename, archive, and unarchive sessions
+- ACP prompt responses now report the turn's token spend per model, subagents included, in `_meta.quota.model_usage`
 
 ### Changed
 
@@ -385,6 +386,7 @@
 - ACP `session/new` no longer writes a session file until the first reply, and `session/list` hides untitled empty sessions
 - Reduced interactive startup memory usage for new sessions by initializing syntax highlighting only when needed; resumed sessions still prepare highlighting in the background so the restored transcript paints without delay ([#15299](https://github.com/can1357/oh-my-pi/pull/15299) by [@iliaal](https://github.com/iliaal))
 - Compacted Read directory listings by replacing alignment padding with single-space separators while retaining file sizes and relative modification times ([#9062](https://github.com/can1357/oh-my-pi/pull/9062) by [@MikeeI](https://github.com/MikeeI), [#15352](https://github.com/can1357/oh-my-pi/pull/15352) by [@iliaal](https://github.com/iliaal)).
+- ACP clients now receive `usage_update` after each assistant message, after compaction, and when a session loads, instead of only at turn end
 
 ### Fixed
 

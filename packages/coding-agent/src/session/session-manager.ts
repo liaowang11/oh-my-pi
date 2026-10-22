@@ -61,6 +61,7 @@ import {
 	type LabelEntry,
 	type ModeChangeEntry,
 	type ModelChangeEntry,
+	type ModelTokenStatistics,
 	type ModelUsageEntry,
 	lastSelfSelectedLeafId,
 	type NewSessionOptions,
@@ -426,6 +427,43 @@ function entryUsage(entry: SessionEntry): Usage | undefined {
 	return undefined;
 }
 
+/**
+ * Visit the usage `entry` records under the `<provider>/<model>` that spent
+ * it. A `task` result is split by subagent; a subagent result with no resolved
+ * model is skipped, so these visits can sum to less than {@link entryUsage}.
+ */
+function forEachModelUsage(entry: SessionEntry, visit: (model: string, usage: Usage) => void): void {
+	if (entry.type === "model_usage") {
+		visit(`${entry.provider}/${entry.model}`, entry.usage);
+		return;
+	}
+	if (entry.type !== "message") return;
+	const message = entry.message;
+	if (message.role === "assistant") {
+		if (message.usage) visit(`${message.provider}/${message.model}`, message.usage);
+		return;
+	}
+	if (message.role !== "toolResult" || message.toolName !== "task" || !isTaskToolDetails(message.details)) return;
+	for (const result of message.details.results) {
+		const model = result.resolvedModelIdentity ?? result.resolvedModel;
+		if (model && result.usage) visit(model, result.usage);
+	}
+}
+
+function addModelTokens(target: Map<string, ModelTokenStatistics>, model: string, usage: Usage): void {
+	let tokens = target.get(model);
+	if (!tokens) {
+		tokens = { input: 0, output: 0, reasoning: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 0 };
+		target.set(model, tokens);
+	}
+	tokens.input += usage.input;
+	tokens.output += usage.output;
+	tokens.reasoning += usage.reasoningTokens ?? 0;
+	tokens.cacheRead += usage.cacheRead;
+	tokens.cacheWrite += usage.cacheWrite;
+	tokens.totalTokens += usage.totalTokens;
+}
+
 /** Complete incomplete assistant usage in loaded history; returns how many messages were repaired. */
 function normalizeLoadedUsage(entries: SessionEntry[]): number {
 	let repaired = 0;
@@ -531,6 +569,7 @@ class SessionEntryIndex {
 	#labels = new Map<string, string>();
 	#leaf: string | null = null;
 	#usage = emptyUsageStatistics();
+	#modelUsage = new Map<string, ModelTokenStatistics>();
 	// Branch memo: getBranch() walks leaf-to-root per call (array + Set +
 	// reverse) on per-frame/per-turn paths. The branch only changes on
 	// insert/rebuild/setLeaf, so cache the array keyed on (leaf, generation).
@@ -547,6 +586,7 @@ class SessionEntryIndex {
 		this.#labels.clear();
 		this.#leaf = null;
 		this.#usage = emptyUsageStatistics();
+		this.#modelUsage.clear();
 		this.#generation++;
 		this.#branchCache = undefined;
 	}
@@ -599,6 +639,7 @@ class SessionEntryIndex {
 		if (usage && entry.type === "message" && entry.message.role === "toolResult") {
 			this.#usage.subagentCost += usage.cost.total;
 		}
+		forEachModelUsage(entry, (model, modelUsage) => addModelTokens(this.#modelUsage, model, modelUsage));
 	}
 
 	has(id: string): boolean {
@@ -655,6 +696,10 @@ class SessionEntryIndex {
 
 	usageSnapshot(): UsageStatistics {
 		return { ...this.#usage };
+	}
+
+	modelUsageSnapshot(): Map<string, ModelTokenStatistics> {
+		return new Map([...this.#modelUsage].map(([model, tokens]) => [model, { ...tokens }]));
 	}
 
 	pathTo(id: string | null | undefined = this.#leaf): SessionEntry[] {
@@ -3154,6 +3199,15 @@ export class SessionManager {
 
 	getUsageStatistics(): UsageStatistics {
 		return this.#index.usageSnapshot();
+	}
+
+	/**
+	 * Running token totals per `<provider>/<model>` over every recorded entry,
+	 * subagent results split by their resolved model. Diff two readings for the
+	 * spend between them, as with {@link getUsageStatistics}.
+	 */
+	getModelUsageStatistics(): Map<string, ModelTokenStatistics> {
+		return this.#index.modelUsageSnapshot();
 	}
 
 	/**
