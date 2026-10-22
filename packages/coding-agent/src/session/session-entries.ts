@@ -426,3 +426,13 @@ export interface UsageStatistics {
 	/** Portion of {@link cost} carried by completed `task` results (direct children's spend). */
 	subagentCost: number;
 }
+
+/** Token counters one model spent, summed per `<provider>/<model>` by the session manager. */
+export interface ModelTokenStatistics {
+	input: number;
+	output: number;
+	reasoning: number;
+	cacheRead: number;
+	cacheWrite: number;
+	totalTokens: number;
+}
