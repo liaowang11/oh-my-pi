@@ -31,6 +31,17 @@ export const AIR_GOAL_KEY = "goal";
 export const AIR_COMMAND_TITLE_KEY = "commandTitle";
 /** `_meta.jetbrains.air` flag marking a tool call that launches subagents. */
 export const AIR_SUBAGENT_KEY = "subagent";
+/**
+ * The client renders subagents through AIR's own (earlier-draft) subagent
+ * sessions, which offer no child cancel. Without it an AIR client takes the
+ * subagents RFD form, child cancel included (claude-agent-acp parity).
+ */
+export const AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY = "nativeSubagentSessions";
+/**
+ * `_meta.jetbrains.air` key of a permission request's presentation: the
+ * prompt's heading, its reason as `description`, and `defaultToNo`.
+ */
+export const AIR_PERMISSION_KEY = "permission";
 /** AIR extension version this agent speaks. */
 export const AIR_EXTENSION_VERSION = 1;
 

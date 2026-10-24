@@ -4195,6 +4195,9 @@ pub struct SubagentLifecyclePayload {
 	/// The subagent runs as a detached background job.
 	#[serde(default, skip_serializing_if = "Option::is_none")]
 	pub detached: Option<bool>,
+	/// Why a `failed` run failed, when the run reported a reason.
+	#[serde(default, skip_serializing_if = "Option::is_none")]
+	pub error: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

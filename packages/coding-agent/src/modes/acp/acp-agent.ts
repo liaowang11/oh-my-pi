@@ -2,7 +2,7 @@ import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { AgentBusyError, type AgentToolResult } from "@oh-my-pi/pi-agent-core";
 import { type AssistantMessage, type Model, serviceTierFamily, shouldSendServiceTier } from "@oh-my-pi/pi-ai";
-import { getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
+import { formatBytes, getBlobsDir, isEnoent, logger, type postmortem, VERSION } from "@oh-my-pi/pi-utils";
 import {
 	type Agent,
 	type AgentSideConnection,
@@ -94,6 +94,7 @@ import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import {
 	bashExecutionToText,
+	formatFileMention,
 	isSilentAbort,
 	pythonExecutionToText,
 	SKILL_PROMPT_MESSAGE_TYPE,
@@ -117,6 +118,7 @@ import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "@oh-my-pi/pi-tui/thinking";
 import { OTHER_OPTION } from "../../tools/ask";
+import { formatPathRelativeToCwd } from "../../tools/path-utils";
 import { isProposeToolCall } from "../../tools/resolve";
 import { existingPlanFileSync, resolvePlanFilePath } from "../../plan-mode/plan-files";
 import type { Goal } from "@oh-my-pi/pi-tui/tools/goal";
@@ -136,19 +138,28 @@ import { VibeSessionRegistry } from "../../vibe/runtime";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { BashExecutionMessage, PythonExecutionMessage } from "@oh-my-pi/pi-tui/chat/messages";
 import { createAcpClientBridge } from "./acp-client-bridge";
+import { RATE_LIMIT_META_KEY, rateLimitInfos } from "./acp-rate-limit";
 import {
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
 	normalizeReplayToolArguments,
 } from "./acp-event-mapper";
 import { GOAL_CONTROL_METHOD, type GoalRequest, goalCapability, parseGoalRequest, toGoalSnapshot } from "./acp-goal";
-import { AcpSubagentRelay, clientSupportsSubagents, isSubagentSessionId, subagentSessionId } from "./acp-subagents";
+import {
+	AcpSubagentRelay,
+	clientSupportsSubagents,
+	isSubagentSessionId,
+	subagentSessionId,
+	subagentTitle,
+} from "./acp-subagents";
 import {
 	AIR_ASYNC_TASKS_CAPABILITY,
 	AIR_CUSTOM_ANSWER_KEY,
 	AIR_GOAL_KEY,
+	AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
 	AIR_PLAN_FILE_CAPABILITY,
 	airCapabilityMeta,
+	clientSupportsAirCapability,
 	clientSupportsAsyncTasks,
 	clientSupportsPlanFile,
 	isAirClient,
@@ -434,8 +445,7 @@ function toSteeringPromptBlocks(prompt: unknown): PromptRequest["prompt"] {
 			for (const field of ["title", "name", "mimeType", "description"] as const) {
 				// `null` is a legal value (the ACP schema types these
 				// `string | null`): treat it exactly like an absent field —
-				// the converter's `title ?? name ?? uri` fallback already
-				// does.
+				// the converter names the link by its uri alone.
 				if (record[field] !== undefined && record[field] !== null && typeof record[field] !== "string") {
 					throw RequestError.invalidParams(
 						{ method: SESSION_STEERING_METHOD },
@@ -550,6 +560,8 @@ type ManagedSessionRecord = {
 	// The `usage_update` values last sent, so a reading that did not change
 	// since the last assistant message, compaction, or bootstrap is not repeated.
 	sentUsage: string | undefined;
+	// Each rate-limit window (by `rateLimitType`) last sent, so an unchanged one is not repeated.
+	sentRateLimits: Map<string, string>;
 	// Config warnings already sent as notices, so each reaches the client once.
 	sentConfigWarnings: Set<string>;
 	// Reports this session's context compactions (auto and manual /compact).
@@ -645,21 +657,27 @@ type CreateAcpSession = (
  * The subagents a task tool result spawned: `results` for a run the call
  * waited on, `progress` for a detached one.
  */
-function taskResultSubagents(details: unknown): Array<{ id: string; description: string | undefined }> {
+function taskResultSubagents(
+	details: unknown,
+): Array<{ id: string; agent: string | undefined; description: string | undefined }> {
 	if (typeof details !== "object" || details === null) return [];
 	const { results, progress } = details as { results?: unknown; progress?: unknown };
-	const children = new Map<string, string | undefined>();
+	const children = new Map<string, { agent: string | undefined; description: string | undefined }>();
 	for (const list of [results, progress]) {
 		if (!Array.isArray(list)) continue;
 		for (const item of list) {
 			if (typeof item !== "object" || item === null) continue;
-			const { id, description } = item as { id?: unknown; description?: unknown };
+			const { id, agent, description } = item as { id?: unknown; agent?: unknown; description?: unknown };
 			if (typeof id !== "string" || id.length === 0) continue;
 			const label = typeof description === "string" ? description.trim() || undefined : undefined;
-			children.set(id, children.get(id) ?? label);
+			const known = children.get(id);
+			children.set(id, {
+				agent: known?.agent ?? (typeof agent === "string" ? agent : undefined),
+				description: known?.description ?? label,
+			});
 		}
 	}
-	return [...children].map(([id, description]) => ({ id, description }));
+	return [...children].map(([id, child]) => ({ id, ...child }));
 }
 
 /** The idle snapshot that ends a replayed child, from its last assistant message's stop reason. */
@@ -1597,7 +1615,7 @@ export class AcpAgent implements Agent {
 				}
 				this.#throwIfRecordClosed(record);
 
-				const converted = this.#convertPromptBlocks(params.prompt);
+				const converted = this.#convertPromptBlocks(params.prompt, record.session.sessionManager.getCwd());
 				const pendingPrompt = Promise.withResolvers<PromptResponse>();
 				record.promptTurn = {
 					abortController: new AbortController(),
@@ -2221,7 +2239,7 @@ export class AcpAgent implements Agent {
 		this.#throwIfRecordClosed(record);
 
 		const promptBlocks = toSteeringPromptBlocks(params.prompt);
-		const converted = this.#convertPromptBlocks(promptBlocks);
+		const converted = this.#convertPromptBlocks(promptBlocks, record.session.sessionManager.getCwd());
 		if (converted.text.length === 0 && converted.images.length === 0) {
 			throw RequestError.invalidParams({ method: SESSION_STEERING_METHOD }, "prompt is empty");
 		}
@@ -2485,8 +2503,14 @@ export class AcpAgent implements Agent {
 				send: notification => this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification)),
 				getCwd: () => session.sessionManager.getCwd(),
 				resolveImageData: data => resolveImageDataSync(this.#blobs, data),
-				// AIR never offers child cancel (claude-agent-acp parity).
-				cancellable: !isAirClient(this.#clientCapabilities),
+				// Child cancel is offered unless the client is AIR and lists
+				// `nativeSubagentSessions` (claude-agent-acp parity): only AIR's
+				// native subagent sessions lack it. An AIR client without that
+				// capability, such as agent-shell, gets cancel like any client.
+				cancellable: !clientSupportsAirCapability(
+					this.#clientCapabilities,
+					AIR_NATIVE_SUBAGENT_SESSIONS_CAPABILITY,
+				),
 				airClient: isAirClient(this.#clientCapabilities),
 				// A child mounts its parent's MCP tools under the same names.
 				lookupTool: name => session.getToolByName(name),
@@ -2568,6 +2592,7 @@ export class AcpAgent implements Agent {
 			sentTitle: undefined,
 			sentGoal: undefined,
 			sentUsage: undefined,
+			sentRateLimits: new Map(),
 			sentConfigWarnings: new Set(),
 			compaction: new AcpCompactionLifecycle(
 				update => this.#connection.sessionUpdate({ sessionId: session.sessionId, update }),
@@ -3333,9 +3358,22 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	#convertPromptBlocks(blocks: PromptRequest["prompt"]): { text: string; images: AgentImageContent[] } {
+	/**
+	 * Flattens prompt blocks into the text and images of one user message.
+	 * Attached files — the blocks a client sends in place of an `@path`
+	 * mention — get the `<file path="…">` wrapper the TUI uses for `@path`
+	 * mentions, so the model always sees which file it is reading.
+	 */
+	#convertPromptBlocks(blocks: PromptRequest["prompt"], cwd: string): { text: string; images: AgentImageContent[] } {
 		const textParts: string[] = [];
 		const images: AgentImageContent[] = [];
+		// A `file:` URI shows as a path (cwd-relative inside the cwd); any other
+		// URI stays verbatim — the read tool accepts URLs. `session/prompt`
+		// blocks are not field-validated, so a non-string uri must not throw.
+		const attachedPath = (uri: string): string =>
+			typeof uri === "string" && uri.toLowerCase().startsWith("file://")
+				? formatPathRelativeToCwd(uri, cwd)
+				: String(uri);
 		for (const block of blocks) {
 			switch (block.type) {
 				case "text":
@@ -3343,8 +3381,14 @@ export class AcpAgent implements Agent {
 					break;
 				case "image":
 					images.push({ type: "image", data: block.data, mimeType: block.mimeType });
+					// Name the image when the client says where it came from, as the
+					// TUI does for an `@image.png` mention.
+					if (typeof block.uri === "string" && block.uri.length > 0) {
+						textParts.push(formatFileMention({ path: attachedPath(block.uri), content: "" }));
+					}
 					break;
-				case "resource":
+				case "resource": {
+					const resourcePath = attachedPath(block.resource.uri);
 					// Select arms by *type*, not key presence: `session/prompt`
 					// blocks reach here without the `_session/steering`
 					// validation, and a mixed shape (a string blob plus a
@@ -3353,7 +3397,7 @@ export class AcpAgent implements Agent {
 					// checks narrow the union; the typeof checks keep a
 					// malformed arm from winning it.
 					if ("text" in block.resource && typeof block.resource.text === "string") {
-						textParts.push(block.resource.text);
+						textParts.push(formatFileMention({ path: resourcePath, content: block.resource.text }));
 					} else if (
 						"blob" in block.resource &&
 						typeof block.resource.blob === "string" &&
@@ -3363,15 +3407,29 @@ export class AcpAgent implements Agent {
 						// `embeddedContext: true` covers both text and blob resources, but
 						// blobs aren't directly consumable by the LLM. Route image blobs
 						// to the images array so the user's intent survives; everything
-						// else falls back to the URI placeholder below.
+						// else falls back to the skipped-read note below.
 						images.push({ type: "image", data: block.resource.blob, mimeType: block.resource.mimeType });
+						textParts.push(formatFileMention({ path: resourcePath, content: "" }));
 					} else {
-						textParts.push(`[embedded resource: ${block.resource.uri}]`);
+						textParts.push(
+							formatFileMention({ path: resourcePath, content: "(skipped auto-read: binary file)" }),
+						);
 					}
 					break;
-				case "resource_link":
-					textParts.push(block.title ?? block.name ?? block.uri);
+				}
+				case "resource_link": {
+					// A bare reference (agent-shell sends one for a file over its
+					// embed limit) takes the TUI's skipped-read form, so the model
+					// reads the file itself when it needs the contents.
+					const size = typeof block.size === "number" ? `, ${formatBytes(block.size)}` : "";
+					textParts.push(
+						formatFileMention({
+							path: attachedPath(block.uri),
+							content: `(skipped auto-read: not embedded by the client${size})`,
+						}),
+					);
 					break;
+				}
 				case "audio":
 					textParts.push("[audio omitted]");
 					break;
@@ -4056,7 +4114,14 @@ export class AcpAgent implements Agent {
 		const forkedFrom = parentSessionId(session.parentSessionPath);
 		if (forkedFrom) fields.forkedFrom = forkedFrom;
 		const running = record !== undefined && (isPromptTurnInFlight(record.promptTurn) || record.session.isStreaming);
-		fields.state = running ? "running" : session.status === "error" ? "error" : "idle";
+		// `pendingPermissions` is counted for every client; `runState` only for one that opted into `state_update`.
+		fields.state = running
+			? record.pendingPermissions > 0
+				? "requires_action"
+				: "running"
+			: session.status === "error"
+				? "error"
+				: "idle";
 		if (activity?.lastTurnEndedAt) fields.lastTurnEndedAt = activity.lastTurnEndedAt;
 		const cost = record?.session.sessionManager.getUsageStatistics().cost ?? 0;
 		if (cost > 0) fields.cost = { amount: cost, currency: "USD" };
@@ -4285,6 +4350,8 @@ export class AcpAgent implements Agent {
 	async #emitEndOfTurnUpdates(record: ManagedSessionRecord): Promise<void> {
 		await this.#pushUsageUpdate(record);
 		await this.#pushSessionInfoUpdate(record);
+		// Not awaited: a usage cache miss is a network call, which must not delay the prompt response.
+		void this.#pushRateLimitUpdates(record);
 	}
 
 	/**
@@ -4310,6 +4377,49 @@ export class AcpAgent implements Agent {
 				cost: cost > 0 ? { amount: cost, currency: "USD" } : undefined,
 			},
 		});
+	}
+
+	/**
+	 * Sends each subscription rate-limit window of the session's model and
+	 * account that changed since last sent, one `usage_update` per window under
+	 * `_meta["_claude/rateLimit"]`, as claude-agent-acp does. The reports come
+	 * from the auth storage's usage cache, which refetches at most every few
+	 * minutes; a failed fetch skips the push.
+	 */
+	async #pushRateLimitUpdates(record: ManagedSessionRecord): Promise<void> {
+		const { session } = record;
+		const sessionId = session.sessionId;
+		try {
+			const model = session.model;
+			if (!model) return;
+			const reports = await session.fetchUsageReports();
+			if (!reports || this.#sessions.get(sessionId) !== record) return;
+			const contextUsage = session.getContextUsage();
+			if (!contextUsage) return;
+			const infos = rateLimitInfos(reports, {
+				provider: model.provider,
+				modelId: model.id,
+				identity: session.modelRegistry.authStorage.oauth.identity(model.provider, sessionId),
+			});
+			const cost = session.sessionManager.getUsageStatistics().cost;
+			for (const info of infos) {
+				const sent = JSON.stringify(info);
+				if (record.sentRateLimits.get(info.rateLimitType) === sent) continue;
+				record.sentRateLimits.set(info.rateLimitType, sent);
+				await this.#connection.sessionUpdate({
+					sessionId,
+					update: {
+						sessionUpdate: "usage_update",
+						size: contextUsage.contextWindow,
+						used: contextUsage.tokens ?? 0,
+						cost: cost > 0 ? { amount: cost, currency: "USD" } : undefined,
+						_meta: { [RATE_LIMIT_META_KEY]: info },
+					},
+				});
+			}
+		} catch (error) {
+			logger.debug("Failed to push ACP rate limits", { sessionId, error: String(error) });
+		}
 	}
 
 	/** Sends the session's title, unless it has none or the client already has it. */
@@ -4584,7 +4694,7 @@ export class AcpAgent implements Agent {
 	 * then an idle snapshot. A child without a transcript stays unexposed.
 	 */
 	async #replaySubagent(
-		child: { id: string; description: string | undefined },
+		child: { id: string; agent: string | undefined; description: string | undefined },
 		parentSessionId: string,
 		parentSessionFile: string,
 		subagents: SubagentReplay,
@@ -4601,12 +4711,13 @@ export class AcpAgent implements Agent {
 		}
 		if (messages.length === 0) return;
 		const sessionId = subagentSessionId(subagents.rootSessionId, child.id);
+		const title = subagentTitle(child.id, child.agent);
 		await subagents.send({
 			sessionId: parentSessionId,
 			update: {
 				sessionUpdate: "subagent_update",
 				sessionId,
-				title: child.id,
+				title,
 				...(child.description ? { description: child.description } : {}),
 			},
 		});
@@ -4629,7 +4740,7 @@ export class AcpAgent implements Agent {
 		subagents.relay.restore(child.id, {
 			sessionId,
 			parentSessionId,
-			title: child.id,
+			title,
 			description: child.description,
 			prompts,
 			announced: subagents.announce,
@@ -5187,8 +5298,20 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.titleUnsubscribe?.();
-		record.subagentRelay?.dispose();
+		// Delivers the end of children still running before the session kills them,
+		// but a client that stops reading must not hold the close: this path is also
+		// the fallback when cancel cleanup times out.
+		const subagentsSettled = record.subagentRelay?.dispose();
 		record.asyncTaskRelay?.dispose();
+		if (subagentsSettled) {
+			const deadline = Promise.withResolvers<void>();
+			const timer = setTimeout(deadline.resolve, this.#cancelCleanupTimeoutMs);
+			try {
+				await Promise.race([subagentsSettled, deadline.promise]);
+			} finally {
+				clearTimeout(timer);
+			}
+		}
 		if (record.mcpManager) {
 			try {
 				await record.mcpManager.disconnectAll();

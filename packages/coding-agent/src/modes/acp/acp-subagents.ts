@@ -1,10 +1,11 @@
-import type {
-	ClientCapabilities,
-	SessionNotification,
-	SubagentUpdate,
-	SubagentWorkState,
-} from "@oh-my-pi/pi-utils/acp";
 import { logger } from "@oh-my-pi/pi-utils";
+import {
+	type ClientCapabilities,
+	RequestError,
+	type SessionNotification,
+	type SubagentUpdate,
+	type SubagentWorkState,
+} from "@oh-my-pi/pi-utils/acp";
 import { cancelLiveSubagent } from "../../registry/cancel-subagent";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { MountedMCPToolRouteSource } from "../../session/session-tools";
@@ -36,6 +37,16 @@ export function subagentSessionId(rootSessionId: string, id: string): string {
 /** Whether `sessionId` names a relayed subagent child (see {@link subagentSessionId}), not a stored session. */
 export function isSubagentSessionId(sessionId: string): boolean {
 	return sessionId.includes(":subagent:");
+}
+
+/**
+ * The title of subagent `id` running agent type `agent`, live and replayed
+ * alike: `"id (agent)"`, or the bare id when the type is unknown or the same
+ * (claude-agent-acp's `"name (agentType)"`).
+ */
+export function subagentTitle(id: string, agent: string | undefined): string {
+	const type = agent?.trim();
+	return type && type !== id ? `${id} (${type})` : id;
 }
 
 /** A child of a loaded or resumed session; see {@link AcpSubagentRelay.restore}. */
@@ -120,11 +131,22 @@ export class AcpSubagentRelay {
 		return this.#chain;
 	}
 
-	dispose(): void {
+	/**
+	 * Stop relaying. A child still running is reported idle/cancelled first:
+	 * the session that owns it is going away (close/shutdown kills its
+	 * subagents after this, when nothing relays their end any more), and the
+	 * client must not keep it running forever. Resolves once those reports
+	 * are delivered.
+	 */
+	dispose(): Promise<void> {
 		for (const unsubscribe of this.#unsubscribers) unsubscribe();
 		this.#unsubscribers.length = 0;
+		for (const child of this.#children.values()) {
+			if (child.running) this.#settle(child, IDLE_STATE.aborted);
+		}
 		this.#children.clear();
 		this.#toolCallOwner.clear();
+		return this.#chain;
 	}
 
 	/** The ACP session id of subagent `id`, live or restored, or `undefined` if this relay does not know it. */
@@ -168,7 +190,7 @@ export class AcpSubagentRelay {
 				parentSessionId:
 					(payload.parentToolCallId && this.#toolCallOwner.get(payload.parentToolCallId)) ||
 					this.#options.sessionId,
-				title: payload.id,
+				title: subagentTitle(payload.id, payload.agent),
 				description: payload.description?.trim() || undefined,
 				announced: true,
 				running: true,
@@ -181,7 +203,7 @@ export class AcpSubagentRelay {
 			};
 			this.#children.set(payload.id, child);
 			this.#patch(child, {
-				title: payload.id,
+				title: child.title,
 				...(child.description ? { description: child.description } : {}),
 				state: { state: "running" },
 				...this.#cancelCapability(child),
@@ -192,13 +214,26 @@ export class AcpSubagentRelay {
 		const child = this.#children.get(payload.id);
 		if (!child?.running) return;
 		this.#sendPrompt(child, payload.assignment);
+		// A failure's text goes with it, as `error` on the idle state (ACP subagents RFD).
+		const error = payload.status === "failed" ? payload.error?.trim() : undefined;
+		this.#settle(
+			child,
+			error
+				? {
+						state: "idle",
+						stopReason: "error",
+						error: { code: RequestError.internalError().code, message: error },
+					}
+				: IDLE_STATE[payload.status],
+			this.#descriptionPatch(child, payload.description),
+		);
+	}
+
+	// Ends the child's run on its parent, withdrawing an advertised cancel.
+	#settle(child: ChildSession, state: SubagentWorkState, labels: { description?: string } = {}): void {
 		const cancelAdvertised = this.#canCancel(child);
 		child.running = false;
-		this.#patch(child, {
-			...this.#descriptionPatch(child, payload.description),
-			state: IDLE_STATE[payload.status],
-			...(cancelAdvertised ? { capabilities: null } : {}),
-		});
+		this.#patch(child, { ...labels, state, ...(cancelAdvertised ? { capabilities: null } : {}) });
 	}
 
 	/**

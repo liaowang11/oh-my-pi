@@ -640,6 +640,39 @@ describe("runSubprocess soft request budget", () => {
 		expect(settled).toEqual(["completed"]);
 	});
 
+	it("a failed run's settled lifecycle frame carries the failure text it returns", async () => {
+		const id = "FailingScout";
+		const bus = new EventBus();
+		const settled = Promise.withResolvers<{ status?: string; error?: string }>();
+		bus.on(TASK_SUBAGENT_LIFECYCLE_CHANNEL, frame => {
+			const payload = frame as { id?: string; status?: string; error?: string };
+			if (payload.id === id && payload.status !== "started") settled.resolve(payload);
+		});
+		// Ends without a yield or any text: the run fails.
+		const handle = createMockSession(({ promptIndex, emit, pushMessage }) => {
+			if (promptIndex !== 1) return;
+			const message = assistantText("");
+			pushMessage(message);
+			emit({ type: "message_end", message } as unknown as AgentSessionEvent);
+		});
+		vi.spyOn(sdkModule, "createAgentSession").mockImplementation(async () => {
+			return {
+				session: handle.session,
+				extensionsResult: {} as unknown as LoadExtensionsResult,
+				setToolUIContext: () => {},
+				eventBus: new EventBus(),
+			} satisfies CreateAgentSessionResult;
+		});
+		registerRunning(id, handle.session);
+
+		const result = await runSubprocess(baseOptions(id, bus));
+		const frame = await settled.promise;
+
+		expect(result.exitCode).not.toBe(0);
+		expect(result.error).toBeTruthy();
+		expect(frame).toMatchObject({ status: "failed", error: result.error });
+	});
+
 	it("a caller-signal abort keeps the kept-alive agent resumable via irc", async () => {
 		const id = "CancelledScout";
 		const controller = new AbortController();
