@@ -1144,6 +1144,8 @@ export interface SubagentLifecyclePayload {
 	parentToolCallId?: string;
 	/** The subagent runs as a detached background job. */
 	detached?: boolean;
+	/** Why a `failed` run failed, when the run reported a reason. */
+	error?: string;
 }
 
 export interface SubagentProgressPayload {
