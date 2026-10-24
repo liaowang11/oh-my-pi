@@ -521,6 +521,57 @@ describe("agentLoop with AgentMessage", () => {
 		expect(details.get("tool-failed")).toEqual({});
 	});
 
+	it("marks a running tool that an external abort stopped as interrupted", async () => {
+		// An ACP client shows such a call as interrupted rather than failed; the
+		// tool's own error text stays the result content. A gate's own tag wins.
+		const toolSchema = type({ tag: "string" });
+		const started = Promise.withResolvers<void>();
+		let running = 0;
+		const tool: AgentTool<typeof toolSchema> = {
+			name: "slow",
+			label: "Slow",
+			description: "Slow tool",
+			parameters: toolSchema,
+			concurrency: "shared",
+			async execute(_toolCallId, params, signal) {
+				if (++running === 2) started.resolve();
+				const { promise, reject } = Promise.withResolvers<never>();
+				signal?.addEventListener("abort", () => {
+					const error = new Error(`stopped ${params.tag}`);
+					reject(params.tag === "gated" ? Object.assign(error, { nonExecution: "cancelled" }) : error);
+				});
+				return await promise;
+			},
+		};
+		const context: AgentContext = { systemPrompt: [""], messages: [], tools: [tool] };
+		const mock = createMockModel({
+			responses: [
+				{
+					content: [
+						{ type: "toolCall", id: "tool-plain", name: "slow", arguments: { tag: "plain" } },
+						{ type: "toolCall", id: "tool-gated", name: "slow", arguments: { tag: "gated" } },
+					],
+				},
+			],
+		});
+		const controller = new AbortController();
+		const config: AgentLoopConfig = { model: mock.model, convertToLlm: identityConverter };
+		void started.promise.then(() => controller.abort());
+		const stream = agentLoop([createUserMessage("run slow")], context, config, controller.signal, mock.stream);
+		const results = new Map<string, { details: unknown; text: unknown }>();
+		for await (const event of stream) {
+			if (event.type === "tool_execution_end") {
+				const first = event.result.content?.[0];
+				results.set(event.toolCallId, {
+					details: event.result.details,
+					text: first?.type === "text" ? first.text : undefined,
+				});
+			}
+		}
+		expect(results.get("tool-plain")).toEqual({ details: { nonExecution: "interrupted" }, text: "stopped plain" });
+		expect(results.get("tool-gated")).toEqual({ details: { nonExecution: "cancelled" }, text: "stopped gated" });
+	});
+
 	it("still derives intent for a tool that owns `i` as an argument", async () => {
 		const toolSchema = type({ label: "string", "i?": "string" });
 		const executed: unknown[] = [];

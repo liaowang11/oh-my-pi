@@ -29,6 +29,15 @@ export interface ClientBridgePermissionToolCall {
 	rawInput?: unknown;
 	content?: unknown[];
 	locations?: { path: string; line?: number }[];
+	/** How the prompt itself is presented, beyond the tool call it guards. */
+	presentation?: ClientBridgePermissionPresentation;
+}
+
+export interface ClientBridgePermissionPresentation {
+	/** Why the approval policy asks. */
+	reason?: string;
+	/** A stray keystroke must not approve: the policy forced this prompt over any grant. */
+	defaultToNo?: boolean;
 }
 
 export type ClientBridgePermissionOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";
