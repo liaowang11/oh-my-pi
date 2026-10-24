@@ -52,7 +52,7 @@ export type SessionIndexPosition = { orderAtMs: number; sessionId: string };
 export type SessionIdRequest = { sessionId: string };
 export type RenameSessionRequest = { sessionId: string; title: string };
 
-/** The AIR row state, never `unknown`. `requires_action` is not reported by omp. */
+/** The AIR row state, never `unknown`. `requires_action` marks a running session waiting on a permission request. */
 export type SessionIndexState = "running" | "idle" | "requires_action" | "error";
 
 /** Flat `_meta.jetbrains.air` fields of a list row. `archived` is always present. */

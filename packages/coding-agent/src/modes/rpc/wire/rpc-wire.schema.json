@@ -4694,6 +4694,10 @@
 				"detached": {
 					"type": "boolean",
 					"description": "The subagent runs as a detached background job."
+				},
+				"error": {
+					"type": "string",
+					"description": "Why a `failed` run failed, when the run reported a reason."
 				}
 			},
 			"required": [

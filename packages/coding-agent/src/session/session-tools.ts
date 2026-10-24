@@ -55,12 +55,13 @@ import { resolveEditMode } from "../utils/edit-mode";
 import {
 	extractPermissionLocations,
 	getPermissionIntent,
+	ONCE_PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS,
 	PERMISSION_OPTIONS_BY_ID,
 	PERMISSION_REQUIRED_TOOLS,
 	withNonExecution,
 } from "./acp-permission-gate";
-import type { ClientBridge, ClientBridgePermissionOutcome } from "./client-bridge";
+import type { ClientBridge, ClientBridgePermissionOutcome, ClientBridgePermissionPresentation } from "./client-bridge";
 import { toolReadsSkillUris } from "../system-prompt";
 
 import type { CustomMessage } from "./messages";
@@ -1052,6 +1053,7 @@ export class SessionTools {
 					const restrictions = approvalRestrictions(this.#host.settings, this.#host.sessionManager.getCwd());
 					// A restricted call is approved per call: a remembered ACP answer never covers it.
 					let cacheable = restrictedFolderReason(target, args, restrictions) === undefined;
+					let presentation: ClientBridgePermissionPresentation | undefined;
 					if (target.name === "bash") {
 						const explicitAutoApprove = this.#isExplicitAutoApproveMode();
 						const { approvalMode, userPolicies } = resolveApprovalFromContext({
@@ -1074,8 +1076,12 @@ export class SessionTools {
 							return await target.execute(toolCallId, args as never, signal, onUpdate, ctx as never);
 						}
 						// A prompt forced by a critical command or an explicit pattern
-						// remains per-call, even after the client selects Always allow.
+						// remains per-call: the client gets only the once options, and
+						// is asked not to default to approving.
 						cacheable = !resolved.override;
+						if (resolved.override) {
+							presentation = { defaultToNo: true, ...(resolved.reason ? { reason: resolved.reason } : {}) };
+						}
 					}
 					const permissionIntent = getPermissionIntent(target.name, args);
 					if (!permissionIntent) {
@@ -1214,8 +1220,9 @@ export class SessionTools {
 										this.#host.sessionManager.getCwd(),
 										permissionIntent.paths,
 									),
+									...(presentation ? { presentation } : {}),
 								},
-								PERMISSION_OPTIONS,
+								cacheable ? PERMISSION_OPTIONS : ONCE_PERMISSION_OPTIONS,
 								signal,
 								// The bridge cancels its pending wire dialog when the
 								// steer wins; the gate's own race above classifies the
@@ -1237,7 +1244,10 @@ export class SessionTools {
 						this.#host.steeringArrivalRelease(arrivalParkSeq);
 					}
 					if (raced.kind === "steered") {
-						throw new ToolAbortError("Permission request superseded by user steering");
+						throw withNonExecution(
+							new ToolAbortError("Permission request superseded by user steering"),
+							"cancelled",
+						);
 					}
 					if (raced.kind === "aborted" || signal?.aborted) {
 						throw withNonExecution(new ToolAbortError("Permission request cancelled"), "cancelled");
