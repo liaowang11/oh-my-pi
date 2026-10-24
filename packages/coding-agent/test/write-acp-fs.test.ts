@@ -127,6 +127,29 @@ describe("write tool ACP fs routing", () => {
 		expect(resultText(result)).toContain(`Successfully wrote ${FILE_CONTENT.length} bytes to progress.txt`);
 	});
 
+	it("marks a write that created its file, on disk and through the bridge, but not an overwrite", async () => {
+		// ACP shows a created file as a new-file diff; an overwrite's old text is unknown.
+		const local = new WriteTool(createSession(tmpDir));
+		const localPath = path.join(tmpDir, "local.txt");
+		const first = await local.execute("call-create", { path: localPath, content: FILE_CONTENT });
+		const second = await local.execute("call-overwrite", { path: localPath, content: "replaced\n" });
+		expect(first.details?.created).toBe(true);
+		expect(second.details?.created).toBeUndefined();
+
+		const bridge: ClientBridge = {
+			capabilities: { writeTextFile: true },
+			writeTextFile: async ({ path: target, content }) => {
+				await Bun.write(target, content);
+			},
+		};
+		const bridged = new WriteTool(createSession(tmpDir, { bridge }));
+		const bridgedPath = path.join(tmpDir, "bridged.txt");
+		const created = await bridged.execute("call-bridge-create", { path: bridgedPath, content: FILE_CONTENT });
+		const replaced = await bridged.execute("call-bridge-overwrite", { path: bridgedPath, content: "replaced\n" });
+		expect(created.details?.created).toBe(true);
+		expect(replaced.details?.created).toBeUndefined();
+	});
+
 	it("writes local plan artifacts to disk instead of the ACP bridge", async () => {
 		const planPath = "local://PLAN.md";
 		const planContent = "# Plan\n\nhello world\n";
