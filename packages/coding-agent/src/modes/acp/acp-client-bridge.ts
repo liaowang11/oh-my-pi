@@ -14,6 +14,7 @@ import type {
 	RequestPermissionResponse,
 	ToolCallUpdate,
 } from "@oh-my-pi/pi-utils/acp";
+import { AIR_EXTENSION_VERSION, AIR_PERMISSION_KEY, isAirClient, withAirMeta } from "./acp-air";
 import type {
 	ClientBridge,
 	ClientBridgeCapabilities,
@@ -74,8 +75,18 @@ export function createAcpClientBridge(
 			createTerminalHandle(connection, sessionId, params);
 	}
 
+	const airClient = isAirClient(clientCapabilities);
 	bridge.requestPermission = (toolCall, options, signal, steeringSignal) =>
-		requestPermission(connection, sessionId, toolCall, options, signal, steeringSignal, permissionObserver);
+		requestPermission(
+			connection,
+			sessionId,
+			toolCall,
+			options,
+			signal,
+			steeringSignal,
+			permissionObserver,
+			airClient,
+		);
 
 	return bridge;
 }
@@ -128,6 +139,7 @@ async function requestPermission(
 	signal: AbortSignal | undefined,
 	steeringSignal: AbortSignal | undefined,
 	observer: AcpPermissionObserver | undefined,
+	airClient: boolean,
 ): Promise<ClientBridgePermissionOutcome> {
 	const update: ToolCallUpdate = {
 		toolCallId: toolCall.toolCallId,
@@ -148,6 +160,18 @@ async function requestPermission(
 		toolCall: update,
 		options: acpOptions,
 	};
+	// Only AIR gets the presentation, in claude-agent-acp's shape: the reason as
+	// a `Reason: ` description, and `defaultToNo` when a stray keystroke must not
+	// approve.
+	const presentation = toolCall.presentation;
+	if (airClient && (presentation?.reason || presentation?.defaultToNo)) {
+		request._meta = withAirMeta(undefined, AIR_PERMISSION_KEY, {
+			version: AIR_EXTENSION_VERSION,
+			title: toolCall.title,
+			...(presentation.reason ? { description: `Reason: ${presentation.reason}` } : {}),
+			...(presentation.defaultToNo ? { defaultToNo: true } : {}),
+		});
+	}
 	if (signal?.aborted) {
 		return { outcome: "cancelled" };
 	}

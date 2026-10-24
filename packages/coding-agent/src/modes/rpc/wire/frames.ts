@@ -64,6 +64,7 @@ export const frameDefs = {
 		"parentToolCallId?": "string",
 		index: "number.integer",
 		"detached?": doc("boolean", "The subagent runs as a detached background job."),
+		"error?": doc("string", "Why a `failed` run failed, when the run reported a reason."),
 	},
 	SubagentProgressPayload: {
 		index: "number.integer",

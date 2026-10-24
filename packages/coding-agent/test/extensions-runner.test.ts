@@ -2824,7 +2824,12 @@ describe("ExtensionRunner", () => {
 					abort: () => {},
 					settings: Settings.isolated({ "tools.approvalMode": "always-ask" }),
 				}),
-			).rejects.toThrow("Tool call denied by user: dangerous_tool");
+			).rejects.toMatchObject({
+				message: "Tool call denied by user: dangerous_tool",
+				// The agent loop keeps the tag as the result's `details.nonExecution`,
+				// so an ACP client shows the call as rejected, not failed.
+				nonExecution: "user-rejected",
+			});
 
 			expect(events).toEqual([
 				{ type: "tool_approval_requested", reason: undefined },

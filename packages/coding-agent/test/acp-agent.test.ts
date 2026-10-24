@@ -2380,20 +2380,75 @@ describe("ACP agent", () => {
 		// Admission goes through AgentSession.joinActiveTurn — the atomic
 		// check+enqueue primitive — never a raw steer() plus bridge heuristics.
 		expect(result).toEqual({ outcome: "injected", queue: "steering" });
+		const steeredText =
+			'use the existing parser\n\n<file path="/plan.md">\n(skipped auto-read: not embedded by the client)\n</file>';
 		expect(session.joinActiveTurnCalls).toEqual([
 			{
-				text: "use the existing parser\n\nplan",
+				text: steeredText,
 				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
 				queue: "steering",
 			},
 		]);
 		expect(session.steerCalls).toEqual([
 			{
-				text: "use the existing parser\n\nplan",
+				text: steeredText,
 				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
 			},
 		]);
 		expect(session.followUpCalls).toEqual([]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("names attached files with the TUI's <file path> wrapper", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.isStreaming = true;
+
+		// agent-shell replaces each `@path` with one of these blocks. The model
+		// must see each file's path (cwd-relative inside the session cwd), not
+		// just its body; a non-file URI stays visible verbatim.
+		await harness.agent.extMethod("_session/steering", {
+			sessionId: created.sessionId,
+			prompt: [
+				{ type: "text", text: "compare" },
+				{
+					type: "resource",
+					resource: {
+						uri: `file://${harness.cwdA}/src/a.ts`,
+						text: "export const a = 1;",
+						mimeType: "text/x-typescript",
+					},
+				},
+				{ type: "resource", resource: { uri: "file:///elsewhere/b.md", text: "# B" } },
+				{ type: "resource", resource: { uri: "https://example.com/spec.txt", text: "spec body" } },
+				{
+					type: "resource_link",
+					uri: `file://${harness.cwdA}/logs/big.log`,
+					name: "logs/big.log",
+					mimeType: "text/plain",
+					size: 6 * 1024 * 1024,
+				},
+				{ type: "image", data: "aW1hZ2U=", mimeType: "image/png", uri: `file://${harness.cwdA}/shot.png` },
+			],
+		});
+
+		expect(session.joinActiveTurnCalls).toEqual([
+			{
+				text: [
+					"compare",
+					'<file path="src/a.ts">\nexport const a = 1;\n</file>',
+					'<file path="/elsewhere/b.md">\n# B\n</file>',
+					'<file path="https://example.com/spec.txt">\nspec body\n</file>',
+					'<file path="logs/big.log">\n(skipped auto-read: not embedded by the client, 6.0MB)\n</file>',
+					'<file path="shot.png">\n</file>',
+				].join("\n\n"),
+				images: [{ type: "image", data: "aW1hZ2U=", mimeType: "image/png" }],
+				queue: "steering",
+			},
+		]);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -2955,6 +3010,65 @@ describe("ACP agent", () => {
 		const manual = harness.updates.length;
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
 		expect(usageUpdates(manual)).toEqual([12_000]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("pushes the model's subscription limits on usage_update as claude-agent-acp's _claude/rateLimit, once per change", async () => {
+		const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+		const harness = await createHarness({ authStorage });
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		session.model = TEST_MODELS[0];
+		session.contextUsage = { tokens: 1_000, contextWindow: 200_000, percent: 0.5 };
+		const fiveHour = (usedFraction: number) => ({
+			provider: "anthropic",
+			fetchedAt: 0,
+			limits: [
+				{
+					id: "anthropic:5h",
+					label: "Claude 5 Hour",
+					scope: { provider: "anthropic", windowId: "5h" },
+					window: { id: "5h", label: "5 Hour", resetsAt: 1_800_000_000_000 },
+					amount: { unit: "percent" as const, usedFraction },
+					status: usedFraction >= 0.9 ? ("warning" as const) : ("ok" as const),
+				},
+			],
+		});
+		let reports = [fiveHour(0.92)];
+		Object.assign(session, { fetchUsageReports: async () => reports });
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const rateLimits = () =>
+			harness.updates
+				.filter(update => update.sessionId === created.sessionId && update.update.sessionUpdate === "usage_update")
+				.map(update => update.update._meta?.["_claude/rateLimit"])
+				.filter(info => info !== undefined);
+		const settle = async (count: number) => {
+			for (let attempt = 0; attempt < 100 && rateLimits().length < count; attempt++) await Bun.sleep(5);
+		};
+
+		// A turn end reports the limits.
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "one" }] });
+		await settle(1);
+		expect(rateLimits()).toEqual([
+			{ status: "allowed_warning", rateLimitType: "five_hour", utilization: 0.92, resetsAt: 1_800_000_000 },
+		]);
+		// An unchanged window is not re-sent.
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "two" }] });
+		await Bun.sleep(20);
+		expect(rateLimits()).toHaveLength(1);
+		reports = [fiveHour(0.5)];
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "three" }] });
+		await settle(2);
+		expect(rateLimits().at(-1)).toEqual({
+			status: "allowed",
+			rateLimitType: "five_hour",
+			utilization: 0.5,
+			resetsAt: 1_800_000_000,
+		});
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -7201,7 +7315,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: child,
-					title: "InspectLabels",
+					title: "InspectLabels (explore)",
 					state: { state: "running" },
 				},
 			},
@@ -7221,6 +7335,37 @@ describe("ACP subagent sessions", () => {
 			},
 		]);
 		expectAcpNotifications(notifications);
+		harness.abortController.abort();
+	});
+
+	it("reports a failed child's error text in its idle state, and no error when the run gave none", async () => {
+		const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const bus = harness.eventBuses.at(-1)!;
+		const parent = created.sessionId;
+		lifecycle(bus, "Broken", "started");
+		lifecycle(bus, "Broken", "failed", { error: "Provider returned 529: overloaded" });
+		lifecycle(bus, "Silent", "started");
+		lifecycle(bus, "Silent", "failed");
+		await Bun.sleep(0);
+
+		const idle = subagentUpdates(harness).flatMap(n =>
+			n.update.sessionUpdate === "subagent_update" && n.update.state?.state === "idle"
+				? [[n.update.sessionId, n.update.state]]
+				: [],
+		);
+		expect(idle).toEqual([
+			[
+				`${parent}:subagent:Broken`,
+				{
+					state: "idle",
+					stopReason: "error",
+					error: { code: -32603, message: "Provider returned 529: overloaded" },
+				},
+			],
+			[`${parent}:subagent:Silent`, { state: "idle", stopReason: "error" }],
+		]);
+		expectAcpNotifications(harness.updates);
 		harness.abortController.abort();
 	});
 
@@ -7282,7 +7427,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: child,
-					title: "0-Explore",
+					title: "0-Explore (explore)",
 					description: "map the repo",
 					state: { state: "running" },
 				},
@@ -7293,7 +7438,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: nested,
-					title: "0-Explore.0-Scan",
+					title: "0-Explore.0-Scan (scan)",
 					state: { state: "running" },
 				},
 			},
@@ -7350,7 +7495,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: child,
-					title: "0-Explore",
+					title: "0-Explore (explore)",
 					description: "Old purpose",
 					state: { state: "running" },
 				},
@@ -7415,7 +7560,7 @@ describe("ACP subagent sessions", () => {
 		stored.sessionManager.appendMessage(
 			taskResult("toolu_task", {
 				results: [
-					{ id: "0-Explore", description: "map the repo" },
+					{ id: "0-Explore", agent: "explore", description: "map the repo" },
 					{ id: "1-Ghost", description: "no transcript" },
 				],
 			}),
@@ -7426,7 +7571,10 @@ describe("ACP subagent sessions", () => {
 		const childFile = await writeTranscript(stored.sessionManager.getSessionFile()!, "0-Explore", [
 			{ role: "user", content: [{ type: "text", text: "Map the repository" }], timestamp: Date.now() },
 			toolCall("toolu_nested"),
-			taskResult("toolu_nested", { results: [], progress: [{ id: "0-Explore.0-Scan", description: "scan deps" }] }),
+			taskResult("toolu_nested", {
+				results: [],
+				progress: [{ id: "0-Explore.0-Scan", agent: "scan", description: "scan deps" }],
+			}),
 			makeAssistantMessage("found it"),
 		]);
 		await writeTranscript(childFile, "0-Explore.0-Scan", [
@@ -7475,7 +7623,7 @@ describe("ACP subagent sessions", () => {
 		expect(replayed.find(n => n.update.sessionUpdate === "subagent_update")?.update).toEqual({
 			sessionUpdate: "subagent_update",
 			sessionId: child,
-			title: "0-Explore",
+			title: "0-Explore (explore)",
 			description: "map the repo",
 		});
 		expect(replayed.find(n => n.update.sessionUpdate === "session_message")).toEqual(
@@ -7516,7 +7664,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: child,
-					title: "0-Explore",
+					title: "0-Explore (explore)",
 					description: "map the repo",
 				},
 			},
@@ -7525,7 +7673,7 @@ describe("ACP subagent sessions", () => {
 				update: {
 					sessionUpdate: "subagent_update",
 					sessionId: nested,
-					title: "0-Explore.0-Scan",
+					title: "0-Explore.0-Scan (scan)",
 					description: "scan deps",
 				},
 			},
@@ -7651,6 +7799,54 @@ describe("ACP subagent sessions", () => {
 				[{ state: "idle", stopReason: "end_turn" }, null],
 			]);
 			expectAcpNotifications(harness.updates);
+			harness.abortController.abort();
+		});
+
+		it("reports a still-running child idle/cancelled before its session closes", async () => {
+			const harness = await createHarness({ clientCapabilities: { subagents: {} } });
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const running = `${created.sessionId}:subagent:Worker`;
+			const finished = `${created.sessionId}:subagent:Done`;
+			const dir = await transcriptDir();
+
+			lifecycle(bus, "Worker", "started", { sessionFile: path.join(dir, "Worker.jsonl") });
+			lifecycle(bus, "Done", "started");
+			lifecycle(bus, "Done", "completed");
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			// Delivered by the time the close resolves.
+			expect(childPatches(harness, running).map(update => [update.state, update.capabilities])).toEqual([
+				[{ state: "running" }, { cancel: {} }],
+				[{ state: "idle", stopReason: "cancelled" }, null],
+			]);
+			// What the session's teardown reports after close is not relayed again.
+			lifecycle(bus, "Worker", "aborted");
+			await Bun.sleep(0);
+			expect(childPatches(harness, running)).toHaveLength(2);
+			expect(childPatches(harness, finished).map(update => update.state)).toEqual([
+				{ state: "running" },
+				{ state: "idle", stopReason: "end_turn" },
+			]);
+			expectAcpNotifications(harness.updates);
+			harness.abortController.abort();
+		});
+
+		it("closes the session even when the client never acknowledges a child's final update", async () => {
+			const harness = await createHarness({
+				clientCapabilities: { subagents: {} },
+				// A client that stops reading: every subagent update hangs.
+				sessionUpdateHook: notification =>
+					notification.update.sessionUpdate === "subagent_update" ? new Promise<void>(() => {}) : undefined,
+			});
+			harness.agent.setCancelCleanupTimeoutForTesting(20);
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const dir = await transcriptDir();
+
+			lifecycle(bus, "Worker", "started", { sessionFile: path.join(dir, "Worker.jsonl") });
+			const closed = harness.agent.closeSession({ sessionId: created.sessionId }).then(() => true);
+
+			expect(await Promise.race([closed, Bun.sleep(1_000).then(() => false)])).toBe(true);
 			harness.abortController.abort();
 		});
 
@@ -7791,11 +7987,37 @@ describe("ACP subagent sessions", () => {
 			harness.abortController.abort();
 		});
 
-		it("neither advertises nor honors child cancel for a JetBrains AIR client", async () => {
+		it("advertises and honors child cancel for an AIR client without native subagent sessions", async () => {
+			// agent-shell speaks AIR for other extensions but takes the RFD
+			// subagent form, which includes child cancel.
 			const harness = await createHarness({
 				clientCapabilities: {
 					subagents: {},
 					_meta: { jetbrains: { air: { version: 1, capabilities: [] } } },
+				} as ClientCapabilities,
+			});
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const bus = harness.eventBuses.at(-1)!;
+			const dir = await transcriptDir();
+			const calls: string[] = [];
+			const child = `${created.sessionId}:subagent:Worker`;
+			lifecycle(bus, "Worker", "started", { sessionFile: path.join(dir, "Worker.jsonl") });
+			registerLiveAgent("Worker", path.join(dir, "Worker.jsonl"), calls);
+			await Bun.sleep(0);
+
+			expect(childPatches(harness, child)[0]?.capabilities).toEqual({ cancel: {} });
+			await harness.agent.cancel({ sessionId: child });
+
+			expect(calls).toEqual(["abort:Worker", "dispose:Worker"]);
+			expect(AgentRegistry.global().get("Worker")?.status).toBe("aborted");
+			harness.abortController.abort();
+		});
+
+		it("neither advertises nor honors child cancel for an AIR client with native subagent sessions", async () => {
+			const harness = await createHarness({
+				clientCapabilities: {
+					subagents: {},
+					_meta: { jetbrains: { air: { version: 1, capabilities: ["nativeSubagentSessions"] } } },
 				} as ClientCapabilities,
 			});
 			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });

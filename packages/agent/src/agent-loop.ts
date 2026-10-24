@@ -3720,7 +3720,7 @@ async function executeToolCalls(
 			// keeps its real result even if its signal aborted around completion:
 			// the model must see the work it actually performed (#4752).
 			// Non-interruptible tools also retain errors from external user aborts.
-			emitToolResult(record, result, isError);
+			emitToolResult(record, abortedDuringExecution ? withAbortNonExecution(result) : result, isError);
 		}
 
 		const firstTextBlock = result.content?.[0];
@@ -4054,11 +4054,33 @@ function nonExecutionDetails(error: unknown): Record<string, unknown> {
 	return typeof kind === "string" ? { nonExecution: kind } : {};
 }
 
+/**
+ * Kind a tool result carries when an external abort (user cancel) stopped the
+ * call before it finished. Consumers (ACP) show such a call as interrupted
+ * instead of as a tool failure.
+ */
+const ABORT_NON_EXECUTION_KIND = "interrupted";
+
+/**
+ * Tag an aborted call's result with {@link ABORT_NON_EXECUTION_KIND}, unless
+ * the thrown error already named why the call never ran (a permission gate's
+ * `cancelled`). Non-object details are left alone.
+ */
+function withAbortNonExecution(result: AgentToolResult<any>): AgentToolResult<any> {
+	const details: unknown = result.details;
+	if (details === undefined || details === null) {
+		return { ...result, details: { nonExecution: ABORT_NON_EXECUTION_KIND } };
+	}
+	if (typeof details !== "object" || Array.isArray(details)) return result;
+	if (typeof (details as { nonExecution?: unknown }).nonExecution === "string") return result;
+	return { ...result, details: { ...details, nonExecution: ABORT_NON_EXECUTION_KIND } };
+}
+
 function createToolSignalAbortedResult(signal: AbortSignal): AgentToolResult<unknown> {
 	const reason = abortReasonText(signal);
 	return {
 		content: [{ type: "text", text: `Tool was not executed because the run was aborted: ${reason}.` }],
-		details: {},
+		details: { nonExecution: ABORT_NON_EXECUTION_KIND },
 	};
 }
 

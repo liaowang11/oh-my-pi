@@ -281,6 +281,46 @@ it("ACP bash uses pattern decisions and scopes persistent grants to noncritical 
 	expect(bashTool.executeCalls).toBe(5);
 });
 
+it("ACP bash prompts that are never remembered offer only once options and default to no", async () => {
+	const settingsOverrides = {
+		"tools.approvalMode": "always-ask",
+		"tools.approval": { bash: "prompt" },
+		"bash.patterns": [{ match: "echo ask*", approval: "prompt" }],
+	};
+	const settings = Settings.isolated(settingsOverrides);
+	const requests: Array<{ toolCall: ClientBridgePermissionToolCall; kinds: string[] }> = [];
+	const bridge: ClientBridge = {
+		capabilities: { requestPermission: true },
+		async requestPermission(toolCall, options) {
+			requests.push({ toolCall, kinds: options.map(option => option.kind) });
+			return { outcome: "selected", optionId: "allow_once", kind: "allow_once" };
+		},
+	};
+	const bashTool = makeFakeTool("bash");
+	bashTool.approval = new BashTool({ ...makeToolSession(bridge), settings }).approval;
+	const wrapped = new ExtensionToolWrapper(bashTool, noUiRunner()) as unknown as AgentTool;
+	session = await createSession([wrapped], bridge, settingsOverrides);
+	await session.setActiveToolsByName(["bash"]);
+	const gatedBash = session.agent.state.tools.find(tool => tool.name === "bash");
+	if (!gatedBash) throw new Error("Missing bash tool");
+	const ctx = { settings } as never;
+	for (const command of ["echo plain", "rm -rf /", "echo ask-me"]) {
+		await gatedBash.execute(`call-${command}`, { command }, undefined, undefined as never, ctx);
+	}
+
+	// An ordinary prompt can be remembered and is not flagged.
+	expect(requests[0].kinds).toEqual(["allow_once", "allow_always", "reject_once", "reject_always"]);
+	expect(requests[0].toolCall.presentation).toBeUndefined();
+	// Critical and pattern-forced prompts ask on every call, so "always" would act as once.
+	expect(requests[1].kinds).toEqual(["allow_once", "reject_once"]);
+	expect(requests[1].toolCall.presentation).toEqual({ defaultToNo: true, reason: "Critical pattern detected" });
+	expect(requests[2].kinds).toEqual(["allow_once", "reject_once"]);
+	expect(requests[2].toolCall.presentation).toEqual({
+		defaultToNo: true,
+		reason: "Prompt required by bash pattern: echo ask*",
+	});
+});
+
 it("always-ask: an ordinary edit without an ACP grant still faces the inner approval gate", async () => {
 	const editTool = makeFakeTool("edit");
 	editTool.approval = "write";
@@ -1119,6 +1159,12 @@ it("a steer sent while a permission dialog is open supersedes it instead of wait
 	expect(deleteTool.executeCalls).toBe(0);
 	// The steer reached the model inside the same turn.
 	const messages = session.agent.state.messages;
+	// The superseded call says it was cancelled, so an ACP client shows it
+	// stopped rather than failed.
+	const supersededResult = messages.find(
+		message => message.role === "toolResult" && message.toolCallId === "call-delete-1",
+	);
+	expect(supersededResult).toMatchObject({ isError: true, details: { nonExecution: "cancelled" } });
 	expect(
 		messages.some(
 			message => message.role === "user" && JSON.stringify(message.content).includes("use the other parser"),

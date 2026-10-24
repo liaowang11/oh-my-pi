@@ -44,6 +44,8 @@ export interface ImageContent extends Meta {
 	type: "image";
 	data: string;
 	mimeType: string;
+	/** Where the image came from, e.g. the `file://` URI of an attached file. */
+	uri?: string | null;
 }
 /** Audio content block. */
 export interface AudioContent extends Meta {

@@ -13,6 +13,7 @@ import type { SchemeSpec } from "../../internal-urls/types";
 import type { AgentSessionEvent } from "../../session/agent-session";
 import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { AIR_COMMAND_TITLE_KEY, AIR_SUBAGENT_KEY, withAirFields } from "./acp-air";
+import { GITHUB_READONLY_OPS } from "../../tools/gh";
 import { resolveToCwd, splitPathAndSelPreferringLiteralSync } from "../../tools/path-utils";
 import type { TodoStatus } from "@oh-my-pi/pi-tui/tools/todo";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
@@ -140,7 +141,23 @@ interface TextMessageLike {
 	role?: unknown;
 }
 
-const ACP_TEXT_LIMIT = 4_000;
+/**
+ * Cap on each text block of a tool call's final content. The tools already
+ * bound what the model sees (bash and read keep about 52 KiB inline by default:
+ * the 50 KiB `tools.artifactSpillThreshold` plus notice slack), so this cap is
+ * above that and the client shows the same output the model got. It still
+ * bounds tools without their own cap (task output, JSON fallbacks). The full
+ * result also rides each update as `rawOutput`.
+ */
+const ACP_TEXT_LIMIT = 64 * 1024;
+
+/**
+ * Cap on titles and on the text of streamed progress updates. A streaming
+ * tool resends its whole output so far on every update, and the client
+ * re-renders each one, so progress stays a short preview; the final update
+ * carries the full output.
+ */
+const ACP_PREVIEW_TEXT_LIMIT = 4_000;
 
 /** Declared spec of the registered scheme a `write` call targets; undefined for file paths and other tools. */
 function writeTargetSpec(toolName: string, args: unknown): SchemeSpec | undefined {
@@ -178,14 +195,57 @@ export function mapToolKind(toolName: string, args?: unknown): ToolKind {
 		case "exec":
 		case "eval":
 			return "execute";
+		case "ast_edit":
+			return "edit";
 		case "grep":
 		case "glob":
 		case "ast_grep":
+		case "find":
 			return "search";
 		case "web_search":
 			return "fetch";
 		case "todo":
 			return "think";
+		case "lsp":
+			return lspToolKind(args);
+		case "github":
+			return GITHUB_READONLY_OPS.has(extractStringProperty<GithubOpContainer>(args, "op") ?? "") ? "fetch" : "other";
+		default:
+			return "other";
+	}
+}
+
+interface GithubOpContainer {
+	op?: unknown;
+}
+
+interface LspArgsLike {
+	action?: unknown;
+	apply?: unknown;
+}
+
+/**
+ * Kind of an `lsp` call: a rename (applied unless `apply: false`) or a code
+ * action applied with `apply: true` edits files; navigation and code-action
+ * listing search the index; server management is neither.
+ */
+function lspToolKind(args: unknown): ToolKind {
+	if (typeof args !== "object" || args === null) return "other";
+	const { action, apply } = args as LspArgsLike;
+	switch (action) {
+		case "rename":
+		case "rename_file":
+			return apply === false ? "search" : "edit";
+		case "code_actions":
+			return apply === true ? "edit" : "search";
+		case "diagnostics":
+		case "definition":
+		case "references":
+		case "hover":
+		case "symbols":
+		case "type_definition":
+		case "implementation":
+			return "search";
 		default:
 			return "other";
 	}
@@ -217,7 +277,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			if (isInternalAgentMessageTool(event.toolName, event.args)) return [];
 			const content = mergeToolUpdateContent(
 				buildToolStartContent(event.toolName, event.args),
-				extractToolCallContent(event.partialResult, options),
+				limitPreviewContent(extractToolCallContent(event.partialResult, options)),
 			);
 			const update: SessionUpdate = {
 				sessionUpdate: "tool_call_update",
@@ -240,6 +300,7 @@ export function mapAgentSessionEventToAcpSessionUpdates(
 			if (isInternalAgentMessageTool(event.toolName, args)) return [];
 			const resultContent = [
 				...extractDiffToolCallContent(event.result),
+				...(event.isError ? [] : extractWriteCreationDiff(event.toolName, args, event.result)),
 				...extractToolCallContent(event.result, options),
 			];
 			const content = mergeToolUpdateContent(buildToolStartContent(event.toolName, args), resultContent);
@@ -305,13 +366,16 @@ function toolCallStartMeta(
 interface NonExecutionDetails {
 	nonExecution?: unknown;
 	__synthetic?: unknown;
+	__interrupted?: unknown;
 	source?: unknown;
 }
 
 /**
  * `_meta` of a tool call's final update: the tool name, and for a failed call
- * that never ran, why (`nonExecutionKind`): a permission refusal's tag, or
- * `interrupted` when the assistant turn stopped before the call could run.
+ * that never ran or was stopped, why (`nonExecutionKind`): the tag the call's
+ * error carried (a permission refusal, a denied approval, a cancel), or
+ * `interrupted` when the assistant turn stopped before the call could run or
+ * steering skipped or stopped it.
  */
 function toolCallEndMeta(event: Extract<AgentSessionEvent, { type: "tool_execution_end" }>): Record<string, unknown> {
 	const nonExecutionKind = event.isError ? nonExecutionKindOf(event.result) : undefined;
@@ -321,11 +385,12 @@ function toolCallEndMeta(event: Extract<AgentSessionEvent, { type: "tool_executi
 function nonExecutionKindOf(result: unknown): string | undefined {
 	const details = (result as DetailsContainer | undefined)?.details;
 	if (typeof details !== "object" || details === null) return undefined;
-	const { nonExecution, __synthetic, source } = details as NonExecutionDetails;
+	const { nonExecution, __synthetic, __interrupted, source } = details as NonExecutionDetails;
 	if (typeof nonExecution === "string") return nonExecution;
 	if (__synthetic === true && typeof source === "string" && source.startsWith("assistant_stop_")) {
 		return "interrupted";
 	}
+	if (source === "interrupt_skipped" && (__synthetic === true || __interrupted === true)) return "interrupted";
 	return undefined;
 }
 
@@ -580,7 +645,7 @@ function buildToolStartContent(toolName: string, args: unknown): ToolCallContent
 function buildToolStartText(toolName: string, args: unknown): string | undefined {
 	if (isCommandToolName(toolName)) {
 		const command = extractStringProperty<CommandContainer>(args, "command");
-		return command ? limitText(`$ ${command}`) : undefined;
+		return command ? limitText(`$ ${command}`, ACP_PREVIEW_TEXT_LIMIT) : undefined;
 	}
 	if (toolName === "eval") {
 		return buildEvalStartText(args);
@@ -614,7 +679,7 @@ function buildEvalStartText(args: unknown): string | undefined {
 		}
 		lines.push(title ? `[${language}] ${title}` : `[${language}]`, code);
 	}
-	return lines.length > 0 ? limitText(lines.join("\n")) : undefined;
+	return lines.length > 0 ? limitText(lines.join("\n"), ACP_PREVIEW_TEXT_LIMIT) : undefined;
 }
 
 function mergeToolUpdateContent(startContent: ToolCallContent[], resultContent: ToolCallContent[]): ToolCallContent[] {
@@ -738,12 +803,29 @@ function extractToolLocations(args: unknown, cwd?: string, toolName?: string): T
 	return locations;
 }
 
+interface FirstChangedLineContainer {
+	firstChangedLine?: unknown;
+}
+
+/**
+ * Give a file's location the first line an edit changed. agent-shell matches a
+ * location to a diff by path and uses its line to find the hunk in the file.
+ */
+function withFirstChangedLine(location: ToolCallLocation, entry: unknown): ToolCallLocation {
+	const line = extractNumberProperty<FirstChangedLineContainer>(entry, "firstChangedLine");
+	return line !== undefined && Number.isInteger(line) && line > 0 ? { ...location, line } : location;
+}
+
 /** Pull locations from a tool result's details (e.g. EditToolDetails.perFileResults[].path). */
 function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCallLocation[] {
 	if (typeof result !== "object" || result === null) return [];
 	const details = (result as { details?: unknown }).details;
 	if (typeof details !== "object" || details === null) return [];
-	const direct = extractToolLocations(details, cwd);
+	const perFile = (details as { perFileResults?: unknown }).perFileResults;
+	// A multi-file result's top-level `firstChangedLine` is only the first file's.
+	const direct = extractToolLocations(details, cwd).map(location =>
+		Array.isArray(perFile) ? location : withFirstChangedLine(location, details),
+	);
 	const resolvedFile = existingFileLocationPath(
 		extractStringProperty<ResolvedPathContainer>(details, "resolvedPath"),
 		cwd,
@@ -751,7 +833,6 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 	if (resolvedFile && !direct.some(location => location.path === resolvedFile)) {
 		direct.push({ path: resolvedFile });
 	}
-	const perFile = (details as { perFileResults?: unknown }).perFileResults;
 	if (!Array.isArray(perFile)) {
 		return direct;
 	}
@@ -763,9 +844,32 @@ function extractToolLocationsFromResult(result: unknown, cwd?: string): ToolCall
 		const path = toAcpLocationPath(raw, cwd);
 		if (seen.has(path)) continue;
 		seen.add(path);
-		locations.push({ path });
+		locations.push(withFirstChangedLine({ path }, entry));
 	}
 	return locations;
+}
+
+interface ContentArgContainer {
+	content?: unknown;
+}
+
+interface CreatedContainer {
+	created?: unknown;
+}
+
+/**
+ * A `write` that created its file, as a new-file diff of the written content
+ * (as claude-agent-acp reports a Write). An overwrite gets no diff: the tool
+ * does not read the old text, and an all-new diff would misstate the change.
+ */
+function extractWriteCreationDiff(toolName: string, args: unknown, result: unknown): ToolCallContent[] {
+	if (toolName !== "write") return [];
+	const details = (result as DetailsContainer | undefined)?.details;
+	if (typeof details !== "object" || details === null || (details as CreatedContainer).created !== true) return [];
+	const path = extractStringProperty<ResolvedPathContainer>(details, "resolvedPath");
+	const content = typeof args === "object" && args !== null ? (args as ContentArgContainer).content : undefined;
+	if (!path || typeof content !== "string") return [];
+	return [{ type: "diff", path, oldText: null, newText: content }];
 }
 
 /** Emit a `diff` ToolCallContent for each per-file edit result that carries oldText/newText. */
@@ -1174,8 +1278,17 @@ function normalizeText(text: string | undefined): string | undefined {
 	return normalized.length > 0 ? limitText(normalized) : undefined;
 }
 
-function limitText(text: string): string {
-	return text.length > ACP_TEXT_LIMIT ? `${text.slice(0, ACP_TEXT_LIMIT - 1)}…` : text;
+function limitText(text: string, limit = ACP_TEXT_LIMIT): string {
+	return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+/** Cuts the text blocks of a streamed progress update to {@link ACP_PREVIEW_TEXT_LIMIT}. */
+function limitPreviewContent(content: ToolCallContent[]): ToolCallContent[] {
+	return content.map(item =>
+		item.type === "content" && item.content.type === "text"
+			? textToolCallContent(limitText(item.content.text, ACP_PREVIEW_TEXT_LIMIT))
+			: item,
+	);
 }
 
 function safeJsonStringify(value: unknown): string | undefined {

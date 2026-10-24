@@ -461,7 +461,11 @@ export class ExtensionToolWrapper<TParameters extends TSchema = TSchema, TDetail
 			await emitApprovalResolved(approved, approved ? undefined : "denied by user");
 			if (!approved) {
 				cancelPreflight();
-				throw new Error(`Tool call denied by user: ${this.tool.name}`);
+				// The agent loop keeps `nonExecution` as the failed result's
+				// `details.nonExecution`: the call was refused, it never ran.
+				throw Object.assign(new Error(`Tool call denied by user: ${this.tool.name}`), {
+					nonExecution: "user-rejected",
+				});
 			}
 			if (pendingSafetyChecks.length > 0) {
 				if (!context) {

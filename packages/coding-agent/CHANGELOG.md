@@ -4,11 +4,27 @@
 
 ### Added
 
+- ACP sessions push the active model's subscription rate limits on `usage_update` (`_meta["_claude/rateLimit"]`), so clients such as agent-shell show limit warnings without polling
+- ACP approval prompts for critical or pattern-forced bash commands ask AIR clients to default to no and say why (`_meta.jetbrains.air.permission`)
+- ACP edit locations carry the first changed line, and `write` calls that create a file show a new-file diff
 - Anthropic web search and Files API uploads follow `PI_ANTHROPIC_API_VERSION=2026-10-21`; web search omits `temperature` under that version ([#16706](https://github.com/can1357/oh-my-pi/pull/16706) by [@H4vC](https://github.com/H4vC))
 - llama.cpp auto-discovery now also finds local servers on llama-server's new default port 9931 when nothing answers on 8080 ([#16675](https://github.com/can1357/oh-my-pi/pull/16675) by [@bartbroere](https://github.com/bartbroere))
 
+### Changed
+
+- ACP subagent titles include the agent type (`id (agent)`), live and after session load
+- ACP tool output is cut at 64 KiB per block instead of 4,000 characters
+- ACP clients see `find`, `ast_edit`, `lsp` and `github` tool calls under the matching kind (search, edit, fetch)
+
 ### Fixed
 
+- Fixed ACP prompts losing the names of attached files: embedded files, file links and images reach the model as `<file path="…">`, as `@path` mentions do in the TUI
+- Fixed AIR ACP clients that do not list `nativeSubagentSessions` (such as agent-shell) being unable to cancel a single subagent
+- Fixed failed ACP subagents carrying no error message
+- Fixed ACP subagents still running when their session closes staying shown as running
+- Fixed ACP tool calls skipped or stopped by steering, superseded permission prompts, denied approvals, and calls stopped by cancel showing as plain failures instead of interrupted or rejected
+- Fixed ACP approval prompts for critical or pattern-forced bash commands offering "Always allow/reject" choices that were never remembered
+- Fixed ACP `session/list` reporting a session waiting on a permission prompt as `running` instead of `requires_action`
 - Fixed `omp gc --compress` exiting with "the event loop drained while it was still pending" on Bun 1.3.14 when a session artifact is pretty-printed JSON larger than 1 MiB, and session header probes (gc, session move and transfer) reading whole artifacts on Windows ([#15745](https://github.com/can1357/oh-my-pi/issues/15745), [#16754](https://github.com/can1357/oh-my-pi/pull/16754) by [@wolfiesch](https://github.com/wolfiesch))
 - `/resume` into another session now cancels the previous session's background jobs, as `/new` does, instead of delivering their results into the resumed session and starting a turn there ([#16760](https://github.com/can1357/oh-my-pi/pull/16760) by [@will-bogusz](https://github.com/will-bogusz))
 - Fixed the models config migration writing `models.yml` readable by other users on the machine, and dropping every custom provider when the write was interrupted; the migrated file is now published atomically with owner-only permissions ([#16654](https://github.com/can1357/oh-my-pi/pull/16654) by [@adi-IL](https://github.com/adi-IL))

@@ -260,6 +260,21 @@ describe("ACP event mapper", () => {
 		}
 	});
 
+	it("maps search, structural-edit, LSP and GitHub tools to the kinds clients group them by", () => {
+		expect(mapToolKind("find", { query: "parser entry" })).toBe("search");
+		expect(mapToolKind("ast_edit", { paths: ["src/a.ts"] })).toBe("edit");
+		// LSP navigation reads the index; a rename or applied code action edits files.
+		expect(mapToolKind("lsp", { action: "references", file: "a.ts" })).toBe("search");
+		expect(mapToolKind("lsp", { action: "rename", file: "a.ts", new_name: "b" })).toBe("edit");
+		expect(mapToolKind("lsp", { action: "rename", file: "a.ts", new_name: "b", apply: false })).toBe("search");
+		expect(mapToolKind("lsp", { action: "code_actions", file: "a.ts" })).toBe("search");
+		expect(mapToolKind("lsp", { action: "code_actions", file: "a.ts", query: "fix", apply: true })).toBe("edit");
+		expect(mapToolKind("lsp", { action: "reload" })).toBe("other");
+		// GitHub reads fetch remote resources; a push or PR creation is not a fetch.
+		expect(mapToolKind("github", { op: "search_prs", query: "fix" })).toBe("fetch");
+		expect(mapToolKind("github", { op: "pr_push" })).toBe("other");
+	});
+
 	it("keeps background job-wait results visible over ACP", () => {
 		const events = [
 			{
@@ -387,6 +402,33 @@ describe("ACP event mapper", () => {
 		expect(update.title.endsWith("…")).toBe(true);
 		expect(update.content).toEqual([{ type: "content", content: { type: "text", text: update.title } }]);
 	});
+	it("keeps streamed tool output at the preview cap and the final result at the full cap", () => {
+		const output = "y".repeat(10_000);
+		const textOf = (event: AgentSessionEvent): string | undefined => {
+			const [notification] = mapAgentSessionEventToAcpSessionUpdates(event, "session-1");
+			const content = (notification!.update as { content?: Array<{ content?: { text?: string } }> }).content;
+			return content?.[0]?.content?.text;
+		};
+
+		const streamed = textOf({
+			type: "tool_execution_update",
+			toolCallId: "tc-long-output",
+			toolName: "read",
+			args: {},
+			partialResult: { content: [{ type: "text", text: output }] },
+		} as AgentSessionEvent);
+		const final = textOf({
+			type: "tool_execution_end",
+			toolCallId: "tc-long-output",
+			toolName: "read",
+			isError: false,
+			result: { content: [{ type: "text", text: output }] },
+		} as AgentSessionEvent);
+
+		expect(streamed).toHaveLength(4_000);
+		expect(streamed?.endsWith("…")).toBe(true);
+		expect(final).toBe(output);
+	});
 	it("emits a diff ToolCallContent for each per-file edit result", () => {
 		const updates = mapAgentSessionEventToAcpSessionUpdates(
 			{
@@ -399,8 +441,8 @@ describe("ACP event mapper", () => {
 					details: {
 						diff: "--- a/foo\n+++ b/foo\n",
 						perFileResults: [
-							{ path: "foo.ts", diff: "...", oldText: "before\n", newText: "after\n" },
-							{ path: "bar.ts", diff: "...", oldText: undefined, newText: "created\n" },
+							{ path: "foo.ts", diff: "...", firstChangedLine: 12, oldText: "before\n", newText: "after\n" },
+							{ path: "bar.ts", diff: "...", firstChangedLine: 1, oldText: undefined, newText: "created\n" },
 							{ path: "skipped.ts", diff: "", isError: true, errorText: "boom" },
 						],
 					},
@@ -414,7 +456,7 @@ describe("ACP event mapper", () => {
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
-			locations?: { path: string }[];
+			locations?: { path: string; line?: number }[];
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		const diffBlocks = update.content?.filter(block => block.type === "diff") ?? [];
@@ -422,7 +464,13 @@ describe("ACP event mapper", () => {
 			{ type: "diff", path: "foo.ts", oldText: "before\n", newText: "after\n" },
 			{ type: "diff", path: "bar.ts", oldText: null, newText: "created\n" },
 		]);
-		expect(update.locations).toEqual([{ path: "foo.ts" }, { path: "bar.ts" }, { path: "skipped.ts" }]);
+		// Each file's first changed line rides its location: agent-shell matches a
+		// location to a diff by path and uses the line to find the hunk.
+		expect(update.locations).toEqual([
+			{ path: "foo.ts", line: 12 },
+			{ path: "bar.ts", line: 1 },
+			{ path: "skipped.ts" },
+		]);
 	});
 
 	it("emits a diff ToolCallContent for single-file edit details", () => {
@@ -437,6 +485,7 @@ describe("ACP event mapper", () => {
 					details: {
 						path: "single.ts",
 						diff: "--- a/single.ts\n+++ b/single.ts\n",
+						firstChangedLine: 7,
 						oldText: "before\n",
 						newText: "after\n",
 					},
@@ -450,13 +499,41 @@ describe("ACP event mapper", () => {
 		const update = updates[0]!.update as {
 			sessionUpdate: string;
 			content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
-			locations?: { path: string }[];
+			locations?: { path: string; line?: number }[];
 		};
 		expect(update.sessionUpdate).toBe("tool_call_update");
 		expect(update.content?.filter(block => block.type === "diff")).toEqual([
 			{ type: "diff", path: "single.ts", oldText: "before\n", newText: "after\n" },
 		]);
-		expect(update.locations).toEqual([{ path: "single.ts" }]);
+		expect(update.locations).toEqual([{ path: "single.ts", line: 7 }]);
+	});
+
+	it("shows a write that created its file as a new-file diff, and no diff for an overwrite", () => {
+		const cwd = path.resolve("/repo");
+		const target = path.join(cwd, "src/new.ts");
+		const writeEnd = (details: Record<string, unknown>) =>
+			mapAgentSessionEventToAcpSessionUpdates(
+				{
+					type: "tool_execution_end",
+					toolCallId: "tc-write",
+					toolName: "write",
+					args: { path: "src/new.ts", content: "export const x = 1;\n" },
+					isError: false,
+					result: { content: [{ type: "text", text: "Successfully wrote 20 bytes to src/new.ts" }], details },
+				} as AgentSessionEvent,
+				"session-1",
+				{ cwd },
+			)[0]!.update as {
+				content?: Array<{ type: string; path?: string; oldText?: string | null; newText?: string }>;
+			};
+
+		const created = writeEnd({ resolvedPath: target, created: true });
+		expect(created.content?.filter(block => block.type === "diff")).toEqual([
+			{ type: "diff", path: target, oldText: null, newText: "export const x = 1;\n" },
+		]);
+		// The old text of an overwritten file is unknown: no all-new diff for it.
+		const overwritten = writeEnd({ resolvedPath: target });
+		expect(overwritten.content?.filter(block => block.type === "diff")).toEqual([]);
 	});
 
 	it("resolves live image blob refs for ACP content without expanding rawOutput", () => {
@@ -1361,6 +1438,13 @@ describe("ACP tool-call _meta", () => {
 		};
 		expect(kindOf(end("bash", { nonExecution: "user-rejected" }))).toBe("user-rejected");
 		expect(kindOf(end("bash", { __synthetic: true, source: "assistant_stop_aborted", executed: false }))).toBe(
+			"interrupted",
+		);
+		// Steering skipped the call before it ran, or stopped it once started.
+		expect(kindOf(end("bash", { __synthetic: true, source: "interrupt_skipped", executed: false }))).toBe(
+			"interrupted",
+		);
+		expect(kindOf(end("bash", { __interrupted: true, source: "interrupt_skipped", execution: "started" }))).toBe(
 			"interrupted",
 		);
 		expect(kindOf(end("bash", {}))).toBeUndefined();
