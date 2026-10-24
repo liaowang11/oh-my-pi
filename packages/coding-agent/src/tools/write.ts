@@ -1085,6 +1085,8 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			const batchRequest = getLspBatchRequest(context?.toolCall);
 
 			const existing = await fs.stat(absolutePath).catch(() => undefined);
+			// Lets ACP show a created file as a new-file diff; an overwrite's old text is not read.
+			const created = existing ? undefined : true;
 			if (target && existing?.isDirectory()) {
 				throw new ToolError(`${target.url.protocol}// URL must resolve to a file: ${path}`);
 			}
@@ -1144,7 +1146,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				}
 				return {
 					content: [{ type: "text", text: resultText }],
-					details: { resolvedPath: absolutePath, madeExecutable: madeExecutable || undefined },
+					details: { resolvedPath: absolutePath, created, madeExecutable: madeExecutable || undefined },
 				};
 			}
 
@@ -1177,7 +1179,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 			if (!diagnostics.diagnostics) {
 				return {
 					content: [{ type: "text", text: resultText }],
-					details: { resolvedPath: absolutePath, madeExecutable: madeExecutable || undefined },
+					details: { resolvedPath: absolutePath, created, madeExecutable: madeExecutable || undefined },
 				};
 			}
 
@@ -1185,6 +1187,7 @@ export class WriteTool implements AgentTool<typeof writeSchema, WriteToolDetails
 				content: [{ type: "text", text: resultText }],
 				details: {
 					resolvedPath: absolutePath,
+					created,
 					diagnostics: diagnostics.diagnostics,
 					madeExecutable: madeExecutable || undefined,
 					meta: outputMeta()

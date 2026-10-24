@@ -1325,6 +1325,8 @@ class SubagentLifecyclePayload:
     parent_tool_call_id: str | None = None
     detached: bool | None = None
     """The subagent runs as a detached background job."""
+    error: str | None = None
+    """Why a `failed` run failed, when the run reported a reason."""
 
 
 @dataclass(slots=True, frozen=True, kw_only=True)
@@ -2783,6 +2785,7 @@ def parse_subagent_lifecycle_payload(value: object, path: str = "SubagentLifecyc
         session_file=optional(payload, "sessionFile", decode_str, path),
         parent_tool_call_id=optional(payload, "parentToolCallId", decode_str, path),
         detached=optional(payload, "detached", decode_bool, path),
+        error=optional(payload, "error", decode_str, path),
     )
 
 

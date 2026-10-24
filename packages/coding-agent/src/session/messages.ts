@@ -957,6 +957,15 @@ export function replaceLlmImagesWithText(messages: Message[], placeholder: strin
 }
 
 /**
+ * The model-facing text of one attached file: `<file path="…">…</file>`.
+ * Shared by `@path` mentions and ACP-attached files so the model sees one format.
+ */
+export function formatFileMention(file: Pick<FileMentionMessage["files"][number], "path" | "content">): string {
+	const inner = file.content ? `\n${file.content}\n` : "\n";
+	return `<file path="${file.path}">${inner}</file>`;
+}
+
+/**
  * Convert a BashExecutionMessage to user message text for LLM context.
  */
 export function bashExecutionToText(msg: BashExecutionMessage): string {
@@ -1151,24 +1160,20 @@ function convertOne(m: AgentMessage, interruptedNext: boolean): Message[] {
 			// through `user`, the only Responses content slot that legitimately accepts
 			// `input_image` (Codex chatgpt.com /codex/responses rejects everything else
 			// with `Invalid value: 'input_image'`, #3443).
-			const wrap = (file: FileMentionMessage["files"][number]): string => {
-				const inner = file.content ? `\n${file.content}\n` : "\n";
-				return `<file path="${file.path}">${inner}</file>`;
-			};
 			const textFiles = m.files.filter(file => !file.image);
 			const imageFiles = m.files.filter(file => file.image);
 			const out: Message[] = [];
 			if (textFiles.length > 0) {
 				out.push({
 					role: "developer",
-					content: [{ type: "text" as const, text: textFiles.map(wrap).join("\n") }],
+					content: [{ type: "text" as const, text: textFiles.map(formatFileMention).join("\n") }],
 					attribution: "user",
 					timestamp: m.timestamp,
 				});
 			}
 			if (imageFiles.length > 0) {
 				const content: (TextContent | ImageContent)[] = [
-					{ type: "text" as const, text: imageFiles.map(wrap).join("\n") },
+					{ type: "text" as const, text: imageFiles.map(formatFileMention).join("\n") },
 				];
 				for (const file of imageFiles) {
 					if (file.image) content.push(file.image);
