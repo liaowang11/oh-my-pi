@@ -27,6 +27,7 @@ import type {
 	ClientCapabilities,
 	ListSessionsResponse,
 	PromptRequest,
+	RequestPermissionResponse,
 	SessionInfo,
 	SessionNotification,
 } from "@oh-my-pi/pi-utils/acp";
@@ -66,6 +67,7 @@ describe("ACP AIR sessionIndex", () => {
 	let modelRegistry: ModelRegistry;
 	let sessions: AgentSession[];
 	let updates: SessionNotification[];
+	let permissionAnswers: Array<PromiseWithResolvers<RequestPermissionResponse>>;
 
 	beforeEach(async () => {
 		root = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "omp-acp-index-")));
@@ -79,6 +81,7 @@ describe("ACP AIR sessionIndex", () => {
 		modelRegistry = new ModelRegistry(authStorage);
 		sessions = [];
 		updates = [];
+		permissionAnswers = [];
 	});
 
 	afterEach(async () => {
@@ -105,6 +108,12 @@ describe("ACP AIR sessionIndex", () => {
 			},
 			signal: new AbortController().signal,
 			closed: Promise.withResolvers<void>().promise,
+			// Each permission request stays open until the test answers it.
+			requestPermissionWithCancel: () => {
+				const answer = Promise.withResolvers<RequestPermissionResponse>();
+				permissionAnswers.push(answer);
+				return { promise: answer.promise, cancel: () => {} };
+			},
 		} as unknown as AgentSideConnection;
 		const agent = new AcpAgent(connection, async sessionCwd => {
 			const session = new AgentSession({
@@ -348,6 +357,43 @@ describe("ACP AIR sessionIndex", () => {
 		// Unarchive does not load it; a load of the archived session keeps it archived until then.
 		await agent.extMethod("_session/unarchive", { sessionId: stored.id });
 		expect((await list(agent)).sessions.map(row => row.sessionId)).toEqual([stored.id]);
+	});
+
+	it("reports a loaded session's row as requires_action while its permission request is open", async () => {
+		const stored = await storedSession("Asking");
+		const agent = await createAgent();
+		await agent.loadSession({ sessionId: stored.id, cwd, mcpServers: [] });
+		await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 20);
+		const session = sessions.find(s => s.sessionId === stored.id)!;
+		// A turn that asks once, then runs until it is aborted.
+		const turnAborted = Promise.withResolvers<void>();
+		session.prompt = async () => {
+			await session.clientBridge!.requestPermission!(
+				{ toolCallId: "call-1", toolName: "bash", title: "rm -rf build", status: "pending" },
+				[{ optionId: "allow_once", name: "Allow once", kind: "allow_once" }],
+			);
+			await turnAborted.promise;
+			return true;
+		};
+		const realAbort = session.abort.bind(session);
+		session.abort = async options => {
+			turnAborted.resolve();
+			await realAbort(options);
+		};
+		const running = agent.prompt({
+			sessionId: stored.id,
+			prompt: [{ type: "text", text: "work" }],
+		} as PromptRequest);
+		await Bun.sleep(10);
+
+		// The client did not opt into `state_update`; the row still says who waits on the user.
+		expect(air((await list(agent)).sessions[0]).state).toBe("requires_action");
+		permissionAnswers[0].resolve({ outcome: { outcome: "selected", optionId: "allow_once" } });
+		await Bun.sleep(10);
+		expect(air((await list(agent)).sessions[0]).state).toBe("running");
+
+		await agent.cancel({ sessionId: stored.id });
+		await running;
 	});
 
 	it("unarchiving a loaded session keeps it loaded and reports archived false", async () => {
