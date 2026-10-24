@@ -45,6 +45,49 @@ describe("ACP client bridge permission requests", () => {
 		});
 	});
 
+	it("sends an AIR client the prompt's reason and defaultToNo as claude-agent-acp does", async () => {
+		const requests: RequestPermissionRequest[] = [];
+		const connection = {
+			requestPermissionWithCancel(params: RequestPermissionRequest) {
+				requests.push(params);
+				return { promise: Promise.resolve(ALLOW_SELECTED), cancel: () => {} };
+			},
+		} as unknown as AgentSideConnection;
+		const presentation = { defaultToNo: true, reason: "Critical pattern detected" };
+		const airCapabilities = { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } };
+
+		await createAcpClientBridge(connection, "session-1", airCapabilities).requestPermission!(
+			{ ...TOOL_CALL, presentation },
+			OPTIONS,
+		);
+		await createAcpClientBridge(connection, "session-1", airCapabilities).requestPermission!(
+			{ ...TOOL_CALL },
+			OPTIONS,
+		);
+		await createAcpClientBridge(connection, "session-1", {}).requestPermission!(
+			{ ...TOOL_CALL, presentation },
+			OPTIONS,
+		);
+
+		expect(requests[0]._meta).toEqual({
+			jetbrains: {
+				air: {
+					version: 1,
+					permission: {
+						version: 1,
+						title: "echo hi",
+						description: "Reason: Critical pattern detected",
+						defaultToNo: true,
+					},
+				},
+			},
+		});
+		expect(requests[0].toolCall).not.toHaveProperty("presentation");
+		// Nothing to present, or a client that does not speak AIR: no `_meta`.
+		expect(requests[1]._meta).toBeUndefined();
+		expect(requests[2]._meta).toBeUndefined();
+	});
+
 	it("cancels the pending wire permission request when a steer supersedes the dialog", async () => {
 		let request: RequestPermissionRequest | undefined;
 		let cancelled = 0;
