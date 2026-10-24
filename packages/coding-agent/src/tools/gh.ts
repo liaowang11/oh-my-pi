@@ -66,7 +66,8 @@ export {
 	type ViewLookupResult,
 } from "./gh-view";
 
-const GITHUB_READONLY_OPS: ReadonlySet<string> = new Set([
+/** GitHub operations that only read; the rest change local or remote state. */
+export const GITHUB_READONLY_OPS: ReadonlySet<string> = new Set([
 	"repo_view",
 	"file_read",
 	"search_issues",

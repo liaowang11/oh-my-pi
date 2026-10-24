@@ -38,6 +38,8 @@ export interface SubagentLifecyclePayload {
 	 * unset — surfaces like the subagent HUD only list detached spawns.
 	 */
 	detached?: boolean;
+	/** Why a `failed` run failed, when the run reported a reason. */
+	error?: string;
 }
 
 /** Minimal event subscription surface supplied by the host. */

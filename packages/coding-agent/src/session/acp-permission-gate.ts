@@ -34,6 +34,11 @@ export const PERMISSION_OPTIONS: ClientBridgePermissionOption[] = [
 	{ optionId: "reject_always", name: "Always reject", kind: "reject_always" },
 ];
 
+/** The options of a prompt whose decision is never remembered, so "always" would act as once. */
+export const ONCE_PERMISSION_OPTIONS: ClientBridgePermissionOption[] = PERMISSION_OPTIONS.filter(
+	option => option.kind === "allow_once" || option.kind === "reject_once",
+);
+
 /** Permission options indexed by their wire identifiers; unknown IDs miss and fail closed. */
 export const PERMISSION_OPTIONS_BY_ID = new Map(PERMISSION_OPTIONS.map(option => [option.optionId, option]));
 
