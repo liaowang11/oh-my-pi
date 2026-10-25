@@ -75,3 +75,56 @@ function rateLimitInfo(limit: UsageLimit): RateLimitInfo | undefined {
 		...(resetsAt !== undefined ? { resetsAt: Math.round(resetsAt / 1000) } : {}),
 	};
 }
+
+/**
+ * Words the Claude SDK lists in `USAGE_LIMIT_ERROR_PREFIXES`, the stable
+ * start of the message a turn a usage limit stopped fails with. A client that
+ * reads claude-agent-acp's usage-limit failures by them reads omp's too.
+ */
+const USAGE_LIMIT_PREFIX = "You've hit your";
+
+/**
+ * The message a prompt turn a usage limit stopped fails with: the provider,
+ * then when the limit resets, written as the Claude CLI writes it (`resets
+ * 8pm (Asia/Shanghai)`, `resets Oct 27, 8pm (Asia/Shanghai)`), so a client
+ * parsing the CLI's reset parses omp's. An unknown or past reset is left out.
+ */
+export function usageLimitFailureText(
+	provider: string,
+	resetAtMs: number | undefined,
+	nowMs = Date.now(),
+	timeZone = Intl.DateTimeFormat().resolvedOptions().timeZone,
+): string {
+	const text = `${USAGE_LIMIT_PREFIX} ${provider} usage limit`;
+	if (resetAtMs === undefined || resetAtMs <= nowMs) return text;
+	return `${text} · resets ${formatResetTime(resetAtMs, nowMs, timeZone)} (${timeZone})`;
+}
+
+/**
+ * en-US on a 12-hour clock, minutes dropped when zero and the meridiem
+ * lowercased: `8pm` on the day of `nowMs`, `Oct 27, 8pm` on another day,
+ * `Jan 2, 2027, 8pm` in another year, all in `timeZone`.
+ */
+function formatResetTime(resetAtMs: number, nowMs: number, timeZone: string): string {
+	const format = new Intl.DateTimeFormat("en-US", {
+		timeZone,
+		year: "numeric",
+		month: "short",
+		day: "numeric",
+		hour: "numeric",
+		minute: "2-digit",
+		hour12: true,
+	});
+	const parts = (ms: number) => {
+		const fields: Partial<Record<Intl.DateTimeFormatPartTypes, string>> = {};
+		for (const part of format.formatToParts(ms)) fields[part.type] = part.value;
+		return fields;
+	};
+	const reset = parts(resetAtMs);
+	const now = parts(nowMs);
+	const minute = reset.minute === "00" ? "" : `:${reset.minute}`;
+	const time = `${reset.hour}${minute}${reset.dayPeriod?.toLowerCase()}`;
+	if (reset.year !== now.year) return `${reset.month} ${reset.day}, ${reset.year}, ${time}`;
+	if (reset.month !== now.month || reset.day !== now.day) return `${reset.month} ${reset.day}, ${time}`;
+	return time;
+}
