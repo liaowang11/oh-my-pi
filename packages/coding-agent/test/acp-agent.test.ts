@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { AgentBusyError } from "@oh-my-pi/pi-agent-core";
 import { Database } from "bun:sqlite";
 import { AuthStorage, SqliteAuthCredentialStore } from "@oh-my-pi/pi-ai";
-import type { Model } from "@oh-my-pi/pi-ai";
+import type { AssistantMessage, Model } from "@oh-my-pi/pi-ai";
 import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
@@ -401,6 +401,19 @@ class FakeAgentSession {
 	async waitForIdle(): Promise<void> {
 		this.waitForIdleCalls++;
 		await this.waitForIdleBlocker?.();
+	}
+
+	getLastAssistantMessage(): AssistantMessage | undefined {
+		for (const entry of this.sessionManager.getBranch().toReversed()) {
+			if (entry.type === "message" && entry.message.role === "assistant") return entry.message as AssistantMessage;
+		}
+		return undefined;
+	}
+
+	/** What `usageLimitFailure` answers for a failed turn; undefined is not a usage limit. */
+	usageLimit: { resetAtMs: number | undefined } | undefined;
+	async usageLimitFailure(): Promise<{ resetAtMs: number | undefined } | undefined> {
+		return this.usageLimit;
 	}
 
 	async drainAsyncJobDeliveriesForAcp(options?: { timeoutMs?: number }): Promise<boolean> {
@@ -3688,11 +3701,11 @@ describe("ACP agent", () => {
 			return true;
 		};
 
-		const response = await harness.agent.prompt({
-			sessionId: created.sessionId,
-			prompt: [{ type: "text", text: "Say hello" }],
-		});
-		expectAcpStructure(zPromptResponse, response);
+		// The chunk carries the text; the rejected request is what tells a
+		// client the turn failed rather than finished.
+		await expect(
+			harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "Say hello" }] }),
+		).rejects.toMatchObject({ code: -32603, message: `Internal error: ${errorText}` });
 
 		const messageChunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
@@ -3738,11 +3751,11 @@ describe("ACP agent", () => {
 			return true;
 		};
 
-		const response = await harness.agent.prompt({
-			sessionId: created.sessionId,
-			prompt: [{ type: "text", text: "Say hello" }],
-		});
-		expectAcpStructure(zPromptResponse, response);
+		// The chunk carries the text; the rejected request is what tells a
+		// client the turn failed rather than finished.
+		await expect(
+			harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "Say hello" }] }),
+		).rejects.toMatchObject({ code: -32603, message: `Internal error: ${errorText}` });
 
 		const messageChunks = harness.updates.filter(
 			update => update.sessionId === created.sessionId && update.update.sessionUpdate === "agent_message_chunk",
@@ -3750,6 +3763,158 @@ describe("ACP agent", () => {
 		expect(messageChunks).toHaveLength(1);
 		expect(messageChunks[0]?.update).toEqual(expect.objectContaining({ content: { type: "text", text: errorText } }));
 		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("ends a turn that a retry recovered as end_turn, not as the failure it retried", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+
+		const failedMessage = { ...makeAssistantMessage(""), stopReason: "error" as const, errorMessage: "overloaded" };
+		const recovered = makeAssistantMessage("Recovered answer.");
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.isStreaming = true;
+			session.sessionManager.appendMessage(failedMessage);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [failedMessage], isTerminal: false } as AgentSessionEvent);
+			}
+			session.sessionManager.appendMessage(recovered);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [recovered] } as AgentSessionEvent);
+			}
+			session.isStreaming = false;
+			return true;
+		};
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Say hello" }],
+		});
+		expect(response.stopReason).toBe("end_turn");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("keeps a refusal-shaped provider error a refusal instead of failing the prompt", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId);
+		if (!session) throw new Error("session not registered");
+
+		const refused = {
+			...makeAssistantMessage(""),
+			stopReason: "error" as const,
+			errorMessage: "Output blocked by content filtering policy",
+		};
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.sessionManager.appendMessage(refused);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [refused] } as AgentSessionEvent);
+			}
+			return true;
+		};
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "Say hello" }],
+		});
+		expect(response.stopReason).toBe("refusal");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("fails a usage-limited turn in the Claude SDK's usage-limit words, after pushing the rejected limit", async () => {
+		const authStorage = new AuthStorage(new SqliteAuthCredentialStore(new Database(":memory:")));
+		const harness = await createHarness({
+			authStorage,
+			clientCapabilities: { _meta: { stateUpdate: true } } as ClientCapabilities,
+		});
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		session.model = TEST_MODELS[0];
+		session.contextUsage = { tokens: 1_000, contextWindow: 200_000, percent: 0.5 };
+		const resetsAtMs = Date.now() + 3 * 3_600_000;
+		const usageFetch = Promise.withResolvers<void>();
+		Object.assign(session, {
+			fetchUsageReports: async () => {
+				await usageFetch.promise;
+				return [
+					{
+						provider: "anthropic",
+						fetchedAt: 0,
+						limits: [
+							{
+								id: "anthropic:5h",
+								label: "Claude 5 Hour",
+								scope: { provider: "anthropic", windowId: "5h" },
+								window: { id: "5h", label: "5 Hour", resetsAt: resetsAtMs },
+								amount: { unit: "percent" as const, usedFraction: 1 },
+								status: "exhausted" as const,
+							},
+						],
+					},
+				];
+			},
+		});
+		session.usageLimit = { resetAtMs: resetsAtMs };
+		const limited = {
+			...makeAssistantMessage(""),
+			stopReason: "error" as const,
+			errorMessage: '429 {"type":"error","error":{"type":"rate_limit_error","message":"usage limit reached"}}',
+		};
+		session.prompt = async (text: string): Promise<boolean> => {
+			session.promptCalls.push(text);
+			session.sessionManager.appendMessage(limited);
+			for (const listener of session.listeners()) {
+				listener({ type: "agent_end", messages: [limited] } as AgentSessionEvent);
+			}
+			return true;
+		};
+
+		let settled = false;
+		const pending = harness.agent
+			.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "Say hello" }] })
+			.then(
+				() => undefined,
+				(error: unknown) => error,
+			)
+			.finally(() => {
+				settled = true;
+			});
+		// The limit reaches the client before the failure does, so a client
+		// classifying the failure reads a fresh record: the prompt waits on it.
+		await Bun.sleep(50);
+		expect(settled).toBe(false);
+		usageFetch.resolve();
+		const rejection = await pending;
+		const rateLimits = harness.updates
+			.filter(update => update.sessionId === created.sessionId && update.update.sessionUpdate === "usage_update")
+			.map(update => update.update._meta?.["_claude/rateLimit"])
+			.filter(info => info !== undefined);
+		expect(rateLimits).toContainEqual({
+			status: "rejected",
+			rateLimitType: "five_hour",
+			utilization: 1,
+			resetsAt: Math.round(resetsAtMs / 1000),
+		});
+		expect(rejection).toMatchObject({ code: -32603 });
+		const message = (rejection as { message: string }).message;
+		expect(message).toMatch(/^Internal error: You've hit your anthropic usage limit · resets \S.* \([^() ]+\)$/);
+		const lastState = harness.updates
+			.filter(update => update.sessionId === created.sessionId && update.update.sessionUpdate === "state_update")
+			.at(-1)?.update;
+		expect(lastState).toMatchObject({ state: "idle", stopReason: "error", error: { code: -32603, message } });
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

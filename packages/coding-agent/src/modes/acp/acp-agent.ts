@@ -138,7 +138,7 @@ import { VibeSessionRegistry } from "../../vibe/runtime";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
 import type { BashExecutionMessage, PythonExecutionMessage } from "@oh-my-pi/pi-tui/chat/messages";
 import { createAcpClientBridge } from "./acp-client-bridge";
-import { RATE_LIMIT_META_KEY, rateLimitInfos } from "./acp-rate-limit";
+import { RATE_LIMIT_META_KEY, rateLimitInfos, usageLimitFailureText } from "./acp-rate-limit";
 import {
 	extractAssistantMessageText,
 	mapAgentSessionEventToAcpSessionUpdates,
@@ -223,6 +223,10 @@ const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
 const ACP_VIBE_MODE_ID = "vibe";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
+/** A provider error that is the model declining, which ends the turn as `refusal`. */
+const REFUSAL_ERROR_PATTERN = /content[_ ]?filter|refus(al|ed)/i;
+/** How long a failed usage-limited prompt waits for its rate-limit push before failing. */
+const RATE_LIMIT_PUSH_WAIT_MS = 2_000;
 // Descriptions of an ask form's free-text "Other" field, as claude-agent-acp words them.
 const OTHER_MULTI_DESCRIPTION = "Type your own answer to add to your selection above (optional).";
 const OTHER_SINGLE_DESCRIPTION = "Type your own answer, or add a note to the option you chose above (optional).";
@@ -562,6 +566,8 @@ type ManagedSessionRecord = {
 	sentUsage: string | undefined;
 	// Each rate-limit window (by `rateLimitType`) last sent, so an unchanged one is not repeated.
 	sentRateLimits: Map<string, string>;
+	// The rate-limit push the last turn end started; a failed turn waits on it.
+	rateLimitPush: Promise<void> | undefined;
 	// Config warnings already sent as notices, so each reaches the client once.
 	sentConfigWarnings: Set<string>;
 	// Reports this session's context compactions (auto and manual /compact).
@@ -2593,6 +2599,7 @@ export class AcpAgent implements Agent {
 			sentGoal: undefined,
 			sentUsage: undefined,
 			sentRateLimits: new Map(),
+			rateLimitPush: undefined,
 			sentConfigWarnings: new Set(),
 			compaction: new AcpCompactionLifecycle(
 				update => this.#connection.sessionUpdate({ sessionId: session.sessionId, update }),
@@ -2736,6 +2743,17 @@ export class AcpAgent implements Agent {
 			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
+			const failure = promptTurn.cancelRequested
+				? undefined
+				: await this.#turnFailure(record, event).catch((error: unknown) => {
+						// Settling matters more than classifying: a throw here would leave the prompt pending.
+						logger.warn("Failed to classify ACP turn failure", { sessionId: record.session.sessionId, error });
+						return undefined;
+					});
+			if (failure) {
+				this.#finishPrompt(record, undefined, failure);
+				return;
+			}
 			const response: PromptResponse = {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				...this.#turnUsage(record, promptTurn),
@@ -3328,7 +3346,7 @@ export class AcpAgent implements Agent {
 				return "max_tokens";
 			case "error": {
 				const errorMessage = lastAssistant?.errorMessage ?? "";
-				if (/content[_ ]?filter|refus(al|ed)/i.test(errorMessage)) {
+				if (REFUSAL_ERROR_PATTERN.test(errorMessage)) {
 					return "refusal";
 				}
 				return "end_turn";
@@ -3336,6 +3354,39 @@ export class AcpAgent implements Agent {
 			default:
 				return "end_turn";
 		}
+	}
+
+	/**
+	 * The error a prompt turn fails with when its provider failed and nothing
+	 * recovered it, or undefined. Read once the session is idle, from the
+	 * session's last assistant message rather than the event's: a failed
+	 * attempt that a retry or fallback then answered emits its own `agent_end`
+	 * first. As claude-agent-acp does for a client without AIR session
+	 * failures, the prompt is rejected with `-32603 Internal error: <text>`,
+	 * the only signal an ACP client has that the turn failed rather than
+	 * finished; the error text has already gone out as a message chunk. A
+	 * usage limit is said in the Claude SDK's usage-limit words, after the
+	 * rejected limit window is pushed, so a client reading claude-agent-acp's
+	 * usage-limit failures reads omp's. A refusal and a silent abort keep
+	 * their own outcome.
+	 */
+	async #turnFailure(
+		record: ManagedSessionRecord,
+		event: Extract<AgentSessionEvent, { type: "agent_end" }>,
+	): Promise<RequestError | undefined> {
+		// A run with no assistant message of its own did not fail on a provider;
+		// the session's last one would be an earlier turn's.
+		if (!event.messages.some(message => message.role === "assistant")) return undefined;
+		const last = record.session.getLastAssistantMessage();
+		if (last?.stopReason !== "error" || isSilentAbort(last)) return undefined;
+		const errorMessage = last.errorMessage || "Unknown error";
+		if (REFUSAL_ERROR_PATTERN.test(errorMessage)) return undefined;
+		const limit = await record.session.usageLimitFailure(last);
+		if (!limit) return RequestError.internalError(undefined, errorMessage);
+		// The turn end's push, not a second one: a second would skip the window
+		// the first already claimed and return before its notification is sent.
+		await Promise.race([record.rateLimitPush, Bun.sleep(RATE_LIMIT_PUSH_WAIT_MS)]);
+		return RequestError.internalError(undefined, usageLimitFailureText(last.provider, limit.resetAtMs));
 	}
 
 	async #emitCommandOutput(record: ManagedSessionRecord, text: string): Promise<void> {
@@ -4351,7 +4402,8 @@ export class AcpAgent implements Agent {
 		await this.#pushUsageUpdate(record);
 		await this.#pushSessionInfoUpdate(record);
 		// Not awaited: a usage cache miss is a network call, which must not delay the prompt response.
-		void this.#pushRateLimitUpdates(record);
+		// A usage-limited turn waits on it, bounded, before failing (`#turnFailure`).
+		record.rateLimitPush = this.#pushRateLimitUpdates(record);
 	}
 
 	/**
