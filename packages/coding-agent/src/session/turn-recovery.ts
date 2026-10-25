@@ -858,6 +858,19 @@ export class TurnRecovery {
 		return (await recorded).switchedCredential;
 	}
 
+	/**
+	 * Whether `message` failed on a usage limit, and when the limit resets.
+	 * The reset is the usage report's, and only when every exhausted window in
+	 * it carries one: the error text's retry hint and the 30-minute fallback
+	 * are guesses about when to retry, not when the limit lifts.
+	 */
+	async usageLimitFailure(message: AssistantMessage): Promise<{ resetAtMs: number | undefined } | undefined> {
+		if (message.stopReason !== "error") return undefined;
+		if (!AIError.is(this.#classifyRetryMessage(message), AIError.Flag.UsageLimit)) return undefined;
+		const recorded = await this.#usageLimitOutcomes.get(message)?.catch(() => undefined);
+		return { resetAtMs: recorded?.reportResetAtMs };
+	}
+
 	/** Prompts after transient overlap with a prior agent run. `onClaimed` fires synchronously
 	 *  right after a successful `agent.prompt` claim (before the run is awaited), letting the
 	 *  caller mark the exact moment its own run went live. */

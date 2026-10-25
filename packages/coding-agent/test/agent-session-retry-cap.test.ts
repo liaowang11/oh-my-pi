@@ -810,6 +810,62 @@ describe("AgentSession retry delay cap", () => {
 		}
 	});
 
+	it("reports a turn that failed on a usage limit with the usage report's reset, and other failures as no limit", async () => {
+		// Contract: ACP fails such a prompt in usage-limit words with this reset,
+		// reading the session's settled last assistant message once idle.
+		const exhaustedModel = getBundledModel("opencode-go", "deepseek-v4-flash");
+		if (!exhaustedModel) {
+			throw new Error("Expected bundled OpenCode Go test model to exist");
+		}
+		const weeklyResetMs = Date.parse(new Date(Date.now() + 7_200_000).toISOString());
+		const localStorage = await createOpencodeStorageWithUsage(
+			{ status: "ok", percent: 12, resetsAtIso: new Date(Date.now() + 300_000).toISOString() },
+			{ status: "rate-limited", percent: 100, resetsAtIso: new Date(weeklyResetMs).toISOString() },
+		);
+		try {
+			const localRegistry = new ModelRegistry(localStorage, path.join(tempDir.path(), "models.yml"));
+			const mock = createMockModel({
+				responses: [
+					{ throw: "429 Weekly usage limit reached. type=GoUsageLimitError" },
+					{ throw: "400 invalid request: messages must not be empty" },
+				],
+			});
+			const agent = new Agent({
+				getApiKey: model => localRegistry.resolver(model, agent.sessionId),
+				initialState: { model: exhaustedModel, systemPrompt: ["Test"], tools: [], messages: [] },
+				streamFn: (requestedModel, context, options) => mock.stream(requestedModel, context, options),
+			});
+			const settings = Settings.isolated({
+				"compaction.enabled": false,
+				"retry.baseDelayMs": 5,
+				"retry.maxDelayMs": 100,
+				"retry.modelFallback": false,
+			});
+			settings.setModelRole("default", `${exhaustedModel.provider}/${exhaustedModel.id}`);
+			session = new AgentSession({
+				agent,
+				sessionManager: SessionManager.inMemory(),
+				settings,
+				modelRegistry: localRegistry,
+			});
+			mockSchedulerWaitWithClock();
+
+			await session.prompt("Trigger a usage limit that fails fast");
+			await session.waitForIdle();
+			const limited = session.getLastAssistantMessage();
+			expect(limited?.stopReason).toBe("error");
+			expect(await session.usageLimitFailure(limited!)).toEqual({ resetAtMs: weeklyResetMs });
+
+			await session.prompt("Trigger an ordinary provider failure");
+			await session.waitForIdle();
+			const failed = session.getLastAssistantMessage();
+			expect(failed?.stopReason).toBe("error");
+			expect(await session.usageLimitFailure(failed!)).toBeUndefined();
+		} finally {
+			localStorage.close();
+		}
+	});
+
 	it("sleeps on a report-derived reset with no error-text hint when retry.waitForUsageReset is set", async () => {
 		// Contract: a hintless usage-limit error still bypasses the cap when
 		// the usage report carries an authoritative exhausted window — the

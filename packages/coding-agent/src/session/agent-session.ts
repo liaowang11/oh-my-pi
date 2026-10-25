@@ -6915,6 +6915,14 @@ export class AgentSession implements SettingsScope {
 	getLastAssistantMessage(): AssistantMessage | undefined {
 		return this.#prunedTerminalFailure ?? this.#findLastAssistantMessage();
 	}
+
+	/**
+	 * Whether `message`, a failed assistant turn, hit a usage limit, and when
+	 * the limit resets when the provider's usage report says so.
+	 */
+	usageLimitFailure(message: AssistantMessage): Promise<{ resetAtMs: number | undefined } | undefined> {
+		return this.#recovery.usageLimitFailure(message);
+	}
 	/** Current effective system prompt blocks (includes any per-turn extension modifications) */
 	get systemPrompt(): string[] {
 		return this.agent.state.systemPrompt;
