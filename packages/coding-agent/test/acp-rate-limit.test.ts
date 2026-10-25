@@ -1,6 +1,6 @@
 import { describe, expect, it } from "bun:test";
 import type { UsageLimit, UsageReport } from "@oh-my-pi/pi-ai";
-import { rateLimitInfos } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-rate-limit";
+import { rateLimitInfos, usageLimitFailureText } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-rate-limit";
 
 const RESET_MS = 1_800_000_000_000;
 
@@ -63,5 +63,37 @@ describe("ACP rate-limit mapping", () => {
 			{ status: "rejected", rateLimitType: "seven_day_opus", utilization: 1 },
 			{ status: "allowed", rateLimitType: "daily", utilization: 0.1 },
 		]);
+	});
+});
+
+describe("ACP usage-limit failure text", () => {
+	// 2026-10-25 09:00 in Asia/Shanghai (UTC+8, no DST).
+	const NOW = Date.UTC(2026, 9, 25, 1, 0);
+	const at = (month: number, day: number, hour: number, minute = 0, year = 2026) =>
+		Date.UTC(year, month - 1, day, hour - 8, minute);
+
+	it("starts with the Claude SDK's usage-limit words and says the reset as the Claude CLI writes it", () => {
+		// The client parses these bytes: same day drops the date, zero minutes
+		// drop the minutes, another day adds the date, another year the year.
+		const cases: Array<[number, string]> = [
+			[at(10, 25, 20), "8pm"],
+			[at(10, 25, 14, 30), "2:30pm"],
+			[at(10, 26, 0), "Oct 26, 12am"],
+			[at(1, 2, 9, 5, 2027), "Jan 2, 2027, 9:05am"],
+		];
+		for (const [resetAtMs, when] of cases) {
+			expect(usageLimitFailureText("anthropic", resetAtMs, NOW, "Asia/Shanghai")).toBe(
+				`You've hit your anthropic usage limit · resets ${when} (Asia/Shanghai)`,
+			);
+		}
+	});
+
+	it("leaves the reset out when it is unknown or already past", () => {
+		expect(usageLimitFailureText("openai-codex", undefined, NOW, "Asia/Shanghai")).toBe(
+			"You've hit your openai-codex usage limit",
+		);
+		expect(usageLimitFailureText("openai-codex", NOW - 1, NOW, "Asia/Shanghai")).toBe(
+			"You've hit your openai-codex usage limit",
+		);
 	});
 });
