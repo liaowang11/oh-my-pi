@@ -50,7 +50,7 @@ import { runSubprocess } from "@oh-my-pi/pi-coding-agent/task/executor";
 import type { AgentDefinition } from "@oh-my-pi/pi-coding-agent/task/types";
 import type { ToolSession } from "@oh-my-pi/pi-coding-agent/tools";
 import { EventBus } from "@oh-my-pi/pi-coding-agent/utils/event-bus";
-import { getConfigRootDir, setAgentDir } from "@oh-my-pi/pi-utils";
+import { getConfigRootDir, logger, setAgentDir } from "@oh-my-pi/pi-utils";
 import type {
 	AgentSideConnection,
 	ClientCapabilities,
@@ -2017,6 +2017,74 @@ describe("ACP agent", () => {
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
+	});
+
+	it("keeps addressing the client's session id after the session's own id changes", async () => {
+		// `/fresh`, an extension's ctx.newSession, or a move to a sibling file
+		// (another process holds the file) give the live session a new id the
+		// client never saw. Its prompts and updates stay on the client's id.
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		session.sessionId = "moved-off-id";
+		const updatesBefore = harness.updates.length;
+
+		const response = await harness.agent.prompt({
+			sessionId: created.sessionId,
+			prompt: [{ type: "text", text: "after the move" }],
+		});
+
+		expect(response.stopReason).toBe("end_turn");
+		const pushed = harness.updates.slice(updatesBefore);
+		expect(pushed.some(update => update.update.sessionUpdate === "agent_message_chunk")).toBe(true);
+		expect(new Set(pushed.map(update => update.sessionId))).toEqual(new Set([created.sessionId]));
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("keeps ACP delivery failures in the stored session's debug logs after a rekey", async () => {
+		const deliveryError = new Error("client transport closed");
+		let failDelivery = false;
+		const harness = await createHarness({
+			clientCapabilities: { _meta: { jetbrains: { air: { version: 1, capabilities: [] } } } },
+			sessionUpdateHook(notification) {
+				const meta = notification.update._meta as { jetbrains?: { air?: { goal?: unknown } } } | undefined;
+				if (failDelivery && meta?.jetbrains?.air?.goal) throw deliveryError;
+			},
+		});
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		await session.sessionManager.newSession();
+		session.sessionId = "provider-after-rekey";
+		const storedSessionId = session.sessionManager.getSessionId();
+		const logged = Promise.withResolvers<Record<string, unknown> | undefined>();
+		const unregister = logger.registerLogSink(event => {
+			if (event.context?.error === deliveryError) logged.resolve(event.context);
+		});
+		try {
+			failDelivery = true;
+			session.isStreaming = true;
+			await logger.withContext({ sessionId: storedSessionId }, () =>
+				harness.agent.extMethod("_session/goal", {
+					sessionId: created.sessionId,
+					action: "set",
+					objective: "Keep session logs attributable",
+				}),
+			);
+			// Debug bundles select records by stored session ID, not the fixed ACP handle.
+			expect(await logged.promise).toMatchObject({ sessionId: storedSessionId, acpSessionId: created.sessionId });
+		} finally {
+			unregister();
+			session.isStreaming = false;
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			harness.abortController.abort();
+		}
 	});
 
 	it("suppresses lifetime config_option_update during the bootstrap window", async () => {
