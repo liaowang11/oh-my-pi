@@ -218,6 +218,7 @@ import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 
 import { cfgDisabledExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
+import { cfgSessionWorktreeScope } from "../../session/settings";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
@@ -1396,8 +1397,16 @@ export class AcpAgent implements Agent {
 			return await this.#listSessionIndexPage(params);
 		}
 		// Picker view: untitled 0-turn stubs are hidden but still loadable by id.
+		// Sibling worktrees follow `session.worktreeScope`, as the resume picker does.
 		const sessions = (
-			params.cwd ? await SessionManager.listForPicker(params.cwd) : await SessionManager.listAllForPicker()
+			params.cwd
+				? await SessionManager.listForPicker(
+						params.cwd,
+						undefined,
+						undefined,
+						cfgSessionWorktreeScope.get(await Settings.init()),
+					)
+				: await SessionManager.listAllForPicker()
 		).sort((left, right) => right.modified.getTime() - left.modified.getTime());
 		const offset = this.#parseCursor(params.cursor ?? undefined);
 		const paged = sessions.slice(offset, offset + SESSION_PAGE_SIZE);
