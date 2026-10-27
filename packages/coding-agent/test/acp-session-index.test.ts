@@ -11,6 +11,7 @@ import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+import { cfgSessionWorktreeScope } from "@oh-my-pi/pi-coding-agent/session/settings";
 import { ACP_BOOTSTRAP_RACE_GUARD_MS, AcpAgent } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-agent";
 import { parseSessionIndexListOptions } from "@oh-my-pi/pi-coding-agent/modes/acp/acp-session-index";
 import { AgentSession } from "@oh-my-pi/pi-coding-agent/session/agent-session";
@@ -557,6 +558,24 @@ describe("ACP AIR sessionIndex", () => {
 				[moved.getSessionId(), worktree],
 				[here.id, cwd],
 			]);
+		});
+
+		it("scopes a plain client's list to the directory when session.worktreeScope is directory", async () => {
+			const here = await storedSession("Here");
+			const moved = SessionManager.create(cwd);
+			moved.appendMessage({ role: "user", content: "elsewhere", timestamp: Date.now() });
+			moved.appendMessage({ ...makeAssistantMessage(), model: MODEL_ID });
+			await moved.flush();
+			const { path: worktree } = await createSessionWorktree(cwd, Settings.isolated(), "wt/other");
+			await moved.moveTo(worktree);
+			await moved.close();
+			const agent = await createAgent(null);
+
+			expect((await agent.listSessions({ cwd })).sessions.map(row => row.sessionId).sort()).toEqual(
+				[here.id, moved.getSessionId()].sort(),
+			);
+			cfgSessionWorktreeScope.override(Settings.instance, "directory");
+			expect((await agent.listSessions({ cwd })).sessions.map(row => row.sessionId)).toEqual([here.id]);
 		});
 
 		it("marks only rows in a live agent-made worktree as agentWorktree", async () => {
