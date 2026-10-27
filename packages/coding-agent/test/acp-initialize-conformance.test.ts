@@ -115,6 +115,7 @@ class FakeAgentSession {
 	setActiveToolsByName(): void {}
 	setClientBridge(): void {}
 	setMcpServerInstructionsSource(): void {}
+	enableIdleMaintenance(): void {}
 	isFastModeEnabled(): boolean {
 		return false;
 	}
