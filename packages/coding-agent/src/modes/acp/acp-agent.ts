@@ -547,7 +547,13 @@ function jsonRpcError(error: unknown): { code: number; message: string; data?: u
 }
 
 type ManagedSessionRecord = {
-	/** Stable ACP handle, independent of the underlying durable session. */
+	/**
+	 * The id the client knows this session by, fixed for the record's life.
+	 * `session.sessionId` can change under it: `/fresh`, an extension's
+	 * `ctx.newSession`/`ctx.switchSession`, or a move to a sibling file when
+	 * another process holds or replaced the session file. Every update and
+	 * lookup uses this id, so the client's buffer keeps receiving them.
+	 */
 	readonly protocolSessionId: string;
 	session: AgentSession;
 	setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined;
@@ -1460,6 +1466,8 @@ export class AcpAgent implements Agent {
 	#sessions = new Map<string, ManagedSessionRecord>();
 	/** Serializes writes of the handle map ({@link readAcpSessionHandles}). */
 	#handleWrites: Promise<void> = Promise.resolve();
+	/** The record of each session, from creation on (before `#sessions` lists it). */
+	#recordsBySession = new WeakMap<AgentSession, ManagedSessionRecord>();
 	// Each session's active-branch assistant entries, as of the leaf they were
 	// indexed at, so one replay indexes them once (see `#replayedMessageId`).
 	readonly #replayEntryIndexes = new WeakMap<SessionManager, { leafId: string | null; index: AssistantEntryIndex }>();
@@ -1880,7 +1888,7 @@ export class AcpAgent implements Agent {
 					// the implicit-cancel guard above).
 					cleanup.catch(async (error: unknown) => {
 						logger.warn("ACP cancel cleanup timed out; closing session", {
-							sessionId: record.protocolSessionId,
+							acpSessionId: record.protocolSessionId,
 							error,
 						});
 						await this.#closeManagedSession(record.protocolSessionId, record);
@@ -2203,7 +2211,7 @@ export class AcpAgent implements Agent {
 				await cleanup;
 			} catch (error: unknown) {
 				logger.warn("ACP cancel cleanup timed out; closing session", {
-					sessionId: record.protocolSessionId,
+					acpSessionId: record.protocolSessionId,
 					error,
 				});
 				await this.#closeManagedSession(record.protocolSessionId, record);
@@ -2248,7 +2256,7 @@ export class AcpAgent implements Agent {
 			try {
 				if (await relay.cancelChild(childSessionId)) return;
 			} catch (error) {
-				logger.warn("ACP subagent cancel failed", { sessionId: childSessionId, error });
+				logger.warn("ACP subagent cancel failed", { acpSessionId: childSessionId, error });
 				return;
 			}
 		}
@@ -2534,7 +2542,7 @@ export class AcpAgent implements Agent {
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
+			this.#assertMatchingCwd(existing, cwd);
 			await this.#configureMcpServers(existing, mcpServers);
 			return existing;
 		}
@@ -2546,7 +2554,7 @@ export class AcpAgent implements Agent {
 	async #resumeManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
 		const existing = this.#sessions.get(sessionId);
 		if (existing) {
-			this.#assertMatchingCwd(existing.session, cwd);
+			this.#assertMatchingCwd(existing, cwd);
 			await this.#configureMcpServers(existing, mcpServers);
 			return existing;
 		}
@@ -2760,7 +2768,7 @@ export class AcpAgent implements Agent {
 		session.setMcpServerInstructionsSource(() => record.mcpManager?.getServerInstructions());
 		if (eventBus && clientSupportsSubagents(this.#clientCapabilities)) {
 			record.subagentRelay = new AcpSubagentRelay({
-				sessionId: session.sessionId,
+				sessionId: protocolSessionId,
 				eventBus,
 				// A child's tool call that started a background job is stamped too.
 				send: notification => this.#connection.sessionUpdate(this.#stampBackgroundedToolCall(record, notification)),
@@ -2785,7 +2793,7 @@ export class AcpAgent implements Agent {
 		const asyncJobManager = session.asyncJobManager;
 		if (asyncJobManager instanceof AsyncJobManager && clientSupportsAsyncTasks(this.#clientCapabilities)) {
 			record.asyncTaskRelay = new AcpAsyncTaskRelay({
-				sessionId: session.sessionId,
+				sessionId: protocolSessionId,
 				manager: asyncJobManager,
 				ownerId: session.getAgentId(),
 				// A job a subagent started goes to the subagent's child session.
@@ -2837,7 +2845,7 @@ export class AcpAgent implements Agent {
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined = undefined,
 		protocolSessionId = session.sessionId,
 	): ManagedSessionRecord {
-		return {
+		const record: ManagedSessionRecord = {
 			protocolSessionId,
 			session,
 			setToolUIContext,
@@ -2868,7 +2876,7 @@ export class AcpAgent implements Agent {
 			rateLimitPush: undefined,
 			sentConfigWarnings: new Set(),
 			compaction: new AcpCompactionLifecycle(
-				update => this.#connection.sessionUpdate({ sessionId: session.sessionId, update }),
+				update => this.#connection.sessionUpdate({ sessionId: protocolSessionId, update }),
 				this.#compactionReportOptions(),
 			),
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
@@ -2878,6 +2886,13 @@ export class AcpAgent implements Agent {
 			runState: "idle",
 			pendingPermissions: 0,
 		};
+		this.#recordsBySession.set(session, record);
+		return record;
+	}
+
+	/** The id the client knows `session` by (see {@link ManagedSessionRecord.protocolSessionId}). */
+	#protocolSessionIdOf(session: AgentSession): string {
+		return this.#recordsBySession.get(session)?.protocolSessionId ?? session.sessionId;
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
@@ -2964,13 +2979,14 @@ export class AcpAgent implements Agent {
 		return record;
 	}
 
-	#assertMatchingCwd(session: AgentSession, cwd: string): void {
+	#assertMatchingCwd(record: ManagedSessionRecord, cwd: string): void {
+		const { session } = record;
 		// Equivalent physical directories (symlinks or macOS /private aliases) are the
 		// same workspace; the resolved spellings stay in the error for the client.
 		const expected = path.resolve(cwd);
 		const actual = path.resolve(session.sessionManager.getCwd());
 		if (normalizePathForComparison(expected) !== normalizePathForComparison(actual)) {
-			throw new Error(`ACP session ${session.sessionId} is already loaded for ${actual}, not ${expected}`);
+			throw new Error(`ACP session ${record.protocolSessionId} is already loaded for ${actual}, not ${expected}`);
 		}
 	}
 
@@ -3044,7 +3060,7 @@ export class AcpAgent implements Agent {
 			try {
 				await this.#finishGoalModeAfterTurn(record);
 			} catch (error) {
-				logger.warn("Failed to finish ACP goal mode after turn", { sessionId: record.session.sessionId, error });
+				logger.warn("Failed to finish ACP goal mode after turn", { acpSessionId: record.protocolSessionId, error });
 			}
 			record.liveMessageId = undefined;
 			record.liveMessageProgress = undefined;
@@ -3052,7 +3068,7 @@ export class AcpAgent implements Agent {
 				? undefined
 				: await this.#turnFailure(record, event).catch((error: unknown) => {
 						// Settling matters more than classifying: a throw here would leave the prompt pending.
-						logger.warn("Failed to classify ACP turn failure", { sessionId: record.session.sessionId, error });
+						logger.warn("Failed to classify ACP turn failure", { acpSessionId: record.protocolSessionId, error });
 						return undefined;
 					});
 			if (failure) {
@@ -3110,7 +3126,7 @@ export class AcpAgent implements Agent {
 				},
 				(error: unknown) => {
 					if (!(error instanceof AgentBusyError)) {
-						logger.warn("ACP goal continuation failed", { sessionId: session.sessionId, error });
+						logger.warn("ACP goal continuation failed", { providerSessionId: session.sessionId, error });
 					}
 					settle();
 				},
@@ -3163,7 +3179,7 @@ export class AcpAgent implements Agent {
 				record.liveMessageProgress = undefined;
 			}
 		} catch (error) {
-			logger.warn("ACP autonomous event handler failed", { sessionId: record.session.sessionId, error });
+			logger.warn("ACP autonomous event handler failed", { acpSessionId: record.protocolSessionId, error });
 		}
 		// A prompt waiting behind this run keeps foreground work going; its own
 		// settlement sends the idle.
@@ -3187,7 +3203,7 @@ export class AcpAgent implements Agent {
 		record.runState = state;
 		const update: SessionUpdate = { sessionUpdate: "state_update", state, ...(state === "idle" ? idle : {}) };
 		void this.#sendQuietly(
-			this.#connection.sessionUpdate({ sessionId: record.session.sessionId, update }),
+			this.#connection.sessionUpdate({ sessionId: record.protocolSessionId, update }),
 			"state update",
 		);
 	}
@@ -3315,7 +3331,7 @@ export class AcpAgent implements Agent {
 		record.planProposal = undefined;
 		record.approvedPlan = undefined;
 		if (!approved || isError) return;
-		const { sessionId } = record.session;
+		const sessionId = record.protocolSessionId;
 		if (planFilePath) {
 			await this.#connection.sessionUpdate({
 				sessionId,
@@ -3405,7 +3421,7 @@ export class AcpAgent implements Agent {
 		const supportsNotices = clientSupportsNotices(this.#clientCapabilities);
 		for (const notice of notices) {
 			const delivery = this.#connection.sessionUpdate({
-				sessionId: record.session.sessionId,
+				sessionId: record.protocolSessionId,
 				update: noticeOrTranscriptUpdate(notice, supportsNotices),
 			});
 			onDelivery?.(delivery);
@@ -4232,7 +4248,7 @@ export class AcpAgent implements Agent {
 		}
 		try {
 			await this.#connection.sessionUpdate({
-				sessionId: record.protocolSessionId,
+				sessionId: this.#protocolSessionIdOf(session),
 				update: this.#buildCurrentModeUpdate(session),
 			});
 			await this.#pushConfigOptionUpdate(record);
@@ -4628,7 +4644,7 @@ export class AcpAgent implements Agent {
 			await this.#pushConfigOptionUpdate(record);
 		} catch (error) {
 			logger.warn("Failed to publish ACP model options after background discovery", {
-				sessionId,
+				acpSessionId: sessionId,
 				error: String(error),
 			});
 		}
@@ -4737,7 +4753,7 @@ export class AcpAgent implements Agent {
 	 */
 	async #pushRateLimitUpdates(record: ManagedSessionRecord): Promise<void> {
 		const { session } = record;
-		const sessionId = session.sessionId;
+		const sessionId = record.protocolSessionId;
 		try {
 			const model = session.model;
 			if (!model) return;
@@ -4767,7 +4783,7 @@ export class AcpAgent implements Agent {
 				});
 			}
 		} catch (error) {
-			logger.debug("Failed to push ACP rate limits", { sessionId, error: String(error) });
+			logger.debug("Failed to push ACP rate limits", { acpSessionId: sessionId, error: String(error) });
 		}
 	}
 
@@ -4790,7 +4806,7 @@ export class AcpAgent implements Agent {
 		if (sent === record.sentGoal) return;
 		record.sentGoal = sent;
 		await this.#connection.sessionUpdate({
-			sessionId: record.session.sessionId,
+			sessionId: record.protocolSessionId,
 			update: { sessionUpdate: "session_info_update", _meta: withAirMeta(undefined, AIR_GOAL_KEY, snapshot) },
 		});
 	}
