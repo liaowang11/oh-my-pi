@@ -1978,6 +1978,7 @@ describe("ACP agent", () => {
 				{
 					sessionUpdate: "tool_call",
 					toolCallId: "propose-1:plan-file-clear",
+					name: "write",
 					title: "Exited Plan Mode",
 					kind: "switch_mode",
 					status: "completed",
@@ -3368,6 +3369,7 @@ describe("ACP agent", () => {
 					{
 						sessionUpdate: "tool_call",
 						toolCallId,
+						name: "compact",
 						title: "Compact conversation",
 						kind: "think",
 						status: "in_progress",
@@ -4128,6 +4130,7 @@ describe("ACP agent", () => {
 				{
 					sessionUpdate: "tool_call",
 					toolCallId: expect.stringMatching(/^compaction:\d+$/),
+					name: "compact",
 					title: "Compact conversation",
 					kind: "think",
 					status: "completed",
