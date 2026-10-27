@@ -102,13 +102,16 @@ import {
 } from "../../session/messages";
 import type { ModelTokenStatistics, SessionEntry, UsageStatistics } from "../../session/session-entries";
 import {
+	findSessionContinuation,
 	findSessionFiles,
 	readSessionInfo,
+	type SessionContinuation,
 	sessionIdFromSessionPath,
 	type SessionInfo as StoredSessionInfo,
 } from "../../session/session-listing";
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
 import { isAgentManagedWorktree, worktreeSessionDirs } from "../../session/session-paths";
+import { formatSessionContinuationNotice } from "../persistence-failure";
 import { SessionManager, SessionMoveRefusedError } from "../../session/session-manager";
 import { FileSessionStorage } from "../../session/session-storage";
 import { executeAcpBuiltinSlashCommand } from "../../slash-commands/acp-builtins";
@@ -534,6 +537,9 @@ type ManagedSessionRecord = {
 	// clients (Zed) cannot drop them as notifications for an unknown session.
 	// `oauthCapable` marks http/sse servers, the only ones `/mcp reauth` can repair.
 	pendingMcpStartupChunks: Array<{ name: string; message: string; oauthCapable: boolean }>;
+	// Notices raised before the client knows the session id (a load that
+	// followed the conversation to another file), sent the same way.
+	pendingNotices: SessionNotice[];
 	promptTurn: PromptTurnState | undefined;
 	promptQueue: PromptQueueState;
 	// Cancellation carriers for client prompts accepted on the wire whose
@@ -2443,8 +2449,16 @@ export class AcpAgent implements Agent {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
 		);
+		// The conversation may have gone on in another file (another process
+		// held this one, or replaced it): open that copy, as `omp --resume` does,
+		// under the id the client asked for.
+		let continuation: SessionContinuation | undefined;
 		try {
-			const sessionPath = await this.#relocateFromRemovedWorktree(stored, session.sessionManager);
+			continuation = await findSessionContinuation(stored.path);
+			const sessionPath = await this.#relocateFromRemovedWorktree(
+				continuation?.session ?? stored,
+				session.sessionManager,
+			);
 			const success = await session.switchSession(sessionPath);
 			if (!success) {
 				throw new Error(`ACP session load was cancelled: ${sessionId}`);
@@ -2453,7 +2467,11 @@ export class AcpAgent implements Agent {
 			await this.#disposeStandaloneSession(session);
 			throw error;
 		}
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus);
+		const record = await this.#registerPreparedSession(session, mcpServers, setToolUIContext, eventBus, sessionId);
+		if (continuation) {
+			record.pendingNotices.push({ severity: "info", title: formatSessionContinuationNotice(continuation) });
+		}
+		return record;
 	}
 
 	/**
@@ -2614,6 +2632,7 @@ export class AcpAgent implements Agent {
 			mcpManager: undefined,
 			mcpRefreshChain: undefined,
 			pendingMcpStartupChunks: [],
+			pendingNotices: [],
 			promptTurn: undefined,
 			promptQueue: { promise: Promise.resolve(), release: undefined },
 			liveMessageId: undefined,
@@ -4389,6 +4408,8 @@ export class AcpAgent implements Agent {
 		if (this.#sessions.get(sessionId) !== record) {
 			return;
 		}
+		const notices = record.pendingNotices.splice(0);
+		if (notices.length > 0) await this.#sendSessionNotices(record, notices);
 		// MCP startup failures queued by `#configureMcpServers` flush here,
 		// behind the bootstrap race guard, so the client can finally attribute
 		// them to a session it knows.
