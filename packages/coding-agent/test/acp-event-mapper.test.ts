@@ -117,6 +117,7 @@ class ReplayTestSession {
 	setClientBridge(_bridge: unknown): void {}
 
 	setMcpServerInstructionsSource(_source: unknown): void {}
+	enableIdleMaintenance(): void {}
 
 	subscribe(_listener: (event: AgentSessionEvent) => void): () => void {
 		return () => {};

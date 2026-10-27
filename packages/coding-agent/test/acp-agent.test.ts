@@ -521,6 +521,7 @@ class FakeAgentSession {
 	setClientBridge(_bridge: unknown): void {}
 
 	setMcpServerInstructionsSource(_source: unknown): void {}
+	enableIdleMaintenance(): void {}
 
 	getPlanModeState(): PlanModeState | undefined {
 		return this.planModeState;
