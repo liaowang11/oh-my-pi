@@ -20,6 +20,8 @@ import { withAirMeta } from "./acp-air";
 /** AIR `_meta.jetbrains.air` key of the compaction facts. */
 export const AIR_CONTEXT_COMPACTION_KEY = "contextCompaction";
 const CONTEXT_COMPACTION_META_VERSION = 1;
+/** The tool name of the synthetic compaction call, after the `/compact` command. */
+const TOOL_NAME = "compact";
 const TOOL_TITLE = "Compact conversation";
 
 export type CompactionPresentation = "compaction_update" | "tool_call";
@@ -78,6 +80,7 @@ export const compactionToolCall = {
 		return {
 			sessionUpdate: "tool_call",
 			toolCallId,
+			name: TOOL_NAME,
 			title: TOOL_TITLE,
 			kind: "think",
 			status: "in_progress",
@@ -124,6 +127,7 @@ export const compactionToolCall = {
 			return {
 				sessionUpdate: "tool_call",
 				toolCallId,
+				name: TOOL_NAME,
 				title: TOOL_TITLE,
 				kind: "think",
 				status: toolStatus,
