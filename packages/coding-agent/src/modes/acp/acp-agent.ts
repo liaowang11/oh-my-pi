@@ -232,6 +232,7 @@ import { cfgPlanEnabled } from "../../plan-mode/settings";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import { extensionTheme } from "../../ui/extensions/render-output";
 import { cfgSessionWorktreeScope } from "../../session/settings";
+import { cfgRecapEnabled } from "../settings";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
@@ -2720,6 +2721,16 @@ export class AcpAgent implements Agent {
 		return forkPath;
 	}
 
+	/**
+	 * Idle compaction, as Claude Code runs it: governed by the `compaction.idle*`
+	 * settings, held while a goal continuation is about to start. The idle recap
+	 * stays off, since an ACP client has nowhere to show it.
+	 */
+	#enableIdleMaintenance(record: ManagedSessionRecord): void {
+		cfgRecapEnabled.override(record.session.settings, false);
+		record.session.enableIdleMaintenance({ scheduledTurn: () => record.goalContinuation.pendingTurns > 0 });
+	}
+
 	async #registerPreparedSession(
 		session: AgentSession,
 		mcpServers: McpServer[],
@@ -2800,6 +2811,7 @@ export class AcpAgent implements Agent {
 			// otherwise leak into the read-only vibe toolset and be missing from
 			// the snapshot exit restores.
 			await this.#restoreVibeMode(record);
+			this.#enableIdleMaintenance(record);
 			this.#sessions.set(record.protocolSessionId, record);
 			return record;
 		} catch (error) {
