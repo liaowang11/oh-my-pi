@@ -3001,7 +3001,7 @@ export class AcpAgent implements Agent {
 			await delivery;
 		}
 		if (event.type === "tool_execution_end" && record.planProposal?.toolCallId === event.toolCallId) {
-			const delivery = this.#reportApprovedPlan(record, event.toolCallId, event.isError === true);
+			const delivery = this.#reportApprovedPlan(record, event.toolCallId, event.toolName, event.isError === true);
 			onDelivery?.(delivery);
 			await delivery;
 		}
@@ -3076,7 +3076,12 @@ export class AcpAgent implements Agent {
 	 * markdown plan for a `plan` client, and an AIR `planFile` client gets the
 	 * call that clears its plan file. A refined or failed proposal sends nothing.
 	 */
-	async #reportApprovedPlan(record: ManagedSessionRecord, toolCallId: string, isError: boolean): Promise<void> {
+	async #reportApprovedPlan(
+		record: ManagedSessionRecord,
+		toolCallId: string,
+		toolName: string,
+		isError: boolean,
+	): Promise<void> {
 		const approved = record.approvedPlan;
 		const planFilePath = approved?.planFilePath ?? record.planProposal?.planFilePath;
 		record.planProposal = undefined;
@@ -3089,6 +3094,7 @@ export class AcpAgent implements Agent {
 				update: {
 					sessionUpdate: "tool_call",
 					toolCallId: `${toolCallId}:plan-file-clear`,
+					name: toolName,
 					title: "Exited Plan Mode",
 					kind: "switch_mode",
 					status: "completed",
