@@ -60,6 +60,41 @@ async function errorCode(promise: Promise<unknown>): Promise<number | undefined>
 	return undefined;
 }
 
+/**
+ * The sibling a move-off leaves when another process holds `file`: the same
+ * entries under a new id whose header names the old one in `continuationOf`,
+ * then a later turn.
+ */
+function writeContinuation(file: string): { id: string; file: string } {
+	const records = fs
+		.readFileSync(file, "utf8")
+		.split("\n")
+		.filter(line => line.trim())
+		.map(line => JSON.parse(line) as Record<string, unknown>);
+	const header = records.find(record => record.type === "session");
+	if (!header) throw new Error("Expected a session header");
+	const oldId = header.id as string;
+	const id = crypto.randomUUID();
+	const movedAt = Date.now() + 1_000;
+	Object.assign(header, {
+		id,
+		timestamp: new Date(movedAt).toISOString(),
+		parentSession: oldId,
+		continuationOf: oldId,
+	});
+	records.push({
+		type: "message",
+		id: "continued-turn",
+		parentId: records[records.length - 1].id,
+		timestamp: new Date(movedAt + 1_000).toISOString(),
+		message: { role: "user", content: "after the move-off", timestamp: movedAt + 1_000 },
+	});
+	const fileTime = new Date(movedAt).toISOString().replace(/[:.]/g, "-");
+	const sibling = path.join(path.dirname(file), `${fileTime}_${id}.jsonl`);
+	fs.writeFileSync(sibling, `${records.map(record => JSON.stringify(record)).join("\n")}\n`);
+	return { id, file: sibling };
+}
+
 describe("ACP AIR sessionIndex", () => {
 	const originalAgentDir = process.env.PI_CODING_AGENT_DIR;
 	let root: string;
@@ -299,6 +334,28 @@ describe("ACP AIR sessionIndex", () => {
 		expect(air(after[1]).archived).toBe(true);
 		expect(await errorCode(agent.extMethod("_session/rename", { sessionId: older.id, title: " \n " }))).toBe(-32602);
 		expect(await errorCode(agent.extMethod("_session/rename", { sessionId: "nope", title: "x" }))).toBe(-32002);
+	});
+
+	it("loads the copy a session went on in, under the id the client asked for", async () => {
+		const original = await storedSession("Moved");
+		const continued = writeContinuation(original.file);
+		const agent = await createAgent();
+		await agent.loadSession({ sessionId: original.id, cwd, mcpServers: [] });
+		await Bun.sleep(ACP_BOOTSTRAP_RACE_GUARD_MS + 20);
+
+		// The live session is the copy, with the turn the original file lacks.
+		const loaded = sessions.find(s => s.sessionId === continued.id);
+		expect(JSON.stringify(loaded?.sessionManager.getEntries())).toContain("after the move-off");
+		// The client hears about it only under its own id, with a notice naming the copy.
+		expect(new Set(updates.map(u => u.sessionId))).toEqual(new Set([original.id]));
+		expect(JSON.stringify(updates)).toContain(path.basename(continued.file));
+		// Later requests on the client's id reach the copy.
+		await agent.extMethod("_session/rename", { sessionId: original.id, title: "Renamed" });
+		expect(loaded?.sessionManager.getSessionName()).toBe("Renamed");
+		// Loading the client's id again reuses the live copy instead of reopening the old file.
+		const opened = sessions.length;
+		await agent.loadSession({ sessionId: original.id, cwd, mcpServers: [] });
+		expect(sessions).toHaveLength(opened);
 	});
 
 	it("renames a loaded session through its title and tells the client", async () => {
