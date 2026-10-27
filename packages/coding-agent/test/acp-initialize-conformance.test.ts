@@ -118,6 +118,7 @@ class FakeAgentSession {
 	registerSessionChangeCallback(): () => void {
 		return () => {};
 	}
+	enableIdleMaintenance(): void {}
 	isFastModeEnabled(): boolean {
 		return false;
 	}
