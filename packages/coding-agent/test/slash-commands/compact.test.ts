@@ -12,7 +12,8 @@ function acpRuntime() {
 	const compact = vi.fn(async (_instructions?: string, _options?: CompactOptions) => {});
 	const getContextUsage = vi.fn(() => undefined);
 	const output = vi.fn();
-	const runtime = { session: { compact, getContextUsage }, output } as unknown as SlashCommandRuntime;
+	const subscribe = () => () => {};
+	const runtime = { session: { compact, getContextUsage, subscribe }, output } as unknown as SlashCommandRuntime;
 	return { compact, output, runtime };
 }
 
