@@ -66,18 +66,6 @@ export type SlashCommandResult =
 /** Text-mode hosts that dispatch builtin slash commands without the TUI. */
 export type TextSlashCommandHost = "acp" | "rpc";
 
-/** How a manual compaction ended, as `/compact` reports it to the host. */
-export type SlashCompactionOutcome =
-	| { status: "completed"; summary: string; tokensBefore?: number; tokensAfter?: number }
-	| { status: "failed"; error: string }
-	| { status: "cancelled" };
-
-/** Receives a manual compaction's start and outcome (see `SlashCommandRuntime.reportCompaction`). */
-export interface SlashCompactionReporter {
-	start: () => Promise<void> | void;
-	finish: (outcome: SlashCompactionOutcome) => Promise<void> | void;
-}
-
 /**
  * Runtime visible to slash-command handlers that run in text/ACP mode.
  *
@@ -161,13 +149,6 @@ export interface SlashCommandRuntime {
 	 * (RPC) ignore the flag and always push.
 	 */
 	notifyConfigChanged?: (options?: { handledBySessionEvent?: boolean }) => Promise<void> | void;
-	/**
-	 * Report a manual compaction's lifecycle. Provided only by ACP, which
-	 * shows it as a compaction entity instead of `/compact`'s status text, so
-	 * `/compact` skips that text when this is present. Manual compaction emits
-	 * no `AgentSession` lifecycle events, so the command reports it here.
-	 */
-	reportCompaction?: SlashCompactionReporter;
 }
 
 /**
