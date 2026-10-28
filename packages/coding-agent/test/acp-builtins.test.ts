@@ -79,6 +79,7 @@ interface FakeAcpBuiltinSession {
 	applyMemoryBackend(): Promise<void>;
 	getToolByName(name: string): unknown;
 	compact(args?: string): Promise<void>;
+	subscribe(): () => void;
 	getContextUsage(): { tokens?: number; contextWindow: number } | undefined;
 	getAvailableModels(): Array<{ provider: string; id: string; contextWindow?: number }>;
 	scopedModels: Array<{ model: { provider: string; id: string } }>;
@@ -204,6 +205,7 @@ function createRuntime() {
 		settings,
 		getToolByName: (_name: string) => undefined,
 		async compact(_args?: string) {},
+		subscribe: () => () => {},
 		getContextUsage: () => undefined,
 		getAvailableModels: () => [] as Array<{ provider: string; id: string; contextWindow?: number }>,
 		scopedModels: [],

@@ -1849,23 +1849,6 @@ export class AcpAgent implements Agent {
 			notifyTitleChanged: async () => {
 				await this.#pushSessionInfoUpdate(record);
 			},
-			reportCompaction: {
-				start: () => this.#sendQuietly(record.compaction.start("manual"), "compaction start"),
-				finish: outcome =>
-					this.#sendQuietly(
-						record.compaction.finish(
-							outcome.status === "completed"
-								? {
-										status: "completed",
-										summary: outcome.summary,
-										preTokens: outcome.tokensBefore,
-										postTokens: outcome.tokensAfter,
-									}
-								: outcome,
-						),
-						"compaction outcome",
-					),
-			},
 			notifyConfigChanged: async options => {
 				// Once lifetime delivery is ready, model/thinking events already
 				// push the config update. Keep the pre-bootstrap explicit path.
@@ -1896,6 +1879,7 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			// A builtin such as /compact can change the context with no agent turn.
+			await this.#waitForPromptEventHandlers(record);
 			await record.compaction.reset();
 			await this.#pushUsageUpdate(record);
 			this.#finishPrompt(record, { stopReason: "end_turn", ...this.#turnUsage(record, promptTurn) });
@@ -3068,10 +3052,12 @@ export class AcpAgent implements Agent {
 			await delivery;
 		}
 		if (
-			(event.type === "auto_compaction_start" || event.type === "auto_compaction_end") &&
-			COMPACTION_ACTIONS.has(event.action)
+			event.type === "manual_compaction_start" ||
+			event.type === "manual_compaction_end" ||
+			((event.type === "auto_compaction_start" || event.type === "auto_compaction_end") &&
+				COMPACTION_ACTIONS.has(event.action))
 		) {
-			const delivery = this.#reportAutoCompaction(record, event);
+			const delivery = this.#reportCompaction(record, event);
 			onDelivery?.(delivery);
 			await delivery;
 		}
@@ -3081,7 +3067,9 @@ export class AcpAgent implements Agent {
 		if (notices.length > 0) await this.#sendSessionNotices(record, notices, onDelivery);
 		if (
 			(event.type === "message_end" && event.message.role === "assistant") ||
-			(event.type === "auto_compaction_end" && event.result !== undefined && !event.aborted)
+			((event.type === "auto_compaction_end" || event.type === "manual_compaction_end") &&
+				event.result !== undefined &&
+				!event.aborted)
 		) {
 			await this.#pushUsageUpdate(record);
 		}
@@ -3190,13 +3178,16 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	/** Open or close the compaction entity of an automatic context-rewriting compaction. */
-	async #reportAutoCompaction(
+	/** Open or close the compaction entity for a context-rewriting compaction. */
+	async #reportCompaction(
 		record: ManagedSessionRecord,
-		event: Extract<AgentSessionEvent, { type: "auto_compaction_start" | "auto_compaction_end" }>,
+		event: Extract<
+			AgentSessionEvent,
+			{ type: "auto_compaction_start" | "auto_compaction_end" | "manual_compaction_start" | "manual_compaction_end" }
+		>,
 	): Promise<void> {
-		if (event.type === "auto_compaction_start") {
-			await record.compaction.start("automatic");
+		if (event.type === "auto_compaction_start" || event.type === "manual_compaction_start") {
+			await record.compaction.start(event.type === "manual_compaction_start" ? "manual" : "automatic");
 			return;
 		}
 		let outcome: CompactionOutcome;
