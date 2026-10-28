@@ -3093,8 +3093,12 @@ describe("ACP agent", () => {
 
 		// Manual /compact runs as a builtin command, with no agent turn.
 		session.compact = async () => {
+			for (const listener of session.listeners()) listener({ type: "manual_compaction_start" });
 			session.contextUsage = { tokens: 12_000, contextWindow: 200_000, percent: 6 };
-			return { summary: "Compacted.", firstKeptEntryId: "x", tokensBefore: 150_000 };
+			const result = { summary: "Compacted.", firstKeptEntryId: "x", tokensBefore: 150_000 };
+			for (const listener of session.listeners())
+				listener({ type: "manual_compaction_end", result, aborted: false });
+			return result;
 		};
 		const manual = harness.updates.length;
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
@@ -3186,6 +3190,44 @@ describe("ACP agent", () => {
 					.map(update => update.update);
 			return { harness, created, session, emit, sentSince };
 		}
+
+		it("reports manual compactions initiated outside a slash command", async () => {
+			const { harness, session, emit, sentSince } = await bootSession(COMPACTION_CAPS);
+			const from = harness.updates.length;
+			emit({ type: "manual_compaction_start" });
+			session.contextUsage = { tokens: 9_000, contextWindow: 200_000, percent: 4.5 };
+			emit({
+				type: "manual_compaction_end",
+				result: compactionResult("Extension summary.", 150_000),
+				aborted: false,
+			});
+			emit({ type: "manual_compaction_start" });
+			emit({ type: "manual_compaction_end", aborted: false, skipped: true, errorMessage: "nothing to compact" });
+			emit({ type: "manual_compaction_start" });
+			emit({ type: "manual_compaction_end", aborted: true });
+			emit({ type: "manual_compaction_start" });
+			emit({ type: "manual_compaction_end", aborted: false, errorMessage: "provider failed" });
+			await flushMicrotasks();
+
+			const updates = sentSince(from).filter(update => update.sessionUpdate === "compaction_update");
+			expectAcpNotifications(updates.map(update => ({ sessionId: "s", update })));
+			expect(updates.map(update => ({ ...update, compactionId: undefined }))).toEqual([
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{
+					sessionUpdate: "compaction_update",
+					compactionId: undefined,
+					status: "completed",
+					summary: [{ type: "text", text: "Extension summary." }],
+				},
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "cancelled" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "cancelled" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "in_progress" },
+				{ sessionUpdate: "compaction_update", compactionId: undefined, status: "failed", error: "provider failed" },
+			]);
+			harness.abortController.abort();
+		});
 
 		it("reports auto compaction as one compaction_update lifecycle per compaction", async () => {
 			const { harness, emit, sentSince } = await bootSession(COMPACTION_CAPS);
@@ -3400,19 +3442,42 @@ describe("ACP agent", () => {
 			await Bun.sleep(0);
 		});
 
+		it("surfaces a /compact refusal before its lifecycle starts", async () => {
+			const { harness, created, session, sentSince } = await bootSession(COMPACTION_CAPS);
+			session.compact = async () => {
+				throw new Error("Compaction already in progress");
+			};
+			const from = harness.updates.length;
+			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
+			const updates = sentSince(from);
+			expect(updates.filter(update => update.sessionUpdate === "compaction_update")).toEqual([]);
+			expect(updates).toContainEqual(
+				expect.objectContaining({
+					sessionUpdate: "agent_message_chunk",
+					content: expect.objectContaining({ text: expect.stringContaining("Compaction already in progress") }),
+				}),
+			);
+			harness.abortController.abort();
+		});
+
 		it("reports a manual /compact as a manual compaction lifecycle instead of command text", async () => {
-			const { harness, created, session, sentSince } = await bootSession({
+			const { harness, created, session, emit, sentSince } = await bootSession({
 				...COMPACTION_CAPS,
 				...AIR_CAPS,
 			});
 			session.contextUsage = { tokens: 120_000, contextWindow: 200_000, percent: 60 };
 			session.compact = (async () => {
+				emit({ type: "manual_compaction_start" });
 				session.contextUsage = { tokens: 8_000, contextWindow: 200_000, percent: 4 };
-				return compactionResult("Manual summary.", 120_000);
+				const result = compactionResult("Manual summary.", 120_000);
+				emit({ type: "manual_compaction_end", result, aborted: false });
+				return result;
 			}) as unknown as typeof session.compact;
 			const from = harness.updates.length;
 			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
 			session.compact = (async () => {
+				emit({ type: "manual_compaction_start" });
+				emit({ type: "manual_compaction_end", aborted: false, errorMessage: "Nothing to compact" });
 				throw new Error("Nothing to compact");
 			}) as unknown as typeof session.compact;
 			await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "/compact" }] });
