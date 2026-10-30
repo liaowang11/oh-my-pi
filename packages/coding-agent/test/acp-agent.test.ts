@@ -10,6 +10,7 @@ import { buildModel } from "@oh-my-pi/pi-catalog/build";
 import { Effort } from "@oh-my-pi/pi-catalog/effort";
 import { AsyncJobManager } from "@oh-my-pi/pi-coding-agent/async/job-manager";
 import { cfgModelPresets } from "@oh-my-pi/pi-coding-agent/config/model-settings";
+import { resolveModelRoleValue } from "@oh-my-pi/pi-coding-agent/config/model-resolver";
 import { resetSettingsForTest, Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
 import type { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
 import type { ExtensionUIContext } from "@oh-my-pi/pi-coding-agent/extensibility/extensions";
@@ -1526,6 +1527,43 @@ describe("ACP agent", () => {
 				value: "nope",
 			}),
 		).rejects.toThrow("Unknown ACP model preset: nope");
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("retargets the session's default role on a model pick so @default roles follow", async () => {
+		const harness = await createHarness();
+		type SelectOption = { id: string; currentValue?: unknown };
+		const presetOption = (options: unknown[] | null | undefined) =>
+			(options as SelectOption[] | undefined)?.find(option => option.id === "model_preset");
+		const claude = `${TEST_MODELS[0]!.provider}/${TEST_MODELS[0]!.id}`;
+		const gpt = `${TEST_MODELS[1]!.provider}/${TEST_MODELS[1]!.id}`;
+		cfgModelPresets.set(Settings.instance, {
+			fast: { modelRoles: { default: gpt, slow: "@default:high" } },
+		});
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model_preset",
+			value: "fast",
+		});
+		const picked = await harness.agent.setSessionConfigOption({
+			sessionId: created.sessionId,
+			configId: "model",
+			value: claude,
+		});
+
+		expect(session.model?.id).toBe(TEST_MODELS[0]!.id);
+		expect(Settings.instance.getModelRole("default")).toBe(claude);
+		const slow = resolveModelRoleValue("@slow", [...TEST_MODELS], { settings: Settings.instance });
+		expect(slow.model?.id).toBe(TEST_MODELS[0]!.id);
+		expect(slow.thinkingLevel).toBe(Effort.High);
+		// Session-only: the persisted default is untouched.
+		expect(Settings.instance.getGlobalModelRole("default")).toBeUndefined();
+		expect(presetOption(picked.configOptions)?.currentValue).toBe("_custom");
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

@@ -109,6 +109,7 @@ import {
 	sessionIdFromSessionPath,
 	type SessionInfo as StoredSessionInfo,
 } from "../../session/session-listing";
+import { formatRoleModelValue } from "../../session/role-models";
 import { loadSessionMessagesReadOnly } from "../../session/session-loader";
 import { isAgentManagedWorktree, worktreeSessionDirs } from "../../session/session-paths";
 import { formatSessionContinuationNotice } from "../persistence-failure";
@@ -3798,6 +3799,11 @@ export class AcpAgent implements Agent {
 			throw new Error(`Unknown ACP model: ${modelId}`);
 		}
 		await session.setModel(model);
+		// Retarget `default` for this session the way a preset switch does, so
+		// roles naming `@default` follow the pick. Nothing is persisted.
+		session.settings.overrideModelRoles({
+			default: formatRoleModelValue(session.settings, session.modelRegistry, "default", model),
+		});
 	}
 
 	#setThinkingLevelById(session: AgentSession, value: string): void {
