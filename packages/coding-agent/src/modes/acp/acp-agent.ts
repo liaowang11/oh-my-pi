@@ -320,7 +320,7 @@ type PromptQueueState = {
  * about to stream; the queue callback consumes the mark when the slot is
  * created and resolves the wire response `cancelled` without starting the run.
  */
-type PromptDispatchCancellation = { cancelled: boolean };
+type PromptDispatchCancellation = { cancelled: boolean; wake: () => void; promise: Promise<void> };
 
 type PromptTurnState = {
 	abortController: AbortController;
@@ -578,7 +578,8 @@ type ManagedSessionRecord = {
 	lifetimeUnsubscribe: (() => void) | undefined;
 	commandMetadataUnsubscribe: (() => void) | undefined;
 	lifetimeUpdatesReady: boolean;
-	pendingCompactionNotifications: AcpCompactionNotification[] | undefined;
+	pendingLifetimeEvents: Array<{ event: AgentSessionEvent; autonomous: boolean }> | undefined;
+	lifetimeReplay: Promise<void> | undefined;
 	// Relays task-tool subagents as ACP subagents-RFD child sessions; set only when the
 	// client advertises `subagents`. Released in `#disposeSessionRecord`.
 	subagentRelay: AcpSubagentRelay | undefined;
@@ -1644,10 +1645,16 @@ export class AcpAgent implements Agent {
 		// A cancel that lands between this prompt's wire acceptance and its
 		// turn slot creation must still stop it (the client believes it stopped
 		// the session). The carrier is marked by cancel() and consumed below.
-		const cancellation: PromptDispatchCancellation = { cancelled: false };
+		const wake = Promise.withResolvers<void>();
+		const cancellation: PromptDispatchCancellation = { cancelled: false, wake: wake.resolve, promise: wake.promise };
 		record.pendingPromptDispatches.push(cancellation);
 		try {
 			return await this.#queuePrompt(record, async () => {
+				if (record.lifetimeReplay) {
+					await Promise.race([record.lifetimeReplay, cancellation.promise]);
+					this.#throwIfRecordClosed(record);
+					if (cancellation.cancelled) return { stopReason: "cancelled" };
+				}
 				const previousTurn = record.promptTurn;
 				if (previousTurn) {
 					// Wait for any prompt that's still settling or whose cancel cleanup is
@@ -1992,6 +1999,7 @@ export class AcpAgent implements Agent {
 		// stream after the client believes it stopped the session.
 		for (const cancellation of record.pendingPromptDispatches) {
 			cancellation.cancelled = true;
+			cancellation.wake();
 		}
 		const promptTurn = record.promptTurn;
 		// A turn whose cancel cleanup is still unwinding counts as in
@@ -2668,7 +2676,8 @@ export class AcpAgent implements Agent {
 			lifetimeUnsubscribe: undefined,
 			commandMetadataUnsubscribe: undefined,
 			lifetimeUpdatesReady: false,
-			pendingCompactionNotifications: undefined,
+			pendingLifetimeEvents: undefined,
+			lifetimeReplay: undefined,
 			subagentRelay: undefined,
 			asyncTaskRelay: undefined,
 			titleUnsubscribe: undefined,
@@ -2699,13 +2708,28 @@ export class AcpAgent implements Agent {
 	}
 
 	#handleLifetimeEvent(record: ManagedSessionRecord, event: AgentSessionEvent): void {
-		if (event.type === "goal_updated") {
-			this.#trackLifetimeDelivery(record, event.type, this.#pushGoalUpdate(record, event.goal));
+		const configOrGoal =
+			event.type === "thinking_level_changed" || event.type === "model_changed" || event.type === "goal_updated";
+		if (!record.lifetimeUpdatesReady && configOrGoal) return; // The bootstrap snapshot supplies these values.
+		const autonomous = !configOrGoal && !isPromptTurnInFlight(record.promptTurn);
+		if (!record.lifetimeUpdatesReady || record.lifetimeReplay) {
+			(record.pendingLifetimeEvents ??= []).push({ event, autonomous });
 			return;
 		}
-		if (event.type !== "thinking_level_changed" && event.type !== "model_changed" && !isPromptTurnInFlight(record.promptTurn)) {
-			this.#trackLifetimeDelivery(record, event.type, this.#handleAutonomousEvent(record, event));
+		this.#trackLifetimeDelivery(record, event.type, this.#dispatchLifetimeEvent(record, event, autonomous));
+	}
+
+	async #dispatchLifetimeEvent(
+		record: ManagedSessionRecord,
+		event: AgentSessionEvent,
+		autonomous: boolean,
+	): Promise<void> {
+		if (event.type === "goal_updated") {
+			await this.#pushGoalUpdate(record, event.goal);
+			return;
 		}
+		if (autonomous) await this.#handleAutonomousEvent(record, event);
+		if (record.closedError || this.#connection.signal.aborted) return;
 		const sessionId = record.protocolSessionId;
 		let notification: AcpCompactionNotification;
 		if (event.type === "auto_compaction_start") {
@@ -2728,33 +2752,36 @@ export class AcpAgent implements Agent {
 				},
 			};
 		} else {
-			if (
-				record.lifetimeUpdatesReady &&
-				(event.type === "thinking_level_changed" || event.type === "model_changed")
-			) {
-				this.#trackLifetimeDelivery(record, event.type, this.#pushConfigOptionUpdate(record));
+			if (event.type === "thinking_level_changed" || event.type === "model_changed") {
+				await this.#pushConfigOptionUpdate(record);
 			}
 			return;
 		}
-		// Compaction transitions cannot be rebuilt from a snapshot, so buffer them until delivery opens.
-		if (record.lifetimeUpdatesReady) this.#deliverCompactionNotification(record, notification);
-		else (record.pendingCompactionNotifications ??= []).push(notification);
-	}
-
-	#deliverCompactionNotification(record: ManagedSessionRecord, notification: AcpCompactionNotification): void {
-		this.#trackLifetimeDelivery(
-			record,
-			notification.method,
-			this.#connection.extNotification(notification.method, notification.params),
-		);
+		await this.#connection.extNotification(notification.method, notification.params);
 	}
 
 	#activateLifetimeUpdates(record: ManagedSessionRecord): void {
 		if (record.lifetimeUpdatesReady) return;
 		record.lifetimeUpdatesReady = true;
-		const pending = record.pendingCompactionNotifications;
-		record.pendingCompactionNotifications = undefined;
-		for (const notification of pending ?? []) this.#deliverCompactionNotification(record, notification);
+		if (!record.pendingLifetimeEvents?.length) return;
+		const replay = Promise.resolve().then(async () => {
+			while (record.pendingLifetimeEvents?.length) {
+				const { event, autonomous } = record.pendingLifetimeEvents.shift()!;
+				try {
+					await this.#dispatchLifetimeEvent(record, event, autonomous);
+				} catch (error) {
+					logger.warn("Failed to deliver ACP lifetime update", {
+						acpSessionId: record.protocolSessionId,
+						eventType: event.type,
+						error,
+					});
+				}
+			}
+			record.pendingLifetimeEvents = undefined;
+			record.lifetimeReplay = undefined;
+		});
+		record.lifetimeReplay = replay;
+		this.#trackLifetimeDelivery(record, "replay", replay);
 	}
 
 	#trackLifetimeDelivery(record: ManagedSessionRecord, eventType: string, delivery: Promise<void>): void {
@@ -2973,6 +3000,7 @@ export class AcpAgent implements Agent {
 		}
 		try {
 			await this.#forwardSessionEvent(record, event);
+			if (record.closedError || this.#connection.signal.aborted) return;
 			if (event.type === "agent_end") {
 				await this.#flushMissedFinalAssistantText(record, event);
 				await this.#flushUnreportedTurnError(record, event);
@@ -5457,6 +5485,7 @@ export class AcpAgent implements Agent {
 
 	async #closeManagedSession(sessionId: string, record: ManagedSessionRecord): Promise<void> {
 		record.closedError ??= RequestError.resourceNotFound(sessionId);
+		for (const cancellation of record.pendingPromptDispatches) cancellation.wake();
 		this.#sessions.delete(sessionId);
 		await this.#cancelPromptForClose(record);
 		await this.#disposeSessionRecord(record);
@@ -5479,7 +5508,7 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
-		record.pendingCompactionNotifications = undefined;
+		record.pendingLifetimeEvents = undefined;
 		record.titleUnsubscribe?.();
 		// Delivers the end of children still running before the session kills them,
 		// but a client that stops reading must not hold the close: this path is also

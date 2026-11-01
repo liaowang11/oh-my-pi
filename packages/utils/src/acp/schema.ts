@@ -78,7 +78,9 @@ const SessionUpdate = type({
 		"title?": "string | null | undefined",
 		"description?": "string | null | undefined",
 		"capabilities?": type("object").narrow(notArray).or("null | undefined"),
-		"state?": type({ state: "string", "stopReason?": "string | null | undefined" }).narrow(notArray).or("null | undefined"),
+		"state?": type({ state: "string", "stopReason?": "string | null | undefined" })
+			.narrow(notArray)
+			.or("null | undefined"),
 	})
 	.or({
 		sessionUpdate: "'session_message'",
@@ -92,7 +94,8 @@ const SessionUpdate = type({
 		sessionUpdate: "'plan_update'",
 		plan: type({ type: "'items'", planId: "string", entries: "unknown[]" })
 			.or({ type: "'file'", planId: "string", uri: "string" })
-			.or({ type: "'markdown'", planId: "string", content: "string" }).narrow(notArray),
+			.or({ type: "'markdown'", planId: "string", content: "string" })
+			.narrow(notArray),
 	})
 	.or({ sessionUpdate: "'plan_removed'", planId: "string" })
 	.or({ sessionUpdate: "'notice'", severity: "string", title: "string", "description?": "string | null | undefined" })

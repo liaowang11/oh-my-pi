@@ -733,6 +733,7 @@ async function createHarness(
 		clientCapabilities?: ClientCapabilities;
 		/** Runs before a notification is recorded, so a test can delay one delivery. */
 		sessionUpdateHook?: (notification: SessionNotification) => Promise<void> | void;
+		extNotificationHook?: (method: string) => void;
 		/** Gives each session the factory creates a real extension runner with no extensions. */
 		extensionRunners?: boolean;
 		/** Exposed to each created session's `modelRegistry` for MCP credential round-trips. */
@@ -777,6 +778,7 @@ async function createHarness(
 		},
 		extNotification: async (method: string, params: Record<string, unknown>) => {
 			extNotifications.push({ method, params });
+			options.extNotificationHook?.(method);
 		},
 		unstable_createElicitation: options.elicitationHandler
 			? async (req: CreateElicitationRequest, signal?: AbortSignal) => options.elicitationHandler!(req, signal)
@@ -1846,7 +1848,12 @@ describe("ACP agent", () => {
 	});
 
 	it("buffers compaction notifications until the client knows the session", async () => {
-		const harness = await createHarness();
+		const endDelivered = Promise.withResolvers<void>();
+		const harness = await createHarness({
+			extNotificationHook: method => {
+				if (method === "_omp/compaction/end") endDelivered.resolve();
+			},
+		});
 		vi.useFakeTimers();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
 		const session = harness.findSession(created.sessionId)!;
@@ -1858,7 +1865,7 @@ describe("ACP agent", () => {
 		expect(harness.extNotifications).toEqual([]);
 		await advanceBootstrapGuard();
 		emit({ type: "auto_compaction_end", action: "context-full", result: undefined, aborted: false, willRetry: true });
-		await Promise.resolve();
+		await endDelivered.promise;
 
 		expect(harness.extNotifications).toEqual([
 			{
@@ -2104,6 +2111,130 @@ describe("ACP agent", () => {
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
+
+	it("buffers autonomous chunks until the client knows the session", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const message = makeAssistantMessage("Early background result");
+		for (const listener of session.listeners()) {
+			listener({
+				type: "message_update",
+				message,
+				assistantMessageEvent: { type: "text_delta", delta: "Early background result" },
+			} as AgentSessionEvent);
+		}
+		await Promise.resolve();
+		expect(harness.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk")).toHaveLength(0);
+		await advanceBootstrapGuard();
+		await Promise.resolve();
+		const chunks = harness.updates.filter(update => update.update.sessionUpdate === "agent_message_chunk");
+		expect(chunks).toHaveLength(1);
+		expect(chunks[0]?.update).toEqual(
+			expect.objectContaining({ content: { type: "text", text: "Early background result" } }),
+		);
+		vi.useRealTimers();
+		harness.abortController.abort();
+	});
+
+	it("replays early autonomous events in order before starting a client prompt", async () => {
+		const held = Promise.withResolvers<void>();
+		const started = Promise.withResolvers<void>();
+		const order: string[] = [];
+		const harness = await createHarness({
+			sessionUpdateHook: async notification => {
+				const update = notification.update;
+				if (update.sessionUpdate !== "agent_message_chunk" || update.content.type !== "text") return;
+				if (update.content.text === "early") {
+					started.resolve();
+					await held.promise;
+				}
+				order.push(update.content.text);
+			},
+			extNotificationHook: method => order.push(method),
+		});
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const message = makeAssistantMessage("early");
+		const emit = (event: AgentSessionEvent) => {
+			for (const listener of session.listeners()) listener(event);
+		};
+		emit({
+			type: "message_update",
+			message,
+			assistantMessageEvent: { type: "text_delta", delta: "early" },
+		} as AgentSessionEvent);
+		emit({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+		emit({ type: "auto_compaction_end", action: "context-full", result: undefined, aborted: false, willRetry: true });
+		emit({ type: "agent_end", messages: [message] } as AgentSessionEvent);
+		const prompt = harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "next" }] });
+		await started.promise;
+		expect(session.promptCalls).toEqual([]);
+		const late = makeAssistantMessage("late");
+		emit({
+			type: "message_update",
+			message: late,
+			assistantMessageEvent: { type: "text_delta", delta: "late" },
+		} as AgentSessionEvent);
+		held.resolve();
+		expect((await prompt).stopReason).toBe("end_turn");
+		expect(order.slice(0, 4)).toEqual(["early", "_omp/compaction/start", "_omp/compaction/end", "late"]);
+		expect(session.promptCalls).toEqual(["next"]);
+		vi.useRealTimers();
+		harness.abortController.abort();
+	});
+
+	for (const action of ["cancel", "close"] as const) {
+		it(`${action} releases a prompt blocked behind lifetime replay`, async () => {
+			const held = Promise.withResolvers<void>();
+			const started = Promise.withResolvers<void>();
+			const harness = await createHarness({
+				sessionUpdateHook: async notification => {
+					const update = notification.update;
+					if (
+						update.sessionUpdate === "agent_message_chunk" &&
+						update.content.type === "text" &&
+						update.content.text === "held"
+					) {
+						started.resolve();
+						await held.promise;
+					}
+				},
+			});
+			vi.useFakeTimers();
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			const message = makeAssistantMessage("held");
+			for (const listener of session.listeners()) {
+				listener({
+					type: "message_update",
+					message,
+					assistantMessageEvent: { type: "text_delta", delta: "held" },
+				} as AgentSessionEvent);
+				listener({ type: "auto_compaction_start", reason: "threshold", action: "context-full" });
+			}
+			const prompt = harness.agent.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "next" }],
+			});
+			const outcome = prompt.then(
+				result => result.stopReason,
+				() => "closed",
+			);
+			await started.promise;
+			if (action === "cancel") await harness.agent.cancel({ sessionId: created.sessionId });
+			else await harness.agent.closeSession({ sessionId: created.sessionId });
+			expect(await outcome).toBe(action === "cancel" ? "cancelled" : "closed");
+			expect(session.promptCalls).toEqual([]);
+			held.resolve();
+			await Promise.resolve();
+			if (action === "close") expect(harness.extNotifications).toEqual([]);
+			vi.useRealTimers();
+			harness.abortController.abort();
+		});
+	}
 
 	it("forwards an agent-initiated turn that runs with no session/prompt in flight (#9157)", async () => {
 		// A background job finishing after `end_turn` makes AgentSession start a
