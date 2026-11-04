@@ -50,7 +50,14 @@ import { combine } from "./config/registry";
 import { cfgBashAutoBackgroundEnabled } from "./exec/settings";
 import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
-import { cfgTuiAutoGraph, cfgTuiReactions, cfgTuiRenderMermaid, cfgTuiRenderSvg } from "./modes/settings";
+import {
+	cfgAcpRenderMermaid,
+	cfgAcpRenderSvg,
+	cfgTuiAutoGraph,
+	cfgTuiReactions,
+	cfgTuiRenderMermaid,
+	cfgTuiRenderSvg,
+} from "./modes/settings";
 import { cfgSecretsEnabled } from "./secrets/settings";
 import { cfgToolsFormat } from "./session/context-settings";
 import {
@@ -91,6 +98,8 @@ export const cfgSystemPromptInputs = combine({
 	outEnabled: cfgOutEnabled,
 	renderMermaid: cfgTuiRenderMermaid,
 	renderSvg: cfgTuiRenderSvg,
+	acpRenderMermaid: cfgAcpRenderMermaid,
+	acpRenderSvg: cfgAcpRenderSvg,
 	autoGraph: cfgTuiAutoGraph,
 	reactions: cfgTuiReactions,
 	encourageEdits: cfgEncourageEdits,
