@@ -182,6 +182,7 @@ import {
 	mapSessionNoticeEvent,
 	newConfigWarningNotices,
 	noticeOrTranscriptUpdate,
+	recapNotice,
 	type SessionNotice,
 	textNotice,
 } from "./acp-notices";
@@ -2558,11 +2559,20 @@ export class AcpAgent implements Agent {
 	/**
 	 * Idle compaction, as Claude Code runs it: governed by the `compaction.idle*`
 	 * settings, held while a goal continuation is about to start. The idle recap
-	 * stays off, since an ACP client has nowhere to show it.
+	 * (`recap.*`) goes out as an info notice to a client that declares
+	 * `session.notices`; for any other client it stays off, since it has nowhere
+	 * to show one and the side turn would be paid for nothing.
 	 */
 	#enableIdleMaintenance(record: ManagedSessionRecord): void {
-		cfgRecapEnabled.override(record.session.settings, false);
-		record.session.enableIdleMaintenance({ scheduledTurn: () => record.goalContinuation.pendingTurns > 0 });
+		if (!clientSupportsNotices(this.#clientCapabilities)) cfgRecapEnabled.override(record.session.settings, false);
+		record.session.enableIdleMaintenance({
+			scheduledTurn: () => record.goalContinuation.pendingTurns > 0,
+			onRecap: recap => {
+				this.#sendSessionNotices(record, [recapNotice(recap)]).catch((error: unknown) => {
+					logger.debug("Failed to send ACP idle recap", { acpSessionId: record.protocolSessionId, error });
+				});
+			},
+		});
 	}
 
 	async #registerPreparedSession(

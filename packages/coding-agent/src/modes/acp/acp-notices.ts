@@ -94,6 +94,16 @@ export function textNotice(text: string, severity: SessionNoticeSeverity = "info
 }
 
 /**
+ * The info notice an idle recap reaches the client as. Only clients that
+ * declare `session.notices` get one: an idle agent message line would land in
+ * the transcript outside any turn.
+ */
+export function recapNotice(recap: string): SessionNotice {
+	const description = noticePlainText(recap).trim();
+	return { severity: "info", title: "Recap", ...(description ? { description } : {}) };
+}
+
+/**
  * The notice an `AgentSession` event carries, if any. `config_warnings_changed`
  * is not mapped here: it names no warning, so the caller diffs
  * `session.configWarnings` against what it already sent (see
