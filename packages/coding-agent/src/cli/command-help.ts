@@ -64,6 +64,10 @@ export const dryBalanceHelp = {
 	description: "Dry-run OAuth account balancing across random session ids",
 } satisfies CommandMetadata;
 
+export const figureHelp = {
+	description: "Draw a mermaid diagram or LaTeX math as terminal text, the way the TUI does",
+} satisfies CommandMetadata;
+
 export const galleryHelp = {
 	description: "Preview tool, composer, and status-line renderers in a deterministic visual gallery",
 } satisfies CommandMetadata;
