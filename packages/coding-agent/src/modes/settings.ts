@@ -483,6 +483,32 @@ export const cfgTuiRenderSvg = register({
 	},
 });
 
+export const cfgAcpRenderMermaid = register({
+	id: "acp.renderMermaid",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "ACP: Invite Mermaid Diagrams",
+		description:
+			"Invite the agent to draw Mermaid diagrams in ACP sessions. Turn on only when your ACP client renders them",
+	},
+});
+
+export const cfgAcpRenderSvg = register({
+	id: "acp.renderSvg",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "ACP: Invite SVG Figures",
+		description:
+			"Invite the agent to draw SVG figures in ACP sessions. Turn on only when your ACP client renders them",
+	},
+});
+
 export const cfgTuiAutoGraph = register({
 	id: "tui.autoGraph",
 	type: "enum",

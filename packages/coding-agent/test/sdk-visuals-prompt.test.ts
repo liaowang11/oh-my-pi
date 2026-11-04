@@ -9,7 +9,10 @@ import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manage
 import { TempDir } from "@oh-my-pi/pi-utils";
 
 /** The default system prompt of a session created with `options`. */
-async function promptFor(options: CreateAgentSessionOptions): Promise<string> {
+async function promptFor(
+	options: CreateAgentSessionOptions,
+	overrides: Readonly<Record<string, unknown>> = {},
+): Promise<string> {
 	using tempDir = TempDir.createSync("@omp-sdk-visuals-prompt-");
 	const cwd = tempDir.join("project");
 	const authStorage = await AuthStorage.create(":memory:");
@@ -19,7 +22,7 @@ async function promptFor(options: CreateAgentSessionOptions): Promise<string> {
 		agentDir: tempDir.join("agent"),
 		authStorage,
 		modelRegistry,
-		settings: Settings.isolated(),
+		settings: Settings.isolated(overrides),
 		sessionManager: SessionManager.inMemory(cwd),
 		model: getBundledModel("openai", "gpt-4o-mini"),
 		disableExtensionDiscovery: true,
@@ -54,6 +57,29 @@ describe("visuals guidance in the system prompt", () => {
 			expect(prompt).not.toContain("```mermaid");
 			expect(prompt).not.toContain("```svg");
 			expect(prompt).not.toContain("charts it underneath");
+		}
+	});
+
+	it("is offered to an ACP session per figure the user turned on for ACP clients", async () => {
+		const acpOn = { "acp.renderMermaid": true, "acp.renderSvg": true };
+
+		const both = await promptFor({ hasUI: true, acpTranscript: true }, acpOn);
+		expect(both).toContain("```mermaid");
+		expect(both).toContain("```svg");
+		// Table charts are a TUI-only feature; ACP never invites them.
+		expect(both).not.toContain("charts it underneath");
+
+		const mermaidOnly = await promptFor({ hasUI: true, acpTranscript: true }, { "acp.renderMermaid": true });
+		expect(mermaidOnly).toContain("```mermaid");
+		expect(mermaidOnly).not.toContain("```svg");
+
+		// Off by default, ignored outside ACP, and never reaches ACP subagents.
+		const acpDefault = await promptFor({ hasUI: true, acpTranscript: true });
+		const rpc = await promptFor({ hasUI: true }, acpOn);
+		const subagent = await promptFor({ hasUI: true, acpTranscript: true, taskDepth: 1 }, acpOn);
+		for (const prompt of [acpDefault, rpc, subagent]) {
+			expect(prompt).not.toContain("```mermaid");
+			expect(prompt).not.toContain("```svg");
 		}
 	});
 });

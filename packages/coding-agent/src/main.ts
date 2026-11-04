@@ -603,6 +603,8 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 			deferUsageReserveConfirmation: true,
 			// ACP clients show the session title, so name sessions like the TUI does.
 			autoTitle: true,
+			// Replies render in the ACP client; `acp.render*` settings pick the figures to invite.
+			acpTranscript: true,
 			enableMCP: false,
 			titleSystemPrompt,
 			eventBus,

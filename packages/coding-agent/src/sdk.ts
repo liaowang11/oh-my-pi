@@ -406,6 +406,8 @@ import { cfgDisabledProviders, cfgEnabledModels, cfgEnabledProviders, cfgModelRo
 import { cfgEditRecoverInlineEdits } from "./edit/settings";
 import { cfgGoalEnabled } from "./goals/settings";
 import {
+	cfgAcpRenderMermaid,
+	cfgAcpRenderSvg,
 	cfgImagesBlockImages,
 	cfgStartupQuiet,
 	cfgTuiReactions,
@@ -975,6 +977,12 @@ export interface CreateAgentSessionOptions {
 	 * Print, RPC, ACP and subagent sessions read replies as text. Default: false.
 	 */
 	tuiTranscript?: boolean;
+	/**
+	 * Replies render in an ACP client. The `acp.renderMermaid` / `acp.renderSvg` settings
+	 * then decide which figures the system prompt invites; table charts stay TUI-only.
+	 * Ignored for subagents and when `tuiTranscript` is set. Default: false.
+	 */
+	acpTranscript?: boolean;
 	/**
 	 * Name the unnamed session from the operator's messages once each reply begins
 	 * (see `title.generator`). Only the interactive TUI sets this; ignored for subagents. Default: false.
@@ -2402,6 +2410,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	const agentKind: AgentKind = isSubagentSession ? SUB_AGENT_RULE_NAME : MAIN_AGENT_RULE_NAME;
 	// Visuals (Mermaid, SVG figures, table charts) are drawn only in the top-level TUI transcript.
 	const tuiTranscript = options.tuiTranscript === true && !isSubagentSession;
+	const acpTranscript = options.acpTranscript === true && !tuiTranscript && !isSubagentSession;
 	const resolvedAgentName = (options.agentName ?? agentKind).trim().toLowerCase();
 
 	// Discover rules and bucket them in one pass to avoid repeated scans over large rule sets.
@@ -4439,8 +4448,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				includeModelInPrompt: cfgIncludeModelInPrompt.get(settings),
 				personality: agentKind === "sub" ? "none" : cfgPersonality.get(settings),
 				subagent: agentKind === "sub",
-				renderMermaid: tuiTranscript && cfgTuiRenderMermaid.get(settings),
-				renderSvg: tuiTranscript && cfgTuiRenderSvg.get(settings),
+				renderMermaid: tuiTranscript
+					? cfgTuiRenderMermaid.get(settings)
+					: acpTranscript && cfgAcpRenderMermaid.get(settings),
+				renderSvg: tuiTranscript ? cfgTuiRenderSvg.get(settings) : acpTranscript && cfgAcpRenderSvg.get(settings),
 				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(settings) !== "off",
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				activeRepoContext,
