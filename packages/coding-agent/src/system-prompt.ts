@@ -51,6 +51,8 @@ import { cfgBashAutoBackgroundEnabled } from "./exec/settings";
 import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
 import {
+	cfgAcpRenderMermaid,
+	cfgAcpRenderSvg,
 	cfgTuiAutoGraph,
 	cfgTuiReactions,
 	cfgTuiRenderEmbeds,
@@ -100,6 +102,8 @@ export const cfgSystemPromptInputs = combine({
 	renderMermaid: cfgTuiRenderMermaid,
 	renderSvg: cfgTuiRenderSvg,
 	renderEmbeds: cfgTuiRenderEmbeds,
+	acpRenderMermaid: cfgAcpRenderMermaid,
+	acpRenderSvg: cfgAcpRenderSvg,
 	autoGraph: cfgTuiAutoGraph,
 	reactions: cfgTuiReactions,
 	encourageEdits: cfgEncourageEdits,

@@ -120,3 +120,51 @@ describe("concurrent ACP sessions", () => {
 		}
 	});
 });
+
+describe("ACP session prompt", () => {
+	it("invites the figures the project turned on for ACP clients", async () => {
+		using launchDir = TempDir.createSync("@pi-acp-figures-launch-");
+		using projectDir = TempDir.createSync("@pi-acp-figures-project-");
+		await Bun.write(projectDir.join(".omp/config.yml"), "acp:\n  renderMermaid: true\n");
+		const launchSettings = await Settings.loadIsolated({ cwd: launchDir.path(), agentDir: launchDir.join("agent") });
+		const releaseLaunch = bindEffects(launchSettings);
+		const factory = createAcpSessionFactory({
+			baseOptions: {
+				agentDir: launchDir.join("agent"),
+				model,
+				disableExtensionDiscovery: true,
+				skills: [],
+				contextFiles: [],
+				promptTemplates: [],
+				slashCommands: [],
+				rules: [],
+				enableLsp: false,
+				skipPythonPreflight: true,
+			},
+			settings: launchSettings,
+			sessionDir: launchDir.join("sessions"),
+			authStorage,
+			modelRegistry,
+			parsedArgs: { invalidFlagValues: [] },
+			rawArgs: [],
+			createSession: createAgentSession,
+		});
+		const sessions: AgentSession[] = [];
+		try {
+			const figures = (await factory(projectDir.path())).session;
+			sessions.push(figures);
+			const plain = (await factory(launchDir.path())).session;
+			sessions.push(plain);
+			expect(figures.systemPrompt.join("\n")).toContain("```mermaid");
+			expect(figures.systemPrompt.join("\n")).not.toContain("```svg");
+			expect(plain.systemPrompt.join("\n")).not.toContain("```mermaid");
+		} finally {
+			for (const session of sessions.reverse()) {
+				if (!session.isDisposed) await session.dispose();
+			}
+			releaseLaunch();
+			launchSettings.cancelPendingSaves();
+			AgentStorage.close();
+		}
+	});
+});
