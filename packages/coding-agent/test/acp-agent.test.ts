@@ -77,6 +77,8 @@ import { TOOL_NAME as DELAYED_MCP_TOOL_NAME } from "./fixtures/delayed-tool-mcp"
 
 import { cfgGoalContinuationModes } from "@oh-my-pi/pi-coding-agent/goals/settings";
 import { cfgPlanAutosave, cfgPlanAutosaveDir, cfgPlanEnabled } from "@oh-my-pi/pi-coding-agent/plan-mode/settings";
+import { cfgComposerPredictions } from "@oh-my-pi/pi-coding-agent/modes/settings";
+import type { EphemeralTurnOptions, EphemeralTurnResult } from "@oh-my-pi/pi-coding-agent/session/agent-session-types";
 
 /** Validates an ACP wire payload against the in-house protocol schemas. */
 function expectAcpStructure(schema: Validator<unknown>, value: unknown): void {
@@ -397,6 +399,21 @@ class FakeAgentSession {
 			} as AgentSessionEvent);
 		}
 		this.isStreaming = false;
+		return true;
+	}
+
+	isCompacting = false;
+	/** Replies of the ephemeral side turns, in call order; a turn with none left fails. */
+	ephemeralReplies: string[] = [];
+	ephemeralPrompts: string[] = [];
+	async runEphemeralTurn(args: EphemeralTurnOptions): Promise<EphemeralTurnResult> {
+		this.ephemeralPrompts.push(args.promptText);
+		const replyText = this.ephemeralReplies.shift();
+		if (replyText === undefined) throw new Error("no ephemeral reply queued");
+		return { replyText, assistantMessage: makeAssistantMessage(replyText) } as EphemeralTurnResult;
+	}
+
+	ephemeralMaxTokensPreservesRequest(): boolean {
 		return true;
 	}
 
@@ -3256,6 +3273,51 @@ describe("ACP agent", () => {
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "two" }] });
 		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "three" }] });
 		expect(infoUpdates(titled)).toEqual(["Usage parity"]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("publishes the predicted next prompt as _meta.promptSuggestions and clears it on the next prompt", async () => {
+		const harness = await createHarness();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const suggestionUpdates = () =>
+			harness.updates
+				.filter(
+					update =>
+						update.sessionId === created.sessionId &&
+						update.update.sessionUpdate === "session_info_update" &&
+						update.update._meta?.promptSuggestions !== undefined,
+				)
+				.map(update => update.update._meta?.promptSuggestions);
+
+		// Off by default: no side turn is paid for and no update carries the key.
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "ping" }] });
+		await Bun.sleep(0);
+		expect(session.ephemeralPrompts).toEqual([]);
+		expect(suggestionUpdates()).toEqual([]);
+
+		cfgComposerPredictions.set(Settings.instance, true);
+		session.ephemeralReplies.push('"run the tests"');
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "fix it" }] });
+		await Bun.sleep(0);
+		expect(suggestionUpdates()).toEqual([{ suggestions: [{ text: "run the tests" }] }]);
+
+		// The next prompt clears the held suggestion before the turn's own output; this turn's
+		// model declines, so nothing replaces it.
+		session.ephemeralReplies.push("NO_PREDICTION");
+		const before = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "run the tests" }] });
+		await Bun.sleep(0);
+		expect(suggestionUpdates()).toEqual([{ suggestions: [{ text: "run the tests" }] }, { suggestions: [] }]);
+		const turnUpdates = harness.updates.slice(before).filter(update => update.sessionId === created.sessionId);
+		const clearIndex = turnUpdates.findIndex(update => update.update.sessionUpdate === "session_info_update");
+		const chunkIndex = turnUpdates.findIndex(update => update.update.sessionUpdate === "agent_message_chunk");
+		expect(clearIndex).toBeGreaterThanOrEqual(0);
+		expect(clearIndex).toBeLessThan(chunkIndex);
+		expect(session.ephemeralPrompts).toHaveLength(2);
+		expectAcpNotifications(harness.updates);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);

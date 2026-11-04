@@ -224,7 +224,9 @@ import { ACP_TERMINAL_AUTH_FLAG } from "./terminal-auth";
 import { cfgDisabledExtensions } from "../../extensibility/settings";
 import { cfgPlanEnabled } from "../../plan-mode/settings";
 import { cfgSessionWorktreeScope } from "../../session/settings";
-import { cfgRecapEnabled } from "../settings";
+import { PREDICTION_DEADLINE_MS, predictNextMessages } from "../controllers/composer-prediction-controller";
+import { cfgComposerPredictionAlternatives, cfgComposerPredictions, cfgRecapEnabled } from "../settings";
+import { promptSuggestionsMeta } from "./acp-prompt-suggestions";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
@@ -600,6 +602,11 @@ type ManagedSessionRecord = {
 	// The AIR goal snapshot (JSON) `#pushGoalUpdate` last sent, so an unchanged
 	// goal is not re-sent; `undefined` until one was sent.
 	sentGoal: string | undefined;
+	// The prompt suggestions (JSON) `#publishPromptSuggestions` last sent, so an
+	// unchanged list is not re-sent; `undefined` until one was sent.
+	sentPromptSuggestions: string | undefined;
+	// Aborts the next-prompt prediction running after the last turn, if any.
+	promptSuggestionAbort: AbortController | undefined;
 	// The `usage_update` values last sent, so a reading that did not change
 	// since the last assistant message, compaction, or bootstrap is not repeated.
 	sentUsage: string | undefined;
@@ -1618,6 +1625,11 @@ export class AcpAgent implements Agent {
 	async prompt(params: PromptRequest): Promise<PromptResponse> {
 		const record = this.#getSessionRecord(params.sessionId);
 		this.#activateLifetimeUpdates(record);
+		// The prediction answered the turn before this prompt; drop it before the new turn's updates.
+		// Awaited only when the client holds one, so a prompt without one keeps its microtask ordering.
+		record.promptSuggestionAbort?.abort();
+		record.promptSuggestionAbort = undefined;
+		if (record.sentPromptSuggestions !== undefined) await this.#clearPromptSuggestions(record);
 		const activeTurn = record.promptTurn;
 		// A `_session/steering` refusal (`promptRequired`) now only ever
 		// happens while no client prompt owns the turn (idle, or an
@@ -2689,6 +2701,8 @@ export class AcpAgent implements Agent {
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
 			sentGoal: undefined,
+			sentPromptSuggestions: undefined,
+			promptSuggestionAbort: undefined,
 			sentUsage: undefined,
 			sentRateLimits: new Map(),
 			rateLimitPush: undefined,
@@ -2919,7 +2933,67 @@ export class AcpAgent implements Agent {
 				return;
 			}
 			this.#finishPrompt(record, response);
+			if (response.stopReason === "end_turn") this.#startPromptSuggestions(record);
 		}
+	}
+
+	/**
+	 * With `composer.predictions` on, predict the prompt the user sends after the
+	 * turn that just ended and publish it as `_meta.promptSuggestions`. Runs off
+	 * the prompt turn, which has already settled; a later prompt aborts it.
+	 */
+	#startPromptSuggestions(record: ManagedSessionRecord): void {
+		record.promptSuggestionAbort?.abort();
+		record.promptSuggestionAbort = undefined;
+		const session = record.session;
+		if (!cfgComposerPredictions.get(session.settings)) return;
+		if (!session.model || session.isStreaming || session.isCompacting) return;
+		const abort = new AbortController();
+		record.promptSuggestionAbort = abort;
+		const run = async () => {
+			try {
+				const choices = await predictNextMessages(session, {
+					alternatives: cfgComposerPredictionAlternatives.get(session.settings),
+					signal: AbortSignal.any([abort.signal, AbortSignal.timeout(PREDICTION_DEADLINE_MS)]),
+					// The journal id: the protocol session id can differ from it after a rekey.
+					usageTarget: {
+						sessionId: session.sessionManager.getSessionId(),
+						parentId: session.sessionManager.getLeafId(),
+					},
+				});
+				// A prompt or an agent-started turn since the request makes the prediction stale.
+				if (abort.signal.aborted || record.promptTurn || session.isStreaming || !choices) return;
+				await this.#publishPromptSuggestions(record, choices);
+			} catch (error) {
+				if (!abort.signal.aborted) {
+					logger.debug("ACP prompt suggestion failed", {
+						acpSessionId: record.protocolSessionId,
+						error: String(error),
+					});
+				}
+			} finally {
+				if (record.promptSuggestionAbort === abort) record.promptSuggestionAbort = undefined;
+			}
+		};
+		void run();
+	}
+
+	/** Clear the prediction the client holds; a failed delivery does not fail the prompt. */
+	async #clearPromptSuggestions(record: ManagedSessionRecord): Promise<void> {
+		await this.#publishPromptSuggestions(record, []).catch((error: unknown) => {
+			logger.debug("Failed to clear ACP prompt suggestion", { acpSessionId: record.protocolSessionId, error });
+		});
+	}
+
+	/** Sends `choices` as `_meta.promptSuggestions`, unless the client already has them; `[]` clears. */
+	async #publishPromptSuggestions(record: ManagedSessionRecord, choices: readonly string[]): Promise<void> {
+		const sent = choices.length === 0 ? undefined : JSON.stringify(choices);
+		if (sent === record.sentPromptSuggestions) return;
+		record.sentPromptSuggestions = sent;
+		await this.#connection.sessionUpdate({
+			sessionId: record.protocolSessionId,
+			update: { sessionUpdate: "session_info_update", _meta: promptSuggestionsMeta(choices) },
+		});
 	}
 
 	/**
@@ -5517,6 +5591,8 @@ export class AcpAgent implements Agent {
 		record.commandMetadataUnsubscribe?.();
 		record.pendingLifetimeEvents = undefined;
 		record.titleUnsubscribe?.();
+		record.promptSuggestionAbort?.abort();
+		record.promptSuggestionAbort = undefined;
 		// Delivers the end of children still running before the session kills them,
 		// but a client that stops reading must not hold the close: this path is also
 		// the fallback when cancel cleanup times out.

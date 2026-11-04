@@ -28,7 +28,7 @@ export const MAX_PREDICTION_CHOICES = 4;
  */
 const PREDICTION_MAX_TOKENS = 1024;
 /** A prediction that has not arrived by then is no longer worth paying for or showing. */
-const PREDICTION_DEADLINE_MS = 15_000;
+export const PREDICTION_DEADLINE_MS = 15_000;
 /** Usage-ledger purpose, so session totals and `/stats` include prediction requests. */
 const USAGE_PURPOSE = "composer-prediction";
 /** One pair of double quotes or backticks around the whole reply. */
@@ -122,6 +122,59 @@ function parseReply(reply: string, alternatives: boolean): string[] | undefined 
 	if (alternatives) return parseComposerPredictions(reply, MAX_PREDICTION_CHOICES);
 	const text = parseComposerPrediction(reply);
 	return text === undefined ? undefined : [text];
+}
+
+/** The session surface a next-message prediction runs on. */
+export type PredictionSession = Pick<
+	AgentViewSession,
+	"runEphemeralTurn" | "ephemeralMaxTokensPreservesRequest" | "sessionManager"
+>;
+
+/**
+ * Run the prediction side turn on `session`'s model and context (the same prompt prefix, so it reads
+ * the prompt cache) and return the user's likely next messages, most likely first, or `undefined`
+ * when the model skipped or replied with nothing usable. The request's usage is recorded under
+ * `usageTarget` (the journal session id and the entry it branched from) even when the caller no
+ * longer wants the reply. Throws when the request fails or `signal` aborts it.
+ */
+export async function predictNextMessages(
+	session: PredictionSession,
+	options: { alternatives: boolean; signal: AbortSignal; usageTarget: { sessionId: string; parentId: string | null } },
+): Promise<string[] | undefined> {
+	const { replyText, assistantMessage } = await session.runEphemeralTurn({
+		promptText: prompt.render(composerPredictionPrompt, {
+			skip: SKIP_REPLY,
+			choices: options.alternatives ? MAX_PREDICTION_CHOICES : undefined,
+		}),
+		maxTokens: session.ephemeralMaxTokensPreservesRequest() ? PREDICTION_MAX_TOKENS : undefined,
+		minimizeEffort: true,
+		signal: options.signal,
+	});
+	// Paid for even when the reply arrives too late to show.
+	recordUsage(session, options.usageTarget, assistantMessage);
+	return parseReply(replyText, options.alternatives);
+}
+
+function recordUsage(
+	session: PredictionSession,
+	target: { sessionId: string; parentId: string | null },
+	message: AssistantMessage,
+): void {
+	try {
+		session.sessionManager.appendModelUsage(
+			{
+				purpose: USAGE_PURPOSE,
+				api: message.api,
+				provider: message.provider,
+				model: message.model,
+				usage: message.usage,
+				stopReason: message.stopReason,
+			},
+			target,
+		);
+	} catch (error) {
+		logger.debug("Failed to persist composer prediction usage", { error: String(error) });
+	}
 }
 
 /**
@@ -235,18 +288,11 @@ export class ComposerPredictionController {
 		let outcome: PredictionOutcome;
 		let offered: number | undefined;
 		try {
-			const { replyText, assistantMessage } = await source.session.runEphemeralTurn({
-				promptText: prompt.render(composerPredictionPrompt, {
-					skip: SKIP_REPLY,
-					choices: alternatives ? MAX_PREDICTION_CHOICES : undefined,
-				}),
-				maxTokens: source.session.ephemeralMaxTokensPreservesRequest() ? PREDICTION_MAX_TOKENS : undefined,
-				minimizeEffort: true,
+			const choices = await predictNextMessages(source.session, {
+				alternatives,
 				signal: AbortSignal.any([abort.signal, deadline]),
+				usageTarget: { sessionId: source.sessionId, parentId: source.leafId },
 			});
-			// Paid for even when the reply arrives too late to show.
-			this.#recordUsage(source, assistantMessage);
-			const choices = parseReply(replyText, alternatives);
 			outcome = this.#offer(source, abort, choices);
 			if (outcome === "offered") offered = choices?.length;
 		} catch (error) {
@@ -267,24 +313,6 @@ export class ComposerPredictionController {
 		this.#prediction = { choices, source, shownAt: undefined, acceptDelayMs: undefined, rank: undefined };
 		this.#ctx.ui.requestRender();
 		return "offered";
-	}
-
-	#recordUsage(source: PredictionSource, message: AssistantMessage): void {
-		try {
-			source.session.sessionManager.appendModelUsage(
-				{
-					purpose: USAGE_PURPOSE,
-					api: message.api,
-					provider: message.provider,
-					model: message.model,
-					usage: message.usage,
-					stopReason: message.stopReason,
-				},
-				{ sessionId: source.sessionId, parentId: source.leafId },
-			);
-		} catch (error) {
-			logger.debug("Failed to persist composer prediction usage", { error: String(error) });
-		}
 	}
 
 	#isCurrent(source: PredictionSource): boolean {
