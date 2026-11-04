@@ -1,8 +1,8 @@
 /**
- * Contract: an ACP session opts in to idle maintenance the way Claude Code
- * does it, compaction only. A session left idle over the idle threshold is
- * compacted after the idle delay; it never asks the model for an idle recap,
- * which an ACP client has nowhere to show.
+ * Contract: an ACP session opts in to idle maintenance. A session left idle
+ * over the idle threshold is compacted after the idle delay. The idle recap
+ * reaches a client that declares session notices as an info notice; any other
+ * client has nowhere to show it, so the model is never asked for one.
  */
 import { afterEach, beforeEach, describe, expect, it, vi } from "bun:test";
 import * as fs from "node:fs";
@@ -20,7 +20,7 @@ import { convertToLlm } from "@oh-my-pi/pi-coding-agent/session/messages";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { removeSyncWithRetries, setAgentDir } from "@oh-my-pi/pi-utils";
-import type { AgentSideConnection, SessionNotification } from "@oh-my-pi/pi-utils/acp";
+import type { AgentSideConnection, ClientCapabilities, SessionNotification } from "@oh-my-pi/pi-utils/acp";
 import { createInMemoryAuthStorage } from "./helpers/agent-session-setup";
 import { drive, driveTurn, elapse, flush, until, wait } from "./helpers/fake-clock";
 import { beginSettingsTest, restoreSettingsTestState, type SettingsTestState } from "./helpers/settings-test-state";
@@ -58,13 +58,16 @@ describe("ACP idle maintenance", () => {
 		removeSyncWithRetries(root);
 	});
 
-	it("compacts an idle session over the threshold and never requests a recap", async () => {
+	async function startIdleSession(clientCapabilities: ClientCapabilities) {
 		const main = createMockModel({ handler: { content: ["Work finished."], usage: { input: 5_000, output: 20 } } });
-		const side = createMockModel({ handler: { content: ["A recap."] } });
+		const side = createMockModel({ handler: { content: ["Shipping the parser fix; next, run the suite."] } });
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5");
 		if (!model) throw new Error("Expected built-in anthropic model to exist");
+		const updates: SessionNotification[] = [];
 		const connection = {
-			sessionUpdate: async (_notification: SessionNotification) => {},
+			sessionUpdate: async (notification: SessionNotification) => {
+				updates.push(notification);
+			},
 			signal: new AbortController().signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
@@ -90,7 +93,7 @@ describe("ACP idle maintenance", () => {
 			sessions.push(session);
 			return session;
 		});
-		await wait(agent.initialize({ protocolVersion: 1, clientCapabilities: {} }));
+		await wait(agent.initialize({ protocolVersion: 1, clientCapabilities }));
 		const { sessionId } = await wait(agent.newSession({ cwd: path.join(root, "cwd"), mcpServers: [] }));
 		const session = sessions.find(candidate => candidate.sessionId === sessionId)!;
 		const compaction = vi.spyOn(session, "runIdleCompaction").mockResolvedValue(undefined);
@@ -98,9 +101,29 @@ describe("ACP idle maintenance", () => {
 		await driveTurn(session, agent.prompt({ sessionId, prompt: [{ type: "text", text: "please work" }] }));
 		await wait(session.waitForIdle());
 		await flush();
+		return { side, updates, compaction };
+	}
+
+	it("compacts an idle session over the threshold and never requests a recap without session.notices", async () => {
+		const { side, compaction } = await startIdleSession({});
 		await elapse(COMPACTION_SECONDS * 1000);
 		await until(() => compaction.mock.calls.length === 1, "the idle compaction pass");
 
 		expect(side.calls).toHaveLength(0);
+	});
+
+	it("sends the idle recap as an info notice to a client that declares session.notices", async () => {
+		const { side, updates } = await startIdleSession({ session: { notices: {} } });
+		const recapNotices = () => updates.filter(({ update }) => update.sessionUpdate === "notice");
+		await elapse(RECAP_SECONDS * 1000);
+		await until(() => recapNotices().length === 1, "the idle recap notice");
+
+		expect(side.calls).toHaveLength(1);
+		expect(recapNotices()[0].update).toEqual({
+			sessionUpdate: "notice",
+			severity: "info",
+			title: "Recap",
+			description: "Shipping the parser fix; next, run the suite.",
+		});
 	});
 });
