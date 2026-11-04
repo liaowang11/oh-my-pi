@@ -130,6 +130,11 @@ export const commands: CommandEntry[] = [
 		help: commandHelp.grepHelp,
 	},
 	{
+		name: "figure",
+		load: () => import("./commands/figure").then(m => m.default),
+		help: commandHelp.figureHelp,
+	},
+	{
 		name: "gallery",
 		load: () => import("./commands/gallery").then(m => m.default),
 		help: commandHelp.galleryHelp,

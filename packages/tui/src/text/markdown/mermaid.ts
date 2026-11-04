@@ -70,11 +70,23 @@ function layoutOf(art: string, authored: boolean): Layout {
 
 /** The rows of a Mermaid diagram fitted to `width`, or undefined when the source does not render. */
 export function mermaidRows(source: string, width: number, theme: Theme): string[] | undefined {
+	return fittedRows(source, width, themedOptions(theme));
+}
+
+/**
+ * Uncolored rows of a Mermaid diagram, fitted to `width` when one is given (the
+ * authored layout otherwise), or undefined when the source does not render.
+ */
+export function mermaidPlainRows(source: string, width?: number): string[] | undefined {
+	return fittedRows(source, width, { colorMode: "none" });
+}
+
+function fittedRows(source: string, width: number | undefined, options: MermaidRenderOptions): string[] | undefined {
 	const normalized = source.replace(/\r\n?/g, "\n").trim();
 	if (!normalized) return undefined;
-	const options = themedOptions(theme);
 	const authored = render(normalized, options);
 	if (authored === null) return undefined;
+	if (width === undefined) return authored.split("\n");
 	const candidates = [layoutOf(authored, true)];
 	for (const direction of forcedDirections(normalized)) {
 		const art = render(normalized, { ...options, direction });
