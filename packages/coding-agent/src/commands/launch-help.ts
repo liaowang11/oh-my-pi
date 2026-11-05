@@ -148,6 +148,8 @@ export const launchHelp = {
 				"Draw the composer before startup finishes: on (default; skipped when other flags or a --config overlay would change that frame), off, or force",
 			options: [...PREPAINT_MODES],
 		}),
+		name: Flags.string({ description: "Name this session for cross-session messaging" }),
+		"cross-session": Flags.boolean({ description: "Enable cross-session messaging for this run" }),
 		"no-ui": Flags.boolean({
 			description: "With --mode rpc or rpc-ui: run extensions headless (rpc-ui tool UI remains enabled)",
 		}),

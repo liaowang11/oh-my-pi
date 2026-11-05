@@ -29,6 +29,8 @@ import { LspTool } from "../lsp/tool";
 import type { MCPManagerApi, MCPToolScope } from "../mcp";
 import { MEMORY_BACKEND_TOOL_NAMES } from "../memory-backend/tool-names";
 import type { MnemopiSessionState } from "../mnemopi/state";
+import type { MessagingService } from "../messaging/service";
+import type { AgentSession } from "../session/agent-session";
 import type { PlanModeState } from "../plan-mode/state";
 import type { CallContext, SpotlightSession } from "../spotlight/types";
 import type { AgentLifecycleApi } from "../registry/agent-lifecycle";
@@ -174,6 +176,9 @@ export interface FileChangeReport {
 
 /** Session context for tool factories */
 export interface ToolSession {
+	/** Cross-session capabilities of this caller only; never inherited from its parent. */
+	messaging?: MessagingService;
+	messagingSession?: AgentSession;
 	/** Current working directory */
 	cwd: string;
 	/** Agent-owned database references, released independently from other sessions. */

@@ -94,6 +94,7 @@ import {
 	type MarketplaceAutoUpdateOptions,
 } from "./extensibility/plugins/marketplace-auto-update";
 import type { MCPManager } from "./mcp";
+import { cfgMessagingEnabled } from "./messaging/settings";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import { offerForeignConfigMigration, pendingForeignConfigMigration } from "./modes/foreign-config-migration";
 import { formatSessionContinuationNotice } from "./modes/persistence-failure";
@@ -156,6 +157,7 @@ import { resolveFirstLaunchPythonEvalWarning } from "./eval/startup-warning";
 import { CliUsageError } from "./cli/usage-error";
 import type * as GcAutoCompress from "./cli/gc-auto-compress";
 import { cfgGcAutoCompress } from "./cli/gc-settings";
+import { isReservedAddress, RESERVED_SESSION_NAME_ERROR } from "./messaging/names";
 import { cfgGoalEnabled } from "./goals/settings";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "./plan-mode/settings";
 
@@ -559,6 +561,7 @@ interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 	eventBus: EventBus;
+	name?: string;
 }
 
 type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
@@ -576,7 +579,15 @@ export interface AcpSessionFactoryOptions {
 	modelRegistry: ModelRegistry;
 	parsedArgs: Pick<
 		Args,
-		"apiKey" | "trustedExtensions" | "tools" | "invalidFlagValues" | "model" | "models" | "thinking"
+		| "apiKey"
+		| "trustedExtensions"
+		| "tools"
+		| "invalidFlagValues"
+		| "model"
+		| "models"
+		| "thinking"
+		| "crossSession"
+		| "name"
 	>;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
@@ -646,6 +657,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
 		const hydrateStartupModelCaches = args.modelRegistry.createStartupModelCacheHydrator();
+		if (args.parsedArgs.crossSession) cfgMessagingEnabled.override(nextSettings, true);
 		const nextOptions = { ...args.baseOptions, hydrateStartupModelCaches };
 		if (args.parsedArgs.models === undefined) {
 			const scope = await resolveScopedModels(
@@ -753,7 +765,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				error => logger.warn("Scoped model rebuild after discovery failed", { error: String(error) }),
 			);
 		}
-		return { session: nextSession, setToolUIContext, eventBus };
+		return { session: nextSession, setToolUIContext, eventBus, name: args.parsedArgs.name };
 	};
 }
 
@@ -779,6 +791,7 @@ async function runInteractiveMode(
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
 	modelFallbackMessage?: string,
+	startupName?: string,
 ): Promise<void> {
 	// Captured before setup: the setup wizard may replace the model the fallback warning describes.
 	const modelBeforeSetup = session.model;
@@ -859,6 +872,7 @@ async function runInteractiveMode(
 					foreignConfigTools.length === 0 &&
 					!(offersStartupWorktree && mode.mayAskForStartupWorktree()) &&
 					(startupGoal !== undefined || initialMessage !== undefined || initialMessages.length > 0),
+				name: startupName,
 			}),
 		);
 
@@ -2024,6 +2038,12 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	if (parsed.name !== undefined && isReservedAddress(parsed.name.trim())) {
+		throw new CliUsageError(RESERVED_SESSION_NAME_ERROR);
+	}
+	// A child omp process must never inherit another session's script credentials.
+	delete process.env.OMP_MESSAGING_SOCKET;
+	delete process.env.OMP_MESSAGING_TOKEN;
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
@@ -2176,6 +2196,7 @@ export async function runRootCommand(
 			process.exit(1);
 		}
 
+		if (parsedArgs.crossSession) cfgMessagingEnabled.override(settingsInstance, true);
 		if (parsedArgs.approvalMode) {
 			// Runtime override (not persisted): every `tools.approvalMode` read downstream
 			// sees this value. The wrapper still honours --auto-approve / --yolo on top of it.
@@ -3132,6 +3153,7 @@ export async function runRootCommand(
 					subagentEventBus,
 					mcpManager,
 					input: rpcInput,
+					name: parsedArgs.name,
 				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
@@ -3189,6 +3211,7 @@ export async function runRootCommand(
 								}
 							: undefined,
 						modelFallbackMessage,
+						parsedArgs.name,
 					);
 				} finally {
 					startupLease?.dispose();
@@ -3209,6 +3232,7 @@ export async function runRootCommand(
 					planYolo: parsedArgs.planYolo,
 					mcpManager,
 					deadline: sessionOptions.deadline,
+					name: parsedArgs.name,
 				});
 				if ($env.PI_TIMING) {
 					logger.printTimings("print batch complete, including prompts");

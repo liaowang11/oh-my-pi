@@ -966,3 +966,29 @@ describe("ExtensionUiController OSC 7501 run status", () => {
 		expect(await answer).toBeUndefined();
 	});
 });
+
+it("starts cross-session approval expiry only after its queued selector mounts", async () => {
+	const h = makeHarness();
+	const blocker = h.controller.showHookInput("Blocking input");
+	const view = { from: { name: "alpha", shortId: "aaaaaaaa", address: "alpha", cwd: "/project" }, body: "Approve me" };
+	const abort = new AbortController();
+	const presented = vi.fn();
+	const approval = h.controller.askCrossSessionApproval(view, abort.signal, presented);
+	expect(presented).not.toHaveBeenCalled();
+	h.term.press("enter");
+	await blocker;
+	expect(presented).toHaveBeenCalledTimes(1);
+	expect(h.composerFocused()).toBe(false);
+	h.term.press("enter");
+	expect(await approval).toBe("approve");
+
+	const secondBlocker = h.controller.showHookInput("Second blocker");
+	const queuedAbort = new AbortController();
+	const skipped = vi.fn();
+	const queued = h.controller.askCrossSessionApproval(view, queuedAbort.signal, skipped);
+	queuedAbort.abort();
+	expect(await queued).toBeUndefined();
+	h.term.press("enter");
+	await secondBlocker;
+	expect(skipped).not.toHaveBeenCalled();
+});

@@ -40,6 +40,8 @@ import { memoryStatsUnavailableMessage, resolveMemoryBackend } from "../../memor
 import { jobDisplayLabel } from "../../async/job-label";
 import { promptCacheDetails } from "../view-model/status-line/prompt-cache";
 import { type MoveOverlayResult } from "../view-model/overlays/move-overlay";
+import { claimSessionName, isReservedAddress, RESERVED_SESSION_NAME_ERROR } from "../../messaging/names";
+import { cleanSessionTitle } from "../../session/session-title-slot";
 import { moveDirectorySource } from "../move-directory-source";
 import type { InteractiveModeContext } from "../../modes/types";
 import { continuesConversation } from "../utils/conversation-position";
@@ -1918,6 +1920,10 @@ export class CommandController {
 	}
 
 	async handleRenameCommand(title: string): Promise<void> {
+		if (isReservedAddress(title.trim())) {
+			this.ctx.showError(RESERVED_SESSION_NAME_ERROR);
+			return;
+		}
 		const session = this.ctx.session;
 		const sessionManager = this.ctx.sessionManager;
 		const sessionId = sessionManager.getSessionId();
@@ -1929,7 +1935,14 @@ export class CommandController {
 			!signal.aborted &&
 			sessionManager.getSessionId() === sessionId &&
 			sessionManager.titleRevision === titleRevision;
+		// The collision note compares against the spelling the session manager stores.
+		const requested = cleanSessionTitle(title);
 		try {
+			if (session.messaging) {
+				const taken = new Set((await session.messaging.listSessions()).flatMap(s => (s.name ? [s.name] : [])));
+				if (!isCurrent()) return;
+				title = claimSessionName(requested, taken);
+			}
 			const persistence = sessionManager.setSessionName(title, "user");
 			titleRevision = sessionManager.titleRevision;
 			const stored = await persistence;
@@ -1939,7 +1952,8 @@ export class CommandController {
 				return;
 			}
 			const name = sessionManager.getSessionName()!;
-			this.ctx.showStatus(`Session renamed to "${name}".`);
+			const collision = name !== requested ? ` ("${requested}" is used by another session)` : "";
+			this.ctx.showStatus(`Session renamed to "${name}".${collision}`);
 		} catch (err) {
 			if (!isCurrent()) return;
 			this.ctx.showError(`Rename failed: ${err instanceof Error ? err.message : String(err)}`);

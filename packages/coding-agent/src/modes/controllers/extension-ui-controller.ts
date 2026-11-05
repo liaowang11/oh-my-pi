@@ -6,6 +6,9 @@ import { widgetContext, widgetFor } from "@oh-my-pi/pi-tui/term/widgets";
 import { currentTheme } from "@oh-my-pi/pi-tui/theme/runtime";
 import type { CollabUiRequestDraft, CollabUiSelectItem } from "@oh-my-pi/pi-wire";
 import type { CollabHost } from "../../collab/host";
+import type { HeldMessageView } from "../../messaging/service";
+import { peerDisplayText } from "../../messaging/names";
+import { sanitizeText } from "@oh-my-pi/pi-utils";
 import type {
 	CompactOptions,
 	ExtensionActions,
@@ -63,7 +66,7 @@ import { registerComposerShape } from "../../ui/styles/composer/shapes";
 import { getAvailableThemesWithPaths, getThemeByName, setTheme } from "../../ui/theme/service";
 import { AnsiText } from "../../ui/transcript/ansi-text";
 import { getEditorCommand, openInEditor } from "../../utils/external-editor";
-import { disambiguateDisplayLabels, sanitizeCarriageReturns } from "../../utils/render-utils";
+import { disambiguateDisplayLabels, previewLine, sanitizeCarriageReturns } from "../../utils/render-utils";
 import { type BlockedKind, type BlockedStatus, holdBlockedStatus } from "../../utils/run-status";
 import { setExtensionTerminalTitle, setSessionTerminalTitle } from "../../utils/title-generator";
 import {
@@ -1434,6 +1437,27 @@ export class ExtensionUiController {
 		return typeof result.value === "string" ? { kind: "answered", value: result.value } : { kind: "cancelled" };
 	}
 
+	async askCrossSessionApproval(
+		view: HeldMessageView,
+		signal: AbortSignal,
+		onPresented: () => void,
+	): Promise<"approve" | "deny" | undefined> {
+		if (signal.aborted) return undefined;
+		const preview = sanitizeText(sanitizeCarriageReturns(view.body))
+			.split("\n")
+			.slice(0, 12)
+			.map(line => previewLine(line, 512))
+			.join("\n");
+		const result = await this.showHookSelector(
+			`Message from another session: @${peerDisplayText(view.from.address)}\n------------\n${preview}\n------------`,
+			[{ label: "Approve" }, { label: "Deny" }],
+			{ signal },
+			{ onPresented, kind: "permission" },
+		);
+		if (signal.aborted) return undefined;
+		return result === "Approve" ? "approve" : result === "Deny" ? "deny" : undefined;
+	}
+
 	/**
 	 * Show a selector for hooks; it reports a `question` unless `extra.kind` says otherwise.
 	 */
@@ -1441,7 +1465,7 @@ export class ExtensionUiController {
 		title: string,
 		options: ExtensionUISelectItem[],
 		dialogOptions?: InteractiveSelectorDialogOptions,
-		extra?: { slider?: HookSelectorSlider; kind?: BlockedKind },
+		extra?: { slider?: HookSelectorSlider; kind?: BlockedKind; onPresented?: () => void },
 	): Promise<string | undefined> {
 		return this.#presentDialog({ kind: extra?.kind ?? "question", msg: title }, dialogOptions?.signal, settle => {
 			const maxVisible = Math.max(4, Math.min(15, this.ctx.shell.size().rows - 12));
@@ -1483,6 +1507,7 @@ export class ExtensionUiController {
 					}),
 				focusKind("picker", "list"),
 			);
+			extra?.onPresented?.();
 			return () => this.hideHookSelector();
 		});
 	}
@@ -1735,7 +1760,7 @@ export class ExtensionUiController {
 	}
 
 	async #updateSessionName(name: string): Promise<void> {
-		await this.ctx.sessionManager.setSessionName(name, "user");
+		await this.ctx.session.setSessionName(name, "user");
 	}
 
 	/**

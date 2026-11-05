@@ -43,6 +43,7 @@ function failingResyncContext(): InteractiveModeContext {
 	const ctx = createInteractiveModeContext({
 		session: {
 			switchSession: () => Promise.resolve(true),
+			suspendMessagingReceiving: () => () => {},
 			agent: { setModel: () => {}, setThinkingLevel: () => {}, setDisableReasoning: () => {} },
 		},
 		syncRunningSubagentBadge: () => {},

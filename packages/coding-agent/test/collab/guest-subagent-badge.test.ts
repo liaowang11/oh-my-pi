@@ -55,6 +55,7 @@ function makeGuestContext(): { ctx: InteractiveModeContext; subagentCount: () =>
 			getCwd: () => "/local",
 		},
 		session: {
+			suspendMessagingReceiving: () => () => {},
 			messages: [],
 			switchSession: () => Promise.resolve(),
 			newSession: () => Promise.resolve(),

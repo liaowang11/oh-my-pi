@@ -18,7 +18,7 @@ import type { ImageContent, Model } from "@oh-my-pi/pi-ai";
 import { getOAuthProviders } from "@oh-my-pi/pi-ai/oauth";
 import { toolWireSchema } from "@oh-my-pi/pi-ai/utils/schema";
 import { routedModelsAreEqual } from "@oh-my-pi/pi-catalog/models";
-import { $env, isRecord, logger, Snowflake, toError } from "@oh-my-pi/pi-utils";
+import { $env, isRecord, logger, postmortem, Snowflake, toError } from "@oh-my-pi/pi-utils";
 import { clearPluginRootsAndCaches, resolveActiveProjectRegistryPath } from "../../discovery/helpers";
 import {
 	type ExtensionAskDialogQuestion,
@@ -63,6 +63,8 @@ import { disposeLocalMcpHost } from "../../mcp/host/local";
 import type { MCPManager } from "../../mcp/manager";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { RestoredQueuedMessage } from "../../session/agent-session-types";
+import { bindSessionMessaging } from "../../session/messaging-host";
+import { claimSessionName } from "../../messaging/names";
 import { CACHE_WARMING_MODES } from "../../session/cache-warmer";
 import { findMostRecentNonEmptySession, findRecentSessionContinuation } from "../../session/session-listing";
 import { probeSessionLeases } from "../../session/session-storage";
@@ -1549,6 +1551,7 @@ export interface RpcModeOptions {
 	headless?: boolean;
 	subagentEventBus?: EventBus;
 	input?: ReadableStream<Uint8Array>;
+	name?: string;
 	/** Builds `live_start` sessions; defaults to the real {@link LiveSessionController}. */
 	createLiveSession?: RpcLiveSessionFactory;
 	/** Builds the native speech controller; tests may substitute the capture boundary. */
@@ -1562,6 +1565,27 @@ export interface RpcModeOptions {
  * Listens for JSON commands on stdin, outputs events and responses on stdout.
  */
 export async function runRpcMode(session: AgentSession, options: RpcModeOptions = {}): Promise<never> {
+	const messaging = await bindSessionMessaging(session, { directPrint: false });
+	const cancelMessagingTeardown = postmortem.register("rpc-mode-messaging", () => messaging.dispose());
+	try {
+		if (options.name !== undefined) {
+			const taken = new Set(
+				(await session.messaging?.listSessions())?.flatMap(item => (item.name === null ? [] : [item.name])),
+			);
+			await session.sessionManager.setSessionName(claimSessionName(options.name, taken), "user");
+		}
+		return await runRpcModeCore(session, options, messaging);
+	} finally {
+		cancelMessagingTeardown();
+		await messaging.dispose();
+	}
+}
+
+async function runRpcModeCore(
+	session: AgentSession,
+	options: RpcModeOptions,
+	messaging: { ready(): void; dispose(): Promise<void> },
+): Promise<never> {
 	const modelPicker = new RpcModelPicker(session);
 	const {
 		setToolUIContext,
@@ -1589,8 +1613,9 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 	const outputWriter = new RpcOutputWriter(stdout, failure => {
 		logger.error("RPC output delivery failed", { error: String(failure) });
 		dictationBridge?.dispose();
-		void session
+		void messaging
 			.dispose()
+			.then(() => session.dispose())
 			.finally(() => disposeLocalMcpHost())
 			.finally(() => process.exit(1));
 	});
@@ -1999,6 +2024,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			persistenceFailure = error;
 		},
 	);
+	messaging.ready();
 
 	/**
 	 * Dispose the session, then end the process. A store failure still latched
@@ -2019,6 +2045,7 @@ export async function runRpcMode(session: AgentSession, options: RpcModeOptions 
 			// Close the realtime call (microphone, socket) before the session it delegates into.
 			dictationBridge.dispose();
 			await liveBridge.stop();
+			await messaging.dispose();
 			await session.dispose();
 			// Releasing the session's leases starts private unit shutdown, but
 			// process.exit() cannot await the host's registered exit callback.

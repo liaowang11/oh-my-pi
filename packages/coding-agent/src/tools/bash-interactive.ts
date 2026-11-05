@@ -31,8 +31,10 @@ export interface BashInteractiveResult extends OutputSummary {
  * value omp itself was launched with, and a `TERM` left out that way names the
  * terminal the command gets. A value the session set itself stays.
  */
-function terminalEnv(exports: Record<string, string>): Record<string, string> {
+function terminalEnv(exports: Record<string, string>, strip: readonly string[] = []): Record<string, string> {
 	const env = { ...exports };
+	// The native PTY overlays the C environment, so deletion cannot mask inherited values.
+	for (const key of strip) env[key] = "";
 	const guards = buildNonInteractiveEnv();
 	for (const name in guards) {
 		if (env[name] === guards[name]) delete env[name];
@@ -143,6 +145,8 @@ export async function runInteractiveBashPty(
 		signal?: AbortSignal;
 		/** The session shell's exports the program starts from. */
 		env: Record<string, string>;
+		/** Inherited variables the program must not see. */
+		stripEnv?: readonly string[];
 		allocateArtifact?: ArtifactAllocator;
 		/** Called with the program's pid once the terminal spawned it. */
 		onStart?: (pid: number) => void;
@@ -228,7 +232,7 @@ export async function runInteractiveBashPty(
 							args: options.args,
 							cwd: options.cwd,
 							timeoutMs: options.timeoutMs,
-							env: terminalEnv(options.env),
+							env: terminalEnv(options.env, options.stripEnv),
 							signal: options.signal,
 							cols: grid.cols,
 							rows: grid.rows,

@@ -95,6 +95,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { bindEffects, combine } from "./config/registry";
 import { Settings } from "./config/settings";
 import { CronManager } from "./cron";
+import { resolveMessagingPolicy } from "./messaging/policy";
 import type { CursorMcpResourceAdapter } from "./cursor";
 import type * as CursorBridgeTools from "./cursor-bridge-tools";
 import { daemonMutex } from "./daemon/modules/mutex";
@@ -143,6 +144,7 @@ import {
 	type ToolDefinition,
 	wrapRegisteredTools,
 } from "./extensibility/extensions";
+import { bindExtensionExecSession } from "./extensibility/extensions/loader";
 import type { UserWaitTracker } from "./extensibility/extensions/user-wait";
 import { formatExtensionLoadNotifications } from "./extensibility/extensions/load-errors";
 import {
@@ -1333,6 +1335,9 @@ export interface BuildSystemPromptOptions {
 	includeWorkspaceTree?: boolean;
 	/** Include the read-only security:// resource inventory entry. Default: false. */
 	securityEnabled?: boolean;
+	messagingEnabled?: boolean;
+	messagingSendAllowed?: boolean;
+	messagingListAllowed?: boolean;
 	/** Eval preludes to advertise; each contributes its `guidance` block. Default: none. */
 	evalPreludes?: readonly Pick<EvalPreludeDefinition, "name" | "guidance">[];
 }
@@ -1362,6 +1367,9 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		inlineToolDescriptors: options.inlineToolDescriptors,
 		includeWorkspaceTree: options.includeWorkspaceTree,
 		securityEnabled: options.securityEnabled,
+		messagingEnabled: options.messagingEnabled,
+		messagingSendAllowed: options.messagingSendAllowed,
+		messagingListAllowed: options.messagingListAllowed,
 		evalPreludes: options.evalPreludes,
 		toolNames,
 		tools: promptTools,
@@ -2739,6 +2747,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			},
 			taskDepth: options.taskDepth ?? 0,
 			tanFork: options.tanFork === true,
+			get messaging() {
+				return isSubagentSession ? undefined : session?.messaging;
+			},
+			get messagingSession() {
+				return isSubagentSession ? undefined : session;
+			},
 			getSessionFile: () => sessionManager.getSessionFile() ?? null,
 			sessionManager,
 			getEvalKernelOwnerId: () => evalKernelOwnerId,
@@ -4650,8 +4664,12 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					? { mode: "compact", toolNames: [...toolNames, ...mountedPromptToolNames] }
 					: { mode: "full" },
 			);
+			const messagingPolicy = resolveMessagingPolicy(settings);
 			const defaultPrompt = await buildSystemPromptInternal({
 				cwd: promptCwd,
+				messagingEnabled: session?.messaging !== undefined,
+				messagingSendAllowed: messagingPolicy.send !== "deny",
+				messagingListAllowed: messagingPolicy.list !== "deny",
 				additionalWorkspaceRoots: sessionManager.getAdditionalDirectories(),
 				noContextFiles: options.noContextFiles,
 				excludeAgentsMd,
@@ -5375,6 +5393,8 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 		const createAdvisorToolSession = (): ToolSession => ({
 			...toolSession,
 			state: new ToolConversationState(),
+			messaging: undefined,
+			messagingSession: undefined,
 			// An advisor is a conversation of its own with no hidden-message channel: its preludes stay read-first.
 			noteEvalPreludeCall: undefined,
 			get cwd() {
@@ -5679,6 +5699,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			beginSessionFork: () => cronManager.suspendForFork(),
 			completeSessionFork: (result, isCurrent) => cronManager.completeFork(result, isCurrent),
 		});
+		bindExtensionExecSession(extensionsResult.runtime, session);
 		hasSession = true;
 		// The session now owns its cost gate; the interactive TUI starts compression after its first frame.
 		if (options.deferHintCompression !== true) session.startHintCompression();
@@ -5727,6 +5748,23 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 				session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
 			}
 		});
+		let messagingPromptPolicy = resolveMessagingPolicy(settings);
+		session.addDisposer(
+			settings.onLayersChange(() => {
+				const previous = messagingPromptPolicy;
+				messagingPromptPolicy = resolveMessagingPolicy(settings);
+				if (
+					session.isDisposed ||
+					(messagingPromptPolicy.enabled === previous.enabled &&
+						messagingPromptPolicy.send === previous.send &&
+						messagingPromptPolicy.list === previous.list)
+				)
+					return;
+				void session.refreshBaseSystemPrompt().catch(error => {
+					session.emitNotice("error", `Failed to rebuild the system prompt after a settings change: ${error}`);
+				});
+			}),
+		);
 		// Agent-level tool-call switches: the loop snapshots them per prompt run, so a
 		// change applies from the next run without splitting one response's schema/strip.
 		// The prompt listener above republishes the intent-field guidance.

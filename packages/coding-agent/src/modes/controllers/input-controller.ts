@@ -9,7 +9,10 @@ import { isEnoent, logger, postmortem, sanitizeText } from "@oh-my-pi/pi-utils";
 import type { AutocompleteProvider, SlashCommand } from "../../autocomplete/autocomplete";
 import { expandEmoticons } from "../../autocomplete/emoji";
 import { createModelMentionSource } from "../../autocomplete/model-mention";
-import { createPromptActionAutocompleteProvider } from "../../autocomplete/prompt-actions";
+import {
+	createPromptActionAutocompleteProvider,
+	type SessionMentionCandidate,
+} from "../../autocomplete/prompt-actions";
 import type { Keybinding } from "../../config/keybindings/app-keybindings";
 import { canonicalKeyId } from "../../config/keybindings/key-id";
 import { resolveModelRoleValue } from "../../config/model-resolver";
@@ -84,6 +87,8 @@ import { materializeImageChipLinks } from "../utils/ui-helpers";
 import { compactImageMarkers, formatVisionMarker, shiftImageMarkers } from "../view-model/prompt/composer-attachments";
 import { extractImagePastePathsFromText, extractImagePathFromText } from "../view-model/prompt/custom-editor";
 import { formatQueueShorthand, parseQueueShorthand, splitQueuedMessages } from "../view-model/prompt/queue-input";
+import type { MessagingService } from "../../messaging/service";
+import { resolveMessagingPolicy } from "../../messaging/policy";
 
 /** Bare words that quit (as `/<word>`) when typed alone into a session with no messages. */
 const BARE_EXIT_WORDS: Record<string, true> = { exit: true, quit: true, q: true };
@@ -3111,11 +3116,31 @@ export class InputController {
 			registry: this.ctx.session.modelRegistry,
 			scopedModels: () => this.ctx.session.scopedModels.map(s => s.model),
 		};
+		const sessionCandidates = new WeakMap<MessagingService, { at: number; candidates: SessionMentionCandidate[] }>();
 		return createPromptActionAutocompleteProvider({
 			commands,
 			basePath,
 			commandUsage: name => commandUsage.get(name),
 			emojiAutocomplete: () => cfgEmojiAutocomplete.get(this.ctx.settings),
+			sessionMentions: async signal => {
+				// Only the top-level session has an inbox; a focused subagent view lists nothing.
+				const session = this.ctx.session;
+				const messaging = this.ctx.viewSession === session ? session.messaging : undefined;
+				if (!messaging || resolveMessagingPolicy(session.settings).list === "deny") return [];
+				const cached = sessionCandidates.get(messaging);
+				if (cached && Date.now() - cached.at < 5_000) return cached.candidates;
+				try {
+					const candidates = (await messaging.listSessions(signal)).map(peer => ({
+						name: peer.name ?? peer.shortId,
+						cwd: peer.cwd,
+					}));
+					if (signal?.aborted) return [];
+					sessionCandidates.set(messaging, { at: Date.now(), candidates });
+					return candidates;
+				} catch {
+					return [];
+				}
+			},
 			modelMentions: createModelMentionSource(modelHost),
 			mentionModels: modelHost,
 			// The interactive host uses the default registry; the receiving session can change with focus.
