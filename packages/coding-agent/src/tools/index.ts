@@ -104,6 +104,7 @@ import { cfgEditMode } from "../edit/settings";
 import { cfgCompactionExperimentalContextManagement } from "../session/context-settings";
 import { cfgPythonInterpreter } from "../eval/settings";
 import { cfgExternalThinking } from "../session/settings";
+import { cfgCronEnabled } from "../cron-settings";
 import { cfgGoalEnabled } from "../goals/settings";
 import { cfgLspEnabled } from "../lsp/settings";
 import { cfgMemoryBackend } from "../memory-backend/settings";
@@ -673,6 +674,8 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 	const goalModeActive = !restrictToolNames && goalEnabled && session.getGoalModeState?.()?.enabled === true;
 	const externalThinkingActive =
 		cfgExternalThinking.get(session.settings) && supportsExternalThinking(session.getActiveModel?.());
+	// Scheduled jobs outlive a subagent's run, so only top-level sessions get the cron tools by default.
+	const cronDefault = !restrictToolNames && (session.taskDepth ?? 0) === 0 && cfgCronEnabled.get(session.settings);
 	if (goalModeActive && requestedTools && !requestedTools.includes("goal")) {
 		requestedTools.push("goal");
 	}
@@ -849,6 +852,7 @@ export async function resolveBuiltinToolPlan(session: ToolSession, toolNames?: s
 		...(externalThinkingActive ? ["think"] : []),
 		...(includeYield ? ["yield"] : []),
 		...(goalModeActive ? ["goal"] : []),
+		...(cronDefault ? ["cron_create", "cron_list", "cron_delete"] : []),
 	];
 	return { requestedTools, names, isAllowed: isToolAllowed };
 }
