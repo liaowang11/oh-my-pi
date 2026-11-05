@@ -24,6 +24,8 @@ import {
 	type ModelMentionCandidateSource,
 } from "./model-mention-autocomplete";
 import { subsequenceMatch, subsequenceScore } from "../autocomplete";
+import { sanitizeDisplaySingleLine } from "../overlays/extensions/display-text";
+import { previewLine, TRUNCATE_LENGTHS } from "../render/render-utils";
 
 let emojiAutocompleteEnabled = true;
 
@@ -44,6 +46,18 @@ interface PromptActionAutocompleteItem extends AutocompleteItem {
 	actionId: string;
 	execute: (prefix: string) => void;
 }
+export interface SessionMentionCandidate {
+	name: string;
+	cwd: string;
+}
+
+interface SessionMentionItem extends AutocompleteItem {
+	sessionName: string;
+}
+
+function sessionMentionPrefix(text: string): string | undefined {
+	return /(?:^|[\s='"])@("(?:\\"|[^"\\]|\\(?!"))*"?|[^\s"@]*)$/.exec(text)?.[0].replace(/^[\s='"]/, "");
+}
 
 interface PromptActionAutocompleteOptions {
 	commands: SlashCommand[];
@@ -54,6 +68,8 @@ interface PromptActionAutocompleteOptions {
 	internalUrlCaller?: () => InternalUrlCallerContext;
 	/** Session-scoped models available for `^` mentions. */
 	modelMentions?: ModelMentionCandidateSource;
+	/** Live top-level session addresses; appended after file candidates. */
+	sessionMentions?: (signal?: AbortSignal) => Promise<SessionMentionCandidate[]>;
 	keybindings: KeybindingsManager;
 	copyCurrentLine: () => void;
 	copyPrompt: () => void;
@@ -116,6 +132,7 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	#actions: PromptActionDefinition[];
 	#internalUrlCaller: () => InternalUrlCallerContext;
 	#modelMentions: ModelMentionCandidateSource | undefined;
+	#sessionMentions: PromptActionAutocompleteOptions["sessionMentions"];
 
 	constructor(
 		commands: SlashCommand[],
@@ -124,11 +141,13 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		commandUsage?: (name: string) => number,
 		internalUrlCaller?: () => InternalUrlCallerContext,
 		modelMentions?: ModelMentionCandidateSource,
+		sessionMentions?: PromptActionAutocompleteOptions["sessionMentions"],
 	) {
 		this.#commands = commands;
 		this.#baseProvider = new CombinedAutocompleteProvider(commands, basePath, { commandUsage });
 		this.#internalUrlCaller = internalUrlCaller ?? (() => ({ cwd: basePath }));
 		this.#modelMentions = modelMentions;
+		this.#sessionMentions = sessionMentions;
 		this.#actions = actions;
 	}
 
@@ -141,6 +160,31 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 	): Promise<{ items: AutocompleteItem[]; prefix: string } | null> {
 		if (signal?.aborted) return null;
 		const textBeforeCursor = (lines[cursorLine] || "").slice(0, cursorCol);
+		const sessionPrefix = this.#sessionMentions ? sessionMentionPrefix(textBeforeCursor) : undefined;
+		if (sessionPrefix) {
+			const [base, sessions] = await Promise.all([
+				this.#baseProvider.getSuggestions(lines, cursorLine, cursorCol, signal, onPartial),
+				this.#sessionMentions!(signal),
+			]);
+			if (signal?.aborted) return null;
+			const query = sessionPrefix
+				.slice(sessionPrefix.startsWith('@"') ? 2 : 1)
+				.replace(/"$/, "")
+				.replace(/\\"/g, '"')
+				.toLowerCase();
+			const items: SessionMentionItem[] = sessions
+				.filter(session => subsequenceMatch(query, session.name.toLowerCase()))
+				.map(session => ({
+					value: `@${/^[A-Za-z0-9_-]+$/.test(session.name) ? session.name : `"${session.name.replace(/"/g, '\\"')}"`}`,
+					label: previewLine(sanitizeDisplaySingleLine(`@${session.name}`), TRUNCATE_LENGTHS.LINE),
+					description: previewLine(sanitizeDisplaySingleLine(`session · ${session.cwd}`), TRUNCATE_LENGTHS.LINE),
+					sessionName: session.name,
+				}));
+			return base || items.length
+				? { items: [...(base?.items ?? []), ...items], prefix: base?.prefix ?? sessionPrefix }
+				: null;
+		}
+
 		if (!this.#outranksModelMention(lines, cursorLine, textBeforeCursor)) {
 			const modelMention = await this.#modelMentionSuggestions(textBeforeCursor, signal, onPartial);
 			if (modelMention) return modelMention;
@@ -239,6 +283,18 @@ export class PromptActionAutocompleteProvider implements AutocompleteProvider {
 		cursorCol: number;
 		onApplied?: () => void;
 	} {
+		if ("sessionName" in item) {
+			const currentLine = lines[cursorLine] || "";
+			const livePrefix = sessionMentionPrefix(currentLine.slice(0, cursorCol));
+			if (!livePrefix) return { lines, cursorLine, cursorCol };
+			const before = currentLine.slice(0, cursorCol - livePrefix.length);
+			let after = currentLine.slice(cursorCol);
+			if (livePrefix.startsWith('@"') && !livePrefix.endsWith('"') && after.startsWith('"')) after = after.slice(1);
+			const insert = `${item.value} `;
+			const newLines = [...lines];
+			newLines[cursorLine] = before + insert + after;
+			return { lines: newLines, cursorLine, cursorCol: before.length + insert.length };
+		}
 		const githubRefCompletion = applyGithubRefCompletion(lines, cursorLine, cursorCol, item, prefix);
 		if (githubRefCompletion) return githubRefCompletion;
 		if (prefix.startsWith("#") && isPromptActionItem(item)) {
@@ -376,5 +432,6 @@ export function createPromptActionAutocompleteProvider(
 		options.commandUsage,
 		options.internalUrlCaller,
 		options.modelMentions,
+		options.sessionMentions,
 	);
 }

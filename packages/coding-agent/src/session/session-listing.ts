@@ -4,16 +4,16 @@ import * as path from "node:path";
 import type { Message } from "@oh-my-pi/pi-ai";
 import { textContent } from "@oh-my-pi/pi-tui/chat/transcript-entry";
 import type { SessionListing } from "@oh-my-pi/pi-tui/overlays/session-selector";
-import { getSessionsDir } from "@oh-my-pi/pi-utils/dirs";
+import { getCustomSessionFilesDir, getSessionsDir, normalizePathForComparison } from "@oh-my-pi/pi-utils/dirs";
 import { hasFsCode, isEacces, isEnoent, isEnotdir } from "@oh-my-pi/pi-utils/fs-error";
 import * as logger from "@oh-my-pi/pi-utils/logger";
 import { LRUCache } from "@oh-my-pi/pi-utils/lru";
 import { parseJsonlLenient } from "@oh-my-pi/pi-utils/stream";
 import { toError } from "@oh-my-pi/pi-utils/type-guards";
 import { EVAL_STATE_CONTEXT_TYPE } from "../eval/state";
-import { parseSessionOrigin, type SessionOrigin } from "./session-entries";
+import { parseSessionOrigin, type SessionOrigin, type SessionTitleSource } from "./session-entries";
 import { visitEntriesFromFile } from "./session-loader";
-import { computeDefaultSessionDir } from "./session-paths";
+import { collectRegisteredSessionFiles, computeDefaultSessionDir } from "./session-paths";
 import { FileSessionStorage, type SessionStorage, type SessionStorageStat } from "./session-storage";
 import { listSessionTitles, lookupSessionTitle, recordSessionTitle, recordSessionTitles } from "./session-index";
 import { parseTitleSlotLine } from "./session-title-slot";
@@ -42,6 +42,7 @@ export interface SessionInfo {
 	title?: string;
 	/** Client other than the terminal that started the session (header `origin`); see {@link isForeignSession}. */
 	origin?: SessionOrigin;
+	titleSource?: SessionTitleSource;
 	/** Path to the parent session (if this session was forked). */
 	parentSessionPath?: string;
 	/** Id of the session whose conversation this one continues in a new file (header `continuationOf`). */
@@ -399,6 +400,7 @@ interface SessionListHeader {
 	cwd?: string;
 	title?: string;
 	origin?: SessionOrigin;
+	titleSource?: SessionTitleSource;
 	parentSession?: string;
 	continuationOf?: string;
 	timestamp?: string;
@@ -411,9 +413,14 @@ function normalizeTitleOverride(title: string | undefined): string | null | unde
 	return title.trim() ? title : null;
 }
 
+function normalizeTitleSource(source: unknown): SessionTitleSource | undefined {
+	return source === "auto" || source === "user" ? source : undefined;
+}
+
 function sessionListHeaderFromRecord(
 	record: Record<string, unknown> | undefined,
 	titleOverride?: string | null,
+	sourceOverride?: SessionTitleSource,
 ): SessionListHeader | undefined {
 	if (record?.type !== "session" || typeof record.id !== "string") return undefined;
 	return {
@@ -425,13 +432,18 @@ function sessionListHeaderFromRecord(
 			titleOverride === null
 				? undefined
 				: (titleOverride ?? (typeof record.title === "string" ? record.title : undefined)),
+		titleSource: titleOverride !== undefined ? sourceOverride : normalizeTitleSource(record.titleSource),
 		parentSession: typeof record.parentSession === "string" ? record.parentSession : undefined,
 		continuationOf: typeof record.continuationOf === "string" ? record.continuationOf : undefined,
 		timestamp: typeof record.timestamp === "string" ? record.timestamp : undefined,
 	};
 }
 
-function parseSessionListHeaderLine(line: string, titleOverride?: string | null): SessionListHeader | undefined {
+function parseSessionListHeaderLine(
+	line: string,
+	titleOverride?: string | null,
+	sourceOverride?: SessionTitleSource,
+): SessionListHeader | undefined {
 	if (extractStringProperty(line, "type") !== "session") return undefined;
 	const id = extractStringProperty(line, "id");
 	if (!id) return undefined;
@@ -441,6 +453,10 @@ function parseSessionListHeaderLine(line: string, titleOverride?: string | null)
 		cwd: extractStringProperty(line, "cwd"),
 		origin: parseSessionOrigin(extractStringProperty(line, "origin")),
 		title: titleOverride === null ? undefined : (titleOverride ?? extractStringProperty(line, "title")),
+		titleSource:
+			titleOverride !== undefined
+				? sourceOverride
+				: normalizeTitleSource(extractStringProperty(line, "titleSource")),
 		parentSession: extractStringProperty(line, "parentSession"),
 		continuationOf: extractStringProperty(line, "continuationOf"),
 		timestamp: extractStringProperty(line, "timestamp"),
@@ -455,7 +471,11 @@ function parseSessionListHeader(
 	const parsedSlotTitle = normalizeTitleOverride(
 		firstEntry?.type === "title" && typeof firstEntry.title === "string" ? firstEntry.title : undefined,
 	);
-	const parsedHeader = sessionListHeaderFromRecord(entries[firstEntry?.type === "title" ? 1 : 0], parsedSlotTitle);
+	const parsedHeader = sessionListHeaderFromRecord(
+		entries[firstEntry?.type === "title" ? 1 : 0],
+		parsedSlotTitle,
+		normalizeTitleSource(firstEntry?.type === "title" ? firstEntry.source : undefined),
+	);
 	if (parsedHeader) {
 		if (firstEntry?.type === "title" && firstEntry.archived === true) parsedHeader.archived = true;
 		return parsedHeader;
@@ -463,6 +483,7 @@ function parseSessionListHeader(
 
 	let slotTitle: string | null | undefined;
 	let slotArchived = false;
+	let slotSource: SessionTitleSource | undefined;
 	let firstNonEmpty = true;
 	for (const rawLine of content.split(/\r?\n/)) {
 		const line = rawLine.trim();
@@ -470,10 +491,11 @@ function parseSessionListHeader(
 		if (firstNonEmpty && extractStringProperty(line, "type") === "title") {
 			slotTitle = normalizeTitleOverride(extractStringProperty(line, "title"));
 			slotArchived = parseTitleSlotLine(line)?.archived === true;
+			slotSource = normalizeTitleSource(extractStringProperty(line, "source"));
 			firstNonEmpty = false;
 			continue;
 		}
-		const header = parseSessionListHeaderLine(line, slotTitle);
+		const header = parseSessionListHeaderLine(line, slotTitle, slotSource);
 		if (header && slotArchived) header.archived = true;
 		return header;
 	}
@@ -599,6 +621,7 @@ async function scanSessionFile(
 			cwd: header.cwd ?? "",
 			origin: header.origin,
 			title: header.title ?? shortSummary,
+			titleSource: header.title !== undefined ? header.titleSource : undefined,
 			parentSessionPath: header.parentSession,
 			continuationOf: header.continuationOf,
 			created: new Date(header.timestamp ?? ""),
@@ -792,6 +815,23 @@ export function isForeignSession(session: SessionInfo): boolean {
 	return session.origin !== undefined;
 }
 
+/** Local file-backed sessions, including exact files registered outside managed roots. */
+export async function listLocalSessionsWithRegisteredFiles(options?: { agentDir?: string }): Promise<SessionInfo[]> {
+	const sessions = await listAllSessions(new FileSessionStorage(), getSessionsDir(options?.agentDir));
+	const paths = new Set(sessions.map(session => normalizePathForComparison(session.path)));
+	for (const file of await collectRegisteredSessionFiles(getCustomSessionFilesDir(options?.agentDir))) {
+		if (paths.has(normalizePathForComparison(file))) continue;
+		paths.add(normalizePathForComparison(file));
+		const session = await readSessionInfo(file);
+		if (session) sessions.push(session);
+	}
+	const ids = new Map<string, SessionInfo>();
+	for (const session of sessions) {
+		const previous = ids.get(session.id);
+		if (!previous || session.modified > previous.modified) ids.set(session.id, session);
+	}
+	return [...ids.values()].sort((a, b) => b.modified.getTime() - a.modified.getTime());
+}
 /**
  * True when a scanned session is a 0-turn stub with no display name: the tail
  * lifecycle shows no assistant activity (pending user-only or unscannable)

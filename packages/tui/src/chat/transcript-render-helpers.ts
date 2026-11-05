@@ -254,6 +254,7 @@ export function buildIrcMessageCard(message: CustomOrHookMessage, getExpanded: (
 			replyTo?: string;
 			pool?: string;
 			mode?: string;
+			remote?: boolean;
 		}>
 	).details;
 	const kind =
@@ -275,6 +276,7 @@ export function buildIrcMessageCard(message: CustomOrHookMessage, getExpanded: (
 				timestamp: message.timestamp,
 				pool: details?.pool,
 				mode: details?.mode,
+				remote: details?.remote,
 			},
 			getExpanded,
 			theme,
