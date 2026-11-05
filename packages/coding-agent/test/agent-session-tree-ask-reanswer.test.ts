@@ -26,7 +26,13 @@ import type { AskToolDetails } from "@oh-my-pi/pi-tui/tools/ask";
 const TEST_MODEL = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 
 async function createTestSession(
-	options: { inMemory?: boolean; extensionRunner?: ExtensionRunner; obfuscator?: SecretObfuscator } = {},
+	options: {
+		inMemory?: boolean;
+		extensionRunner?: ExtensionRunner;
+		obfuscator?: SecretObfuscator;
+		beginSessionFork?: () => Promise<void>;
+		completeSessionFork?: () => Promise<void>;
+	} = {},
 ) {
 	const sessionManager = SessionManager.inMemory();
 	const settings = Settings.isolated();
@@ -45,6 +51,8 @@ async function createTestSession(
 		modelRegistry,
 		extensionRunner: options.extensionRunner,
 		obfuscator: options.obfuscator,
+		beginSessionFork: options.beginSessionFork,
+		completeSessionFork: options.completeSessionFork,
 	});
 	return {
 		session,
@@ -680,6 +688,40 @@ describe("AgentSession tree navigation onto an ask toolResult", () => {
 
 			await session.waitForIdle();
 			expect(continueSpy).not.toHaveBeenCalled();
+		} finally {
+			await ctx.cleanup();
+		}
+	});
+});
+
+describe("AgentSession tree navigation service lifecycle", () => {
+	it("suspends session services before running tree hooks", async () => {
+		const order: string[] = [];
+		const extensionRunner = {
+			hasHandlers: (eventType: string) => eventType === "session_before_tree",
+			emit: async () => {
+				order.push("hook");
+				return undefined;
+			},
+		} as unknown as ExtensionRunner;
+		const ctx = await createTestSession({
+			inMemory: true,
+			extensionRunner,
+			beginSessionFork: async () => {
+				order.push("suspend");
+			},
+			completeSessionFork: async () => {
+				order.push("resume");
+			},
+		});
+		try {
+			const { session, sessionManager } = ctx;
+			const targetId = sessionManager.appendMessage(userMsg("first"));
+			sessionManager.appendMessage(assistantMsg("second"));
+
+			await session.navigateTree(targetId);
+
+			expect(order).toEqual(["suspend", "hook", "resume"]);
 		} finally {
 			await ctx.cleanup();
 		}

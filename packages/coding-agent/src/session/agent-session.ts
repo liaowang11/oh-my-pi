@@ -487,6 +487,11 @@ import {
 } from "./session-dump-format";
 import { collectSubSessions, type SubSession } from "./sub-sessions";
 import type { BranchSummaryEntry, NewSessionOptions, SessionEntry } from "./session-entries";
+import {
+	buildScheduledNotification,
+	SCHEDULED_NOTIFICATION_KIND,
+	type ScheduledNotificationEntry,
+} from "./scheduled-notification";
 import { SessionHandoff, type SessionHandoffHost } from "./session-handoff";
 import {
 	COMPACTION_CHECK_NONE,
@@ -1016,6 +1021,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	getXdevToolEntries: () => Array<{ name: string; summary: string }>;
 	readonly yieldQueue: YieldQueue;
 	editStore?: EditStore;
+	readonly #scheduledPromptDeliveries = new Map<string, PromiseWithResolvers<void>>();
+	readonly #scheduledPromptsAwaitingMessage = new Set<string>();
+	readonly #scheduledPromptBatch = new Set<string>();
+	#scheduledPromptBatchTask: PromiseWithResolvers<void> | undefined;
+	readonly #onSessionTransition: (() => void) | undefined;
+	readonly #beginSessionFork: (() => Promise<void>) | undefined;
+	readonly #completeSessionFork:
+		| ((
+				result: { oldSessionFile: string; newSessionFile: string } | undefined,
+				isCurrent?: () => boolean,
+		  ) => Promise<void>)
+		| undefined;
+	#sessionServiceTransitionGeneration = 0;
 
 	/** Materializes this session's live extension-root policy per discovery call. */
 	readonly #extensionRoots: () => EffectiveExtensionRoots;
@@ -2153,6 +2171,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#preparedExtensions = config.preparedExtensions;
 		this.#extensionPaths = config.extensionPaths;
 		this.#resetCoordinator = config.codexResetCoordinator ?? defaultCodexAutoRedeemCoordinator;
+		this.#onSessionTransition = config.onSessionTransition;
+		this.#beginSessionFork = config.beginSessionFork;
+		this.#completeSessionFork = config.completeSessionFork;
 		const bashHost: BashRunnerHost = {
 			agent: this.agent,
 			sessionManager: this.sessionManager,
@@ -2485,6 +2506,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// A transition swaps the transcript under the agent: hold idle deliveries until it
 			// settles, so a result from the outgoing session cannot start a turn in the target.
 			isStreaming: () => this.isStreaming || this.isSessionTransitioning,
+			// Only `interruptStreaming` kinds (scheduled prompts) steer a live turn.
+			injectStreaming: message => this.agent.steer(message),
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
@@ -2508,7 +2531,9 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				let turnError: unknown;
 				const inFlightEpoch = this.#beginInFlight();
 				try {
-					await this.agent.prompt(messages.length === 1 ? first : messages);
+					const promptTask = this.agent.prompt(messages.length === 1 ? first : messages);
+					this.#acceptScheduledWake(messages, promptTask);
+					await promptTask;
 				} catch (error) {
 					turnError = error;
 					throw error;
@@ -2546,6 +2571,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			isStale: entry =>
 				this.#isDisposed || !isLaunchCompletionOwner(entry.owner, this.sessionManager.getSessionId()),
 			build: buildLaunchCompletionBatchMessage,
+		});
+		// A fired scheduled prompt is a system notification. `interruptStreaming`
+		// hands it to `Agent.steer` as soon as it is enqueued during a live turn,
+		// which folds it in after the next completed tool call; an idle enqueue
+		// wakes a turn instead. Neither path synthesizes a user-role message.
+		this.yieldQueue.register<ScheduledNotificationEntry>(SCHEDULED_NOTIFICATION_KIND, {
+			build: buildScheduledNotification,
+			interruptStreaming: true,
 		});
 		// Background-job completions / late diagnostics are pulled into the run at
 		// each step boundary as non-interrupting asides. Peer IRCs share the aside
@@ -4781,6 +4814,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (event.type === "tool_execution_start") {
 			this.#recordToolExecutionStart(event);
 		}
+		if (event.type === "message_end") this.#settleScheduledPrompts(event.message);
 
 		// Both buffer resets run before the awaited fan-out: event handlers run
 		// concurrently and message_update skips the await, so a reset placed after
@@ -6529,6 +6563,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		if (this.agent.prepareQueuedMessages === this.#prepareQueuedUserMessages) {
 			this.agent.prepareQueuedMessages = undefined;
 		}
+		const deliveryError = new Error("Session disposed before scheduled prompt delivery.");
+		this.#rejectScheduledPromptDeliveries(deliveryError);
+		this.#scheduledPromptBatch.clear();
+		this.#scheduledPromptBatchTask?.reject(deliveryError);
+		this.#scheduledPromptBatchTask = undefined;
 		this.#memory.cancelLocalMemoryStartup();
 		this.#titleGenerationAbortController.abort();
 		this.#abortAutolearnCapture();
@@ -8019,16 +8058,26 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#rewoundToolResultIds.clear();
 	}
 
+	#cancelScheduledPromptDeliveriesForTransition(): void {
+		this.yieldQueue.clear(SCHEDULED_NOTIFICATION_KIND);
+		const transitionError = new Error("Session changed before scheduled prompt delivery.");
+		this.#rejectScheduledPromptDeliveries(transitionError);
+		this.#scheduledPromptBatch.clear();
+		this.#scheduledPromptBatchTask?.reject(transitionError);
+		this.#scheduledPromptBatchTask = undefined;
+	}
 	/** Drop mutable tool decisions and directives owned by the previous logical session. */
 	#clearSessionScopedToolState(): void {
 		this.agent.clearDeferredToolDirectives();
 		this.#toolChoiceQueue.clear();
+		this.#cancelScheduledPromptDeliveriesForTransition();
 		this.#tools.clearAcpPermissionDecisions();
 		this.#tools.resetAnnouncedMounts();
 		// A `/new`, session switch, or tree navigation reuses tool-call ids, so a
 		// still-cached background-task snapshot from the old conversation must not
 		// survive to be replayed by a focus rebuild in the reset session (#10447).
 		this.#activeToolExecutionUpdates.clear();
+		this.#onSessionTransition?.();
 	}
 
 	/**
@@ -10729,6 +10778,50 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		});
 	}
 
+	#settleScheduledPrompt(prompt: string, error?: unknown): void {
+		const delivery = this.#scheduledPromptDeliveries.get(prompt);
+		this.#scheduledPromptsAwaitingMessage.delete(prompt);
+		if (!delivery) return;
+		this.#scheduledPromptDeliveries.delete(prompt);
+		if (error === undefined) delivery.resolve();
+		else delivery.reject(error);
+	}
+
+	#settleScheduledPrompts(message: AgentMessage, error?: unknown): void {
+		if (
+			message.role !== "custom" ||
+			message.customType !== "scheduled:notification" ||
+			!message.details ||
+			typeof message.details !== "object" ||
+			!("prompts" in message.details) ||
+			!Array.isArray(message.details.prompts)
+		) {
+			return;
+		}
+		for (const promptText of message.details.prompts) {
+			if (typeof promptText !== "string") continue;
+			if (error === undefined && !this.#scheduledPromptsAwaitingMessage.has(promptText)) continue;
+			this.#settleScheduledPrompt(promptText, error);
+		}
+	}
+
+	/** A woken turn accepts its scheduled prompts once `prompt()` is running, not when the turn ends. */
+	#acceptScheduledWake(messages: readonly AgentMessage[], promptTask: Promise<void>): void {
+		if (this.#scheduledPromptsAwaitingMessage.size === 0) return;
+		void Promise.race([promptTask, Promise.resolve()]).then(
+			() => {
+				for (const message of messages) this.#settleScheduledPrompts(message);
+			},
+			(error: unknown) => {
+				for (const message of messages) this.#settleScheduledPrompts(message, error);
+			},
+		);
+	}
+
+	#rejectScheduledPromptDeliveries(error: unknown): void {
+		for (const prompt of this.#scheduledPromptDeliveries.keys()) this.#settleScheduledPrompt(prompt, error);
+	}
+
 	/** Clear queued messages and return the user-restorable ones (text plus any attached images).
 	 *  Only user-authored messages (plain user turns, `attribution:"user"` custom like `/skill`) are
 	 *  returned for editor restore; their hidden companions leave with them (submitting the restored
@@ -10778,13 +10871,18 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		const keep: (m: AgentMessage) => boolean = options?.forInterrupt
 			? m => recordedOnInterrupt.has(m)
 			: m => !isUserAuthoredQueuedMessage(m) && !isHiddenUserCompanion(m);
+		const interruptError = new Error("Scheduled prompt discarded by session interrupt.");
 		for (const message of [...steeringAll, ...followUpAll]) {
 			if (!keep(message)) {
 				if (message.role === "custom" && message.customType === "ttsr-injection") {
 					this.#ttsr.releaseDeferredReservationFromDetails(message.details);
 				}
+				// A discarded scheduled prompt was never delivered; the scheduler retries it.
+				if (options?.forInterrupt) this.#settleScheduledPrompts(message, interruptError);
 			} else if (options?.forInterrupt) {
 				this.#interruptWithdrawnMessages.add(message);
+				// Recorded into the transcript on interrupt, so the scheduled prompt counts as delivered.
+				this.#settleScheduledPrompts(message);
 			}
 		}
 		this.agent.replaceQueues(steeringAll.filter(keep), followUpAll.filter(keep));
@@ -11859,11 +11957,17 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		}
 
 		this.#disconnectFromAgent();
-		let advisorRecordersDetached = false;
 		await this.abort();
-		this.#cancelOwnAsyncJobs();
-		this.#closeAllProviderSessions("new session");
-		await this.#bash.flushPending();
+		const sessionServicesSuspended = await this.#suspendSessionServices();
+		let advisorRecordersDetached = false;
+		try {
+			this.#cancelOwnAsyncJobs();
+			this.#closeAllProviderSessions("new session");
+			await this.#bash.flushPending();
+		} catch (error) {
+			await this.#resumeSessionServices(sessionServicesSuspended, false, "new session");
+			throw error;
+		}
 		const bashTransition = this.#bash.beginSessionTransition({ persistDetached: options?.drop !== true });
 		let sessionTransitioned = false;
 		try {
@@ -11963,6 +12067,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (sessionTransitioned) this.#advisors.resetSessionState();
 				else this.#advisors.reattachRecorderFeeds();
 			}
+			await this.#resumeSessionServices(sessionServicesSuspended, sessionTransitioned, "new session");
 		}
 	}
 
@@ -11978,6 +12083,50 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 	async flushToDisk(): Promise<void> {
 		await this.#bash.flushPending();
 		await this.sessionManager.flush();
+	}
+
+	async #suspendSessionServices(): Promise<boolean> {
+		if (!this.#beginSessionFork) return false;
+		this.#cancelScheduledPromptDeliveriesForTransition();
+		this.#sessionServiceTransitionGeneration++;
+		await this.#beginSessionFork();
+		return true;
+	}
+
+	async #resumeSessionServices(suspended: boolean, committed: boolean, transition: string): Promise<void> {
+		if (!suspended) return;
+		try {
+			await this.#completeSessionFork?.(undefined);
+		} catch (error) {
+			if (!committed) throw error;
+			logger.warn(`Failed to resume session services after committed ${transition}`, {
+				sessionFile: this.sessionFile,
+				error: error instanceof Error ? error.message : String(error),
+			});
+			this.#scheduleSessionServiceRecovery(undefined);
+		}
+	}
+
+	#scheduleSessionServiceRecovery(result: { oldSessionFile: string; newSessionFile: string } | undefined): void {
+		if (!this.#completeSessionFork || this.#isDisposed) return;
+		const generation = this.#sessionServiceTransitionGeneration;
+		const retry = (): void => {
+			const timer = setTimeout(() => {
+				if (this.#isDisposed || generation !== this.#sessionServiceTransitionGeneration) return;
+				void this.#completeSessionFork?.(
+					result,
+					() => !this.#isDisposed && generation === this.#sessionServiceTransitionGeneration,
+				).catch(error => {
+					logger.warn("Failed to recover session services after committed transition", {
+						sessionFile: this.sessionFile,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					if (!this.#isDisposed && generation === this.#sessionServiceTransitionGeneration) retry();
+				});
+			}, 250);
+			timer.unref();
+		};
+		retry();
 	}
 
 	/**
@@ -12027,11 +12176,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			}
 		}
 
-		await this.flushToDisk();
-		// Work admitted during the hook or flush awaits would be copied mid-flight.
-		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
+		const sessionServicesSuspended = await this.#suspendSessionServices();
 		let advisorRecordersDetached = false;
+		let sessionForkStarted = sessionServicesSuspended;
+		let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 		try {
+			await this.flushToDisk();
+			// Work admitted during the hook or flush awaits would be copied mid-flight.
+			if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 			advisorRecordersDetached = true;
 			// Fork keeps the conversation, but still needs a quiet artifact boundary:
 			// stop and settle in-flight advisors before muting their feeds.
@@ -12039,7 +12191,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			const bashTransition = this.#bash.beginSessionTransition();
 
 			// Fork the session (creates new session file with same entries)
-			let forkResult: { oldSessionFile: string; newSessionFile: string } | undefined;
 			try {
 				// No file means fork() is a no-op. Otherwise invalidate admitted
 				// prompt setup before the asynchronous identity rewrite begins.
@@ -12078,9 +12229,24 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 					previousSessionFile,
 				});
 			}
+			if (this.#completeSessionFork) {
+				try {
+					await this.#completeSessionFork(forkResult);
+					sessionForkStarted = false;
+				} catch (error) {
+					logger.warn("Failed to finalize committed session fork", {
+						oldSessionFile: forkResult.oldSessionFile,
+						newSessionFile: forkResult.newSessionFile,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					sessionForkStarted = false;
+					this.#scheduleSessionServiceRecovery(forkResult);
+				}
+			}
 
 			return true;
 		} finally {
+			if (sessionForkStarted) await this.#completeSessionFork?.(forkResult);
 			if (advisorRecordersDetached) this.#advisors.reattachRecorderFeeds();
 		}
 	}
@@ -12132,8 +12298,35 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 	/** Move the active session and artifacts after enforcing mode transition invariants. */
 	async moveSession(newCwd: string, targetSessionDir?: string): Promise<void> {
+		// Holds scheduled wakes until the move settles, like the other session transitions.
+		using _transition = this.#beginSessionTransition();
 		this.#assertVibeSessionTransitionAllowed("move the session");
-		await this.sessionManager.moveTo(newCwd, targetSessionDir);
+		let sessionServicesSuspended = false;
+		let moveCommitted = false;
+		let failure: unknown;
+		try {
+			sessionServicesSuspended = await this.#suspendSessionServices();
+			await this.sessionManager.moveTo(newCwd, targetSessionDir);
+			moveCommitted = true;
+		} catch (error) {
+			failure = error;
+		}
+		if (sessionServicesSuspended) {
+			try {
+				await this.#completeSessionFork?.(undefined);
+			} catch (error) {
+				if (!moveCommitted) {
+					failure ??= error;
+				} else {
+					logger.warn("Failed to resume session services after committed move", {
+						sessionFile: this.sessionFile,
+						error: error instanceof Error ? error.message : String(error),
+					});
+					this.#scheduleSessionServiceRecovery(undefined);
+				}
+			}
+		}
+		if (failure !== undefined) throw failure;
 	}
 
 	// =========================================================================
@@ -13121,6 +13314,83 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		return this.#irc.drainInboxMessages(agentId, opts);
 	}
 
+	/**
+	 * Deliver a fired cron job into this session as a system notification. A live
+	 * turn takes it as a steer at the next tool-call boundary; an idle session
+	 * wakes a turn for it. It never synthesizes a user-role message.
+	 */
+	deliverScheduledPrompt(promptText: string): Promise<void> {
+		if (this.#isDisposed) return Promise.reject(new Error("Session disposed before scheduled prompt delivery."));
+		const prompt = promptText.trim();
+		if (!prompt) return Promise.resolve();
+		const existing = this.#scheduledPromptDeliveries.get(prompt);
+		if (existing) return existing.promise;
+		const delivery = Promise.withResolvers<void>();
+		delivery.promise.catch(() => {});
+		this.#scheduledPromptDeliveries.set(prompt, delivery);
+		this.#scheduledPromptBatch.add(prompt);
+		if (this.#scheduledPromptBatchTask) return delivery.promise;
+		const task = Promise.withResolvers<void>();
+		task.promise.catch(() => {});
+		this.#scheduledPromptBatchTask = task;
+		setImmediate(async () => {
+			if (this.#scheduledPromptBatchTask !== task) return;
+			this.#scheduledPromptBatchTask = undefined;
+			const prompts = [...this.#scheduledPromptBatch];
+			this.#scheduledPromptBatch.clear();
+			if (this.#isDisposed) {
+				const error = new Error("Session disposed before scheduled prompt delivery.");
+				for (const prompt of prompts) this.#settleScheduledPrompt(prompt, error);
+				task.reject(error);
+				return;
+			}
+			try {
+				// The yield queue reports a transition as streaming; a steer then would land in
+				// the outgoing transcript. Transitions also cancel pending deliveries, so this
+				// batch either waits it out or is rejected by that cancellation.
+				if (this.isSessionTransitioning) {
+					await this.waitForSessionTransition();
+					const pending = prompts.filter(prompt => this.#scheduledPromptDeliveries.has(prompt));
+					prompts.splice(0, prompts.length, ...pending);
+					if (prompts.length === 0) {
+						task.resolve();
+						return;
+					}
+				}
+				// Delivery counts as accepted when the notification's `message_end` fires:
+				// a live turn emits it once the steer is consumed, a woken turn at its start.
+				for (const prompt of prompts) this.#scheduledPromptsAwaitingMessage.add(prompt);
+				const streaming = this.isStreaming;
+				this.yieldQueue.enqueueMany<ScheduledNotificationEntry>(
+					SCHEDULED_NOTIFICATION_KIND,
+					prompts.map(prompt => ({ prompt })),
+				);
+				if (!streaming) {
+					// The idle flush runs the woken turn to completion, so it is not awaited:
+					// the scheduler (and session teardown, which drains accepted deliveries)
+					// must not wait on a whole turn. Its outcome settles whatever the
+					// `message_end` above has not: a failed wake rejects, a delivery folded
+					// into context without a turn resolves.
+					const flush = this.yieldQueue.flush("idle", SCHEDULED_NOTIFICATION_KIND);
+					this.#trackPostPromptTask(flush);
+					flush.then(
+						() => {
+							for (const prompt of prompts) this.#settleScheduledPrompt(prompt);
+						},
+						(error: unknown) => {
+							for (const prompt of prompts) this.#settleScheduledPrompt(prompt, error);
+						},
+					);
+				}
+				task.resolve();
+			} catch (error) {
+				for (const prompt of prompts) this.#settleScheduledPrompt(prompt, error);
+				task.reject(error);
+			}
+		});
+		return delivery.promise;
+	}
+
 	/** Delivers an IRC message into this recipient session. */
 	deliverIrcMessage(msg: IrcMessage): Promise<"injected" | "woken"> {
 		// The sender's context is active here; the delivery is the recipient's work.
@@ -13598,11 +13868,16 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 
 		this.#disconnectFromAgent();
 		await this.abort({ goalReason: "internal" });
-		await this.#sessionBeforeSwitchReconciler?.();
-
-		await this.#bash.flushPending();
-		// Flush pending writes before switching so restore snapshots reflect committed state.
-		await this.sessionManager.flush();
+		const sessionServicesSuspended = await this.#suspendSessionServices();
+		try {
+			await this.#sessionBeforeSwitchReconciler?.();
+			await this.#bash.flushPending();
+			// Flush pending writes before switching so restore snapshots reflect committed state.
+			await this.sessionManager.flush();
+		} catch (error) {
+			await this.#resumeSessionServices(sessionServicesSuspended, false, "session switch");
+			throw error;
+		}
 		const previousSessionState = this.sessionManager.captureState();
 		const bashTransition = this.#bash.beginSessionTransition();
 		// Only same-session reloads compare against the prior context to detect
@@ -13667,6 +13942,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#usagePreflightReadyModel = undefined;
 
 		let cwdChangeTarget: string | undefined;
+		let sessionTransitioned = false;
 		try {
 			if (switchingToDifferentSession) {
 				// Stop and settle in-flight advisors while the old-session feeds can
@@ -13879,6 +14155,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#releaseTtsrReservations(previousSteeringMessages);
 			this.#releaseTtsrReservations(previousFollowUpMessages);
 			this.#releaseHeldQueuedMessages([...previousSteeringMessages, ...previousFollowUpMessages]);
+			sessionTransitioned = true;
 			if (previousSessionState.sessionId !== this.sessionManager.getSessionId()) {
 				this.#notifySessionChangeCallbacks();
 			}
@@ -13976,6 +14253,8 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			this.#bash.finishSessionTransition(bashTransition, false);
 			if (error === SESSION_CWD_CHANGE_REJECTED) return false;
 			throw error;
+		} finally {
+			await this.#resumeSessionServices(sessionServicesSuspended, sessionTransitioned, "session switch");
 		}
 	}
 
@@ -14067,28 +14346,29 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
 		}
 
-		await this.#bash.flushPending();
-		// Flush pending writes before branching
-		await this.sessionManager.flush();
-		// Last refusal point. Nothing below is rolled back when the transition stops, so an
-		// idle-only snapshot refuses here, after the flush awaits but before any state of the
-		// old session (pending messages, async jobs, auto-learn capture) is discarded.
-		if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
-
-		// Clear pending messages (bound to old session state)
-		this.#pendingNextTurnMessages = [];
-		this.#scheduledHiddenNextTurnGeneration = undefined;
-		this.#queuedMessageDrainBlocked = false;
-		this.#usagePreflightReadyForNextModelCall = false;
-
-		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
+		const sessionServicesSuspended = await this.#suspendSessionServices();
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
 		try {
+			await this.#bash.flushPending();
+			// Flush pending writes before branching
+			await this.sessionManager.flush();
+			// Last refusal point. Nothing below is rolled back when the transition stops, so an
+			// idle-only snapshot refuses here, after the flush awaits but before any state of the
+			// old session (pending messages, async jobs, auto-learn capture) is discarded.
+			if (requireIdleFor) this.#assertIdleForSnapshot(requireIdleFor);
+
+			// Clear pending messages (bound to old session state)
+			this.#pendingNextTurnMessages = [];
+			this.#scheduledHiddenNextTurnGeneration = undefined;
+			this.#queuedMessageDrainBlocked = false;
+			this.#usagePreflightReadyForNextModelCall = false;
+
+			const bashTransition = this.#bash.beginSessionTransition();
+			this.#cancelOwnAsyncJobs();
+			this.#abortAutolearnCapture();
+			await this.#drainAutolearnCapture();
+
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -14146,6 +14426,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (sessionTransitioned) this.#advisors.resetSessionState();
 				else this.#advisors.reattachRecorderFeeds();
 			}
+			await this.#resumeSessionServices(sessionServicesSuspended, sessionTransitioned, "session branch");
 		}
 	}
 
@@ -14202,18 +14483,19 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		this.#scheduledHiddenNextTurnGeneration = undefined;
 		this.#releaseQueuedTtsrReservations();
 		this.agent.replaceQueues([], []);
-		this.#queuedMessageDrainBlocked = false;
-		this.#usagePreflightReadyForNextModelCall = false;
-		await this.#bash.flushPending();
-		await this.sessionManager.flush();
-		const bashTransition = this.#bash.beginSessionTransition();
-		this.#cancelOwnAsyncJobs();
-		this.#abortAutolearnCapture();
-		await this.#drainAutolearnCapture();
-
+		const sessionServicesSuspended = await this.#suspendSessionServices();
 		let sessionTransitioned = false;
 		let advisorRecordersDetached = false;
 		try {
+			this.#queuedMessageDrainBlocked = false;
+			this.#usagePreflightReadyForNextModelCall = false;
+			await this.#bash.flushPending();
+			await this.sessionManager.flush();
+			const bashTransition = this.#bash.beginSessionTransition();
+			this.#cancelOwnAsyncJobs();
+			this.#abortAutolearnCapture();
+			await this.#drainAutolearnCapture();
+
 			advisorRecordersDetached = true;
 			await this.#advisors.drainAndDetachRecorders();
 			try {
@@ -14271,6 +14553,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				if (sessionTransitioned) this.#advisors.resetSessionState();
 				else this.#advisors.reattachRecorderFeeds();
 			}
+			await this.#resumeSessionServices(sessionServicesSuspended, sessionTransitioned, "session branch");
 		}
 	}
 
@@ -14374,6 +14657,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			// Original arguments couldn't be recovered (corrupted/legacy session
 			// data) — fall through to a plain leaf move so navigation still works.
 		}
+
+		const sessionServicesSuspended = await this.#suspendSessionServices();
+		let branchTransitioned = false;
+		await using _sessionServices = {
+			[Symbol.asyncDispose]: async () => {
+				await this.#resumeSessionServices(sessionServicesSuspended, branchTransitioned, "tree navigation");
+			},
+		};
 
 		// Collect entries to summarize (from old leaf to common ancestor). For an
 		// `ask` re-answer completion, the branch point is `targetEntry.parentId`
@@ -14544,7 +14835,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 		// Summary is attached at the navigation target position (newLeafId), not the old branch
 		const bashTransition = this.#bash.beginSessionTransition();
 		let summaryEntry: BranchSummaryEntry | undefined;
-		let branchTransitioned = false;
 		try {
 			if (summaryText) {
 				// Create summary at target position (can be null for root)

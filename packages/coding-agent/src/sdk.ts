@@ -88,6 +88,7 @@ import { loadPromptTemplates as loadPromptTemplatesInternal, type PromptTemplate
 import { buildServiceTierByFamily } from "./config/service-tier";
 import { bindEffects, combine } from "./config/registry";
 import { Settings } from "./config/settings";
+import { CronManager } from "./cron";
 import { CursorExecHandlers, type CursorMcpResourceAdapter } from "./cursor";
 import { createBridgeEditTool, createBridgeGrepFactory } from "./cursor-bridge-tools";
 import "./discovery";
@@ -2537,6 +2538,16 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 	}
 	const scopedAsyncJobManager = asyncJobManager ?? options.asyncJobManager;
 
+	// The scheduler hands a fired job to the session that can run it. Durable
+	// jobs are keyed on the transcript path, so a `/new` session switch moves the
+	// scheduler to that session's jobs rather than replaying the previous set.
+	const cronManager = new CronManager({
+		getSessionFile: () => sessionManager.getSessionFile(),
+		getSessionId: () => sessionManager.getSessionId(),
+		storage: sessionManager.getStorage(),
+		enqueuePrompt: async promptText => session?.deliverScheduledPrompt(promptText),
+	});
+
 	const agentRegistry = options.agentRegistry ?? AgentRegistry.global();
 	const resolvedAgentId = options.agentId ?? options.parentTaskPrefix ?? MAIN_AGENT_ID;
 	const resolvedAgentDisplayName = options.agentDisplayName ?? agentKind;
@@ -2759,6 +2770,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			getTelemetry: () => agent?.telemetry,
 			// Tools and nested subagents use this root's manager, never another root's singleton.
 			asyncJobManager: scopedAsyncJobManager,
+			cronManager,
 		};
 		// The Spotlight experiment starts before the first prompt build: its shaping rule rides the system prompt
 		// and its shaping replaces the native read summarizer / bash minimizer for the session.
@@ -5239,6 +5251,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			advisorMcpResources: cursorMcpResources,
 			titleSystemPrompt: options.titleSystemPrompt,
 			autoTitle: options.autoTitle === true && !isSubagentSession,
+			onSessionTransition: () => cronManager.refresh(),
+			beginSessionFork: () => cronManager.suspendForFork(),
+			completeSessionFork: (result, isCurrent) => cronManager.completeFork(result, isCurrent),
 		});
 		hasSession = true;
 		// The session now owns its cost gate; the interactive TUI starts compression after its first frame.
@@ -5517,6 +5532,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			build: buildLateDiagnosticsBatchMessage,
 			isStale: entry => entry.isStale(),
 		});
+		void cronManager.prepare().catch(error => {
+			logger.warn("Cron session load failed during startup", { error });
+		});
 
 		// Attach the live session to the pre-registered ref so peers can route IRC
 		// messages here. Refresh sessionFile in case it was unavailable at pre-register
@@ -5552,6 +5570,10 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					// begins — the lifecycle await below opens an async gap before
 					// AgentSession.dispose() would otherwise set its guards.
 					session.beginDispose();
+					// Stops scheduling synchronously, then drains an already accepted
+					// delivery so its lease release and scheduled-task write finish
+					// before teardown closes the storage backend underneath them.
+					await cronManager.dispose();
 					if (agentKind === "main") {
 						// Top-level teardown owns the global agent lifecycle: park timers,
 						// adopted subagent sessions, revivers. Tear it down while shared
@@ -5950,6 +5972,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			});
 		}
 		startDeferredMCPDiscovery?.(session);
+		cronManager.start();
 
 		startupCleanup.move();
 		return {
@@ -5964,6 +5987,9 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 			subagentEventBus,
 		};
 	} catch (error) {
+		// Drain here too: a throw before the dispose wrapper was installed leaves
+		// no other owner for in-flight cron custody, and re-disposing is a no-op.
+		await cronManager.dispose();
 		try {
 			if (hasSession) {
 				await session.dispose();

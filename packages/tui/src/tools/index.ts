@@ -7,6 +7,7 @@ import { askToolRenderer } from "./ask";
 import { astEditToolRenderer } from "./ast-edit";
 import { astGrepToolRenderer } from "./ast-grep";
 import { bashToolRenderer } from "./bash";
+import { cronCreateToolRenderer, cronDeleteToolRenderer, cronListToolRenderer } from "./cron";
 import { debugToolRenderer } from "./debug";
 import { editToolRenderer } from "./edit";
 import { evalToolRenderer } from "./eval";
@@ -38,6 +39,9 @@ export const toolRenderers: Record<string, ToolRenderer> = {
 	ast_grep: astGrepToolRenderer,
 	ast_edit: astEditToolRenderer,
 	bash: bashToolRenderer,
+	cron_create: cronCreateToolRenderer,
+	cron_list: cronListToolRenderer,
+	cron_delete: cronDeleteToolRenderer,
 	debug: debugToolRenderer,
 	eval: evalToolRenderer,
 	edit: editToolRenderer,

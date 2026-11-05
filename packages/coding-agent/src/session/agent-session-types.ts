@@ -320,6 +320,15 @@ export interface AgentSessionConfig {
 	ensureGoalRegistered?: () => Promise<boolean>;
 	/** Re-resolves settings-gated tools against live settings; driven by `SessionTools.reconcileBuiltinTools`. */
 	reconcileSettingsGatedTools?: (isBuiltIn: (name: string) => boolean) => Promise<SettingsGatedToolDelta>;
+	/** Refreshes session-bound services after a logical session transition. */
+	onSessionTransition?: () => void;
+	/** Suspends session-bound services before a fork changes the live session path. */
+	beginSessionFork?: () => Promise<void>;
+	/** Copies backend artifacts and resumes services after a fork, or only resumes when the fork failed. */
+	completeSessionFork?: (
+		result: { oldSessionFile: string; newSessionFile: string } | undefined,
+		isCurrent?: () => boolean,
+	) => Promise<void>;
 	/** Current session pre-LLM message transform pipeline. */
 	transformContext?: (messages: AgentMessage[], signal?: AbortSignal) => AgentMessage[] | Promise<AgentMessage[]>;
 	/** Provider request transform applied after message conversion. */

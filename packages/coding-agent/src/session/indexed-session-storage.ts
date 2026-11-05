@@ -1,5 +1,6 @@
 import * as path from "node:path";
 import { toError } from "@oh-my-pi/pi-utils";
+import { sessionSidecarDir } from "./session-paths";
 import {
 	directChildKeyName,
 	SessionWriteConflictError,
@@ -45,6 +46,10 @@ export interface SessionStorageBackend {
 		title?: SessionTitleUpdate,
 		expectedSize?: number | null,
 	): Promise<void>;
+	writeFull(path: string, content: string, mtimeMs: number, title?: SessionTitleUpdate): Promise<void>;
+	acquireLease?(path: string, owner: string, expiresAt: number, now: number): Promise<boolean>;
+	renewLease?(path: string, owner: string, expiresAt: number, now: number): Promise<boolean>;
+	releaseLease?(path: string, owner: string): Promise<void>;
 	append(path: string, line: string, mtimeMs: number): Promise<void>;
 	updateSessionTitle(path: string, title: SessionTitleUpdate, mtimeMs: number): Promise<void>;
 	truncate(path: string, mtimeMs: number): Promise<void>;
@@ -155,6 +160,7 @@ export class IndexedSessionStorage implements SessionStorage {
 			throw new SessionWriteConflictError(path, expectedSize, actualSize);
 		}
 	}
+	#indexRevision = 0;
 
 	constructor(backend: SessionStorageBackend) {
 		this.#backend = backend;
@@ -166,19 +172,27 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	async refresh(): Promise<void> {
-		await this.drain();
-		const rows = await this.#backend.loadIndex();
-		this.#index.clear();
-		for (const row of rows) {
-			const title = row.titleUpdatedAt
-				? {
-						title: row.title,
-						source: row.titleSource,
-						updatedAt: row.titleUpdatedAt,
-						...(row.titleArchived ? { archived: true } : {}),
-					}
-				: null;
-			this.#setIndex(row.path, row.size, row.mtimeMs, title);
+		for (;;) {
+			await this.drain();
+			while (this.#pathPending.size > 0) {
+				await Promise.allSettled(this.#pathPending.values());
+			}
+			const revision = this.#indexRevision;
+			const rows = [...(await this.#backend.loadIndex())];
+			if (this.#indexRevision !== revision) continue;
+			this.#index.clear();
+			for (const row of rows) {
+				const title = row.titleUpdatedAt
+					? {
+							title: row.title,
+							source: row.titleSource,
+							updatedAt: row.titleUpdatedAt,
+							...(row.titleArchived ? { archived: true } : {}),
+						}
+					: null;
+				this.#setIndex(row.path, row.size, row.mtimeMs, title);
+			}
+			return;
 		}
 	}
 
@@ -323,6 +337,21 @@ export class IndexedSessionStorage implements SessionStorage {
 		return false;
 	}
 
+	acquireLease(path: string, owner: string, expiresAt: number, now: number): Promise<boolean> {
+		if (!this.#backend.acquireLease) throw new Error("Session storage backend does not support leases");
+		return this.#backend.acquireLease(path, owner, expiresAt, now);
+	}
+
+	renewLease(path: string, owner: string, expiresAt: number, now: number): Promise<boolean> {
+		if (!this.#backend.renewLease) throw new Error("Session storage backend does not support lease renewal");
+		return this.#backend.renewLease(path, owner, expiresAt, now);
+	}
+
+	releaseLease(path: string, owner: string): Promise<void> {
+		if (!this.#backend.releaseLease) throw new Error("Session storage backend does not support leases");
+		return this.#backend.releaseLease(path, owner);
+	}
+
 	async writeText(path: string, content: string): Promise<void> {
 		await this.#awaitPath(path);
 		const previous = this.#index.get(path);
@@ -431,7 +460,7 @@ export class IndexedSessionStorage implements SessionStorage {
 		const sessionEntry = this.#index.get(sessionPath);
 		if (!sessionEntry) throw enoent(sessionPath);
 
-		const artifactsDir = sessionPath.slice(0, -6);
+		const artifactsDir = sessionSidecarDir(sessionPath);
 		const prefix = artifactsDir.endsWith("/") ? artifactsDir : `${artifactsDir}/`;
 		const paths = [sessionPath];
 		for (const key of this.#index.keys()) {
@@ -628,6 +657,7 @@ export class IndexedSessionStorage implements SessionStorage {
 	}
 
 	#enqueuePaths(paths: readonly string[], task: () => Promise<void>, options: EnqueueOptions): Promise<void> {
+		this.#indexRevision++;
 		const unique = uniquePaths(paths);
 		// Predecessor choice (rJDg): a positional publish with no backend CAS
 		// token (backend.append) chains on the uncaught pending op so it

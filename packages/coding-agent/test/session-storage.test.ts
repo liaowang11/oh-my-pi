@@ -14,6 +14,8 @@ import {
 	SessionWriteConflictError,
 	type WriteTextAtomicOptions,
 } from "@oh-my-pi/pi-coding-agent/session/session-storage";
+import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
+import { sessionSidecarDir } from "@oh-my-pi/pi-coding-agent/session/session-paths";
 import { type SessionTitleUpdate, serializeTitleSlot } from "@oh-my-pi/pi-coding-agent/session/session-title-slot";
 
 class ControlledTitleUpdateBackend implements SessionStorageBackend {
@@ -291,6 +293,35 @@ describe("FileSessionStorage writer", () => {
 	});
 });
 
+describe("FileSessionStorage leases", () => {
+	let tempDir: string;
+
+	beforeEach(async () => {
+		tempDir = await fsp.mkdtemp(path.join(os.tmpdir(), "omp-session-lease-"));
+	});
+
+	afterEach(async () => {
+		await fsp.rm(tempDir, { recursive: true, force: true });
+	});
+
+	it("coordinates renewal, expiry, and owner-checked release through SQLite", async () => {
+		const first = new FileSessionStorage();
+		const second = new FileSessionStorage();
+		const leasePath = path.join(tempDir, "scheduled_tasks.json.delivery");
+
+		expect(await first.acquireLease(leasePath, "first", 2_000, 1_000)).toBe(true);
+		expect(await second.acquireLease(leasePath, "second", 2_000, 1_000)).toBe(false);
+		expect(await first.renewLease(leasePath, "first", 4_000, 1_500)).toBe(true);
+		expect(await second.renewLease(leasePath, "second", 4_000, 1_500)).toBe(false);
+		expect(await first.renewLease(leasePath, "first", 5_000, 4_001)).toBe(false);
+		expect(await second.acquireLease(leasePath, "second", 5_000, 4_001)).toBe(true);
+		await first.releaseLease(leasePath, "first");
+		expect(await first.acquireLease(leasePath, "third", 5_000, 4_001)).toBe(false);
+		await second.releaseLease(leasePath, "second");
+		expect(await first.acquireLease(leasePath, "third", 6_000, 4_001)).toBe(true);
+	});
+});
+
 describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 	let tempDir: string;
 	let storage: FileSessionStorage;
@@ -324,6 +355,39 @@ describe("FileSessionStorage.deleteSessionWithArtifacts", () => {
 		await expect(storage.deleteSessionWithArtifacts(sessionPath)).resolves.toBeUndefined();
 		expect(fs.existsSync(sessionPath)).toBe(false);
 		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("deletes the canonical sidecar for an explicit non-jsonl session path", async () => {
+		const sessionPath = path.join(tempDir, "explicit-session");
+		const artifactsDir = sessionSidecarDir(sessionPath);
+		await Bun.write(sessionPath, "session\n");
+		await fsp.mkdir(artifactsDir, { recursive: true });
+		await Bun.write(path.join(artifactsDir, "scheduled_tasks.json"), "[]");
+
+		await storage.deleteSessionWithArtifacts(sessionPath);
+
+		expect(fs.existsSync(sessionPath)).toBe(false);
+		expect(fs.existsSync(artifactsDir)).toBe(false);
+	});
+
+	it("does not migrate an artifact-like truncated-path directory", async () => {
+		const sessionPath = path.join(tempDir, "session");
+		const unrelatedDir = sessionPath.slice(0, -".jsonl".length);
+		const canonicalDir = sessionSidecarDir(sessionPath);
+		await Bun.write(
+			sessionPath,
+			`${JSON.stringify({ type: "session", version: 3, id: "session-id", timestamp: "2025-01-01T00:00:00Z", cwd: tempDir })}\n`,
+		);
+		await fsp.mkdir(unrelatedDir, { recursive: true });
+		await Bun.write(path.join(unrelatedDir, "0.build.log"), "unrelated");
+
+		const manager = await SessionManager.open(sessionPath, tempDir, storage);
+		try {
+			expect(await Bun.file(path.join(unrelatedDir, "0.build.log")).text()).toBe("unrelated");
+			expect(fs.existsSync(canonicalDir)).toBe(false);
+		} finally {
+			await manager.close();
+		}
 	});
 
 	it("throws when artifact cleanup fails after the session file is deleted", async () => {
@@ -728,6 +792,84 @@ class PausableWriteFullBackend implements SessionStorageBackend {
 		return Promise.resolve();
 	}
 }
+class RefreshRaceBackend implements SessionStorageBackend {
+	readonly loadStarted = Promise.withResolvers<void>();
+	readonly releaseLoad = Promise.withResolvers<void>();
+	readonly #files = new Map<string, { content: string; mtimeMs: number }>();
+	#pauseNextLoad = false;
+
+	pauseNextLoad(): void {
+		this.#pauseNextLoad = true;
+	}
+
+	init(): Promise<void> {
+		return Promise.resolve();
+	}
+	async loadIndex(): Promise<Iterable<SessionStorageIndexEntry>> {
+		const snapshot = [...this.#files].map(([path, file]) => ({
+			path,
+			size: Buffer.byteLength(file.content),
+			mtimeMs: file.mtimeMs,
+		}));
+		if (this.#pauseNextLoad) {
+			this.#pauseNextLoad = false;
+			this.loadStarted.resolve();
+			await this.releaseLoad.promise;
+		}
+		return snapshot;
+	}
+	readFull(path: string): Promise<string | null> {
+		return Promise.resolve(this.#files.get(path)?.content ?? null);
+	}
+	readSlices(path: string, prefixBytes: number, suffixBytes: number): Promise<[string, string]> {
+		const content = this.#files.get(path)?.content ?? "";
+		return Promise.resolve([content.slice(0, prefixBytes), suffixBytes > 0 ? content.slice(-suffixBytes) : ""]);
+	}
+	writeFull(path: string, content: string, mtimeMs: number): Promise<void> {
+		this.#files.set(path, { content, mtimeMs });
+		return Promise.resolve();
+	}
+	append(path: string, line: string, mtimeMs: number): Promise<void> {
+		const content = `${this.#files.get(path)?.content ?? ""}${line}`;
+		this.#files.set(path, { content, mtimeMs });
+		return Promise.resolve();
+	}
+	updateSessionTitle(): Promise<void> {
+		return Promise.resolve();
+	}
+	truncate(path: string, mtimeMs: number): Promise<void> {
+		this.#files.set(path, { content: "", mtimeMs });
+		return Promise.resolve();
+	}
+	remove(paths: string[]): Promise<void> {
+		for (const path of paths) this.#files.delete(path);
+		return Promise.resolve();
+	}
+	move(src: string, dst: string, mtimeMs: number): Promise<void> {
+		const file = this.#files.get(src);
+		if (file) this.#files.set(dst, { ...file, mtimeMs });
+		this.#files.delete(src);
+		return Promise.resolve();
+	}
+}
+
+describe("IndexedSessionStorage refresh", () => {
+	it("preserves a write that starts while the backend index is loading", async () => {
+		const backend = new RefreshRaceBackend();
+		const storage = new IndexedSessionStorage(backend);
+		await storage.initialize();
+		backend.pauseNextLoad();
+		const refresh = storage.refresh();
+		await backend.loadStarted.promise;
+
+		await storage.writeText("/sessions/new.jsonl", "new session");
+		backend.releaseLoad.resolve();
+		await refresh;
+
+		expect(storage.existsSync("/sessions/new.jsonl")).toBe(true);
+		expect(await storage.readText("/sessions/new.jsonl")).toBe("new session");
+	});
+});
 
 describe("IndexedSessionStorage.writeTextAtomic commitGuard", () => {
 	it("aborts before touching the backend when the guard rejects up front", async () => {
