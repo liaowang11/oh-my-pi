@@ -8,6 +8,8 @@ export interface YieldDispatcher<P> {
 	build(survivors: P[]): AgentMessage | null;
 	/** If true, entries for this kind are drained only by {@link drainLazy} and never trigger the idle flush. */
 	skipIdleFlush?: boolean;
+	/** If true, enqueueing while streaming steers the built message into the agent immediately. */
+	interruptStreaming?: boolean;
 }
 
 export interface YieldQueueOptions {
@@ -23,6 +25,7 @@ interface StoredDispatcher {
 	isStale?: (entry: unknown) => boolean;
 	build: (survivors: unknown[]) => AgentMessage | null;
 	skipIdleFlush?: boolean;
+	interruptStreaming?: boolean;
 }
 
 interface StoredEntry {
@@ -55,6 +58,7 @@ export class YieldQueue {
 			...(dispatcher.isStale ? { isStale: entry => dispatcher.isStale?.(entry as P) ?? false } : {}),
 			build: survivors => dispatcher.build(survivors as P[]),
 			...(dispatcher.skipIdleFlush ? { skipIdleFlush: true } : {}),
+			...(dispatcher.interruptStreaming ? { interruptStreaming: true } : {}),
 		};
 		this.#dispatchers.set(kind, stored);
 		return () => {
@@ -66,19 +70,32 @@ export class YieldQueue {
 	}
 
 	enqueue<P>(kind: string, entry: P): void {
-		this.#enqueue(kind, { value: entry });
+		this.enqueueMany(kind, [entry]);
+	}
+
+	enqueueMany<P>(kind: string, incoming: P[]): void {
+		if (incoming.length === 0) return;
+		this.#enqueue(
+			kind,
+			incoming.map(value => ({ value })),
+		);
 	}
 
 	enqueueWithReceipt<P>(kind: string, entry: P): Promise<void> {
 		const { promise, resolve, reject } = Promise.withResolvers<void>();
-		if (!this.#enqueue(kind, { value: entry, resolve, reject })) {
+		if (!this.#enqueue(kind, [{ value: entry, resolve, reject }])) {
 			reject(new Error(`Yield queue entry ignored for unregistered kind: ${kind}`));
 		}
 		return promise;
 	}
 
-	#enqueue(kind: string, entry: StoredEntry): boolean {
-		if (!this.#dispatchers.has(kind)) {
+	/** Append the whole arrival before dispatching it. Entries that come due
+	 *  together — simultaneous scheduled prompts — must land in the queue before
+	 *  the streaming flush drains it, or the first one steers alone and the rest
+	 *  follow as separate notifications instead of one batch. */
+	#enqueue(kind: string, incoming: StoredEntry[]): boolean {
+		const dispatcher = this.#dispatchers.get(kind);
+		if (!dispatcher) {
 			logger.warn("Yield queue entry ignored for unregistered kind", { kind });
 			return false;
 		}
@@ -87,8 +104,10 @@ export class YieldQueue {
 			entries = [];
 			this.#entries.set(kind, entries);
 		}
-		entries.push(entry);
-		if (!this.#options.isStreaming() && !this.#dispatchers.get(kind)!.skipIdleFlush) {
+		for (const entry of incoming) entries.push(entry);
+		if (this.#options.isStreaming()) {
+			if (dispatcher.interruptStreaming) void this.flush("streaming", kind);
+		} else if (!dispatcher.skipIdleFlush) {
 			this.#scheduleIdleFlush();
 		}
 		return true;
@@ -132,12 +151,14 @@ export class YieldQueue {
 		}
 	}
 
-	async flush(mode: YieldFlushMode): Promise<void> {
+	/** Flush every registered kind, or only `onlyKind` when one is named. */
+	async flush(mode: YieldFlushMode, onlyKind?: string): Promise<void> {
 		if (mode === "idle") {
 			this.#idleFlushPending = false;
 		}
 		const idleMessages: BuiltMessage[] = [];
 		for (const [kind, dispatcher] of this.#dispatchers) {
+			if (onlyKind !== undefined && kind !== onlyKind) continue;
 			if (mode === "idle" && dispatcher.skipIdleFlush) continue;
 			const entries = this.#drain(kind);
 			if (entries.length === 0) continue;
@@ -172,6 +193,7 @@ export class YieldQueue {
 					]?.(dispatchError);
 				}
 				logger.warn("Yield queue idle dispatch failed", { error: formatError(error) });
+				throw error;
 			}
 		}
 	}
