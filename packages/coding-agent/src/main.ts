@@ -80,6 +80,7 @@ import {
 } from "./extensibility/plugins/marketplace-auto-update";
 import { registerDaemonProjectPresence } from "./launch/presence";
 import type { MCPManager } from "./mcp";
+import { cfgMessagingEnabled } from "./messaging/settings";
 import type { InteractiveMode } from "./modes/interactive-mode";
 import { formatSessionContinuationNotice } from "./modes/persistence-failure";
 import type { PrintModeOptions } from "./modes/print-mode";
@@ -151,6 +152,7 @@ import { resolveFirstLaunchPythonEvalWarning } from "./eval/startup-warning";
 import { CliUsageError } from "./cli/usage-error";
 import { scheduleGcAutoCompress } from "./cli/gc-auto-compress";
 import { cfgGcAutoCompress } from "./cli/gc-settings";
+import { isReservedAddress, RESERVED_SESSION_NAME_ERROR } from "./messaging/names";
 import { cfgGoalEnabled } from "./goals/settings";
 import { cfgPlanDefaultOnStartup, cfgPlanEnabled } from "./plan-mode/settings";
 
@@ -519,6 +521,7 @@ interface AcpSessionHandle {
 	session: AgentSession;
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 	eventBus: EventBus;
+	name?: string;
 }
 
 type AcpSessionFactory = (cwd: string, options?: { interactivePrompts?: boolean }) => Promise<AcpSessionHandle>;
@@ -529,7 +532,7 @@ export interface AcpSessionFactoryOptions {
 	sessionDir?: string;
 	authStorage: AuthStorage;
 	modelRegistry: ModelRegistry;
-	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools" | "invalidFlagValues">;
+	parsedArgs: Pick<Args, "apiKey" | "trustedExtensions" | "tools" | "invalidFlagValues" | "crossSession" | "name">;
 	rawArgs: string[];
 	createSession: (options: CreateAgentSessionOptions) => Promise<CreateAgentSessionResult>;
 }
@@ -567,6 +570,7 @@ async function loadTrustedSessionExtensions(
 export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSessionFactory {
 	return async (cwd, factoryOptions) => {
 		const nextSettings = await args.settings.cloneForCwd(cwd);
+		if (args.parsedArgs.crossSession) cfgMessagingEnabled.override(nextSettings, true);
 		const nextSessionManager = SessionManager.create(cwd, args.sessionDir);
 		const agentId = `acp:${nextSessionManager.getSessionId()}`;
 		// `baseOptions.titleSystemPrompt` is resolved from the launch cwd; an ACP
@@ -639,7 +643,7 @@ export function createAcpSessionFactory(args: AcpSessionFactoryOptions): AcpSess
 				throw error;
 			}
 		}
-		return { session: nextSession, setToolUIContext, eventBus };
+		return { session: nextSession, setToolUIContext, eventBus, name: args.parsedArgs.name };
 	};
 }
 
@@ -665,6 +669,7 @@ async function runInteractiveMode(
 	startupGoal?: string,
 	startupRestore?: () => Promise<RestoreOutcome>,
 	refreshScopedModelsAfterLogin?: () => Promise<void>,
+	startupName?: string,
 ): Promise<void> {
 	const InteractiveModeConstructor = await loadInteractiveModeConstructor();
 	let mode: InteractiveMode;
@@ -727,6 +732,7 @@ async function runInteractiveMode(
 				suppressWelcomeIntro: resuming || setupScenes.length > 0 || playStartupSplash,
 				clearInitialTerminalHistory: true,
 				autoStartCollab: joinLink === undefined,
+				name: startupName,
 			}),
 		);
 		startDeferredStartupWork?.(mode);
@@ -1829,6 +1835,12 @@ export async function runRootCommand(
 	rawArgs: string[],
 	deps: RunRootCommandDependencies = DEFAULT_RUN_ROOT_DEPENDENCIES,
 ): Promise<void> {
+	if (parsed.name !== undefined && isReservedAddress(parsed.name.trim())) {
+		throw new CliUsageError(RESERVED_SESSION_NAME_ERROR);
+	}
+	// A child omp process must never inherit another session's script credentials.
+	delete process.env.OMP_MESSAGING_SOCKET;
+	delete process.env.OMP_MESSAGING_TOKEN;
 	logger.startTiming();
 	startStartupWatchdog();
 	try {
@@ -1975,6 +1987,7 @@ export async function runRootCommand(
 		}
 
 		const settingsInstance = await settingsPromise;
+		if (parsedArgs.crossSession) cfgMessagingEnabled.override(settingsInstance, true);
 		// Process-lifetime: broker/account-policy edits reconfigure the shared credential store.
 		createAuthStorageSettingsSync(settingsInstance, authStorage);
 		if (parsedArgs.approvalMode) {
@@ -2831,6 +2844,7 @@ export async function runRootCommand(
 					subagentEventBus,
 					mcpManager,
 					input: rpcInput,
+					name: parsedArgs.name,
 				});
 			} else if (isInteractive) {
 				const versionCheckPromise = checkForNewVersion(VERSION).catch(() => undefined);
@@ -2883,6 +2897,7 @@ export async function runRootCommand(
 						initialArgs.goal,
 						parsedArgs.restore ? () => restoreSession(session, { eventBus, subagentEventBus }) : undefined,
 						refreshScopedModelsAfterLogin,
+						parsedArgs.name,
 					);
 				} finally {
 					startupLease?.dispose();
@@ -2903,6 +2918,7 @@ export async function runRootCommand(
 					planYolo: parsedArgs.planYolo,
 					mcpManager,
 					deadline: sessionOptions.deadline,
+					name: parsedArgs.name,
 				});
 				if ($env.PI_TIMING) {
 					logger.printTimings();

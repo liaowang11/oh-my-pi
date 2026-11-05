@@ -129,6 +129,7 @@ import {
 	SessionWriteConflictError,
 } from "./session-storage";
 import {
+	cleanSessionTitle,
 	parseTitleSlotFromContent,
 	type SessionTitleUpdate,
 	serializeTitleSlot,
@@ -2330,13 +2331,6 @@ export class SessionManager {
 		}
 	}
 
-	static #cleanTitle(raw: string): string {
-		return raw
-			.replace(/[\u0000-\u001f\u007f-\u009f]/g, " ")
-			.replace(/ +/g, " ")
-			.trim();
-	}
-
 	/** Puts a binary blob into the blob store and returns the blob reference. */
 	async putBlob(data: Buffer, options?: BlobPutOptions): Promise<BlobPutResult> {
 		return this.#blobs.put(data, options);
@@ -3546,7 +3540,7 @@ export class SessionManager {
 		if (this.#released) return false;
 		if (this.#titleSource === "user" && source === "auto") return false;
 
-		const title = SessionManager.#cleanTitle(name);
+		const title = cleanSessionTitle(name);
 		if (!title) return false;
 
 		const previousTitle = this.#sessionName;
@@ -4615,7 +4609,7 @@ export class SessionManager {
 		patch: { title?: string; archived?: boolean },
 		storage: SessionStorage = new FileSessionStorage(),
 	): Promise<void> {
-		const title = patch.title === undefined ? undefined : SessionManager.#cleanTitle(patch.title) || undefined;
+		const title = patch.title === undefined ? undefined : cleanSessionTitle(patch.title) || undefined;
 		const [prefix] = await storage.readTextSlices(session.path, SESSION_TITLE_SLOT_BYTES, 0);
 		const slot = titleUpdateFromSlot(parseTitleSlotFromContent(prefix));
 		if (slot) {

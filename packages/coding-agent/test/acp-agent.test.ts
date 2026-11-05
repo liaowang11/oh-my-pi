@@ -39,6 +39,7 @@ import * as sdkModule from "@oh-my-pi/pi-coding-agent/sdk";
 import { SILENT_ABORT_MARKER, USER_INTERRUPT_LABEL } from "@oh-my-pi/pi-coding-agent/session/messages";
 import type { ClientBridge } from "@oh-my-pi/pi-coding-agent/session/client-bridge";
 import { closeSessionIndex } from "@oh-my-pi/pi-coding-agent/session/session-index";
+import * as messagingHost from "@oh-my-pi/pi-coding-agent/session/messaging-host";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import {
 	type SubagentLifecyclePayload,
@@ -2373,6 +2374,40 @@ describe("ACP agent", () => {
 			unregister();
 			session.isStreaming = false;
 			await harness.agent.closeSession({ sessionId: created.sessionId });
+			harness.abortController.abort();
+		}
+	});
+
+	it("binds cross-session messaging per conversation, receives only after the bootstrap guard, and unbinds on close", async () => {
+		const lifecycle: string[] = [];
+		const binding = {
+			ready: vi.fn(() => {
+				lifecycle.push("ready");
+			}),
+			stopReceiving: vi.fn(),
+			dispose: vi.fn(async () => {
+				lifecycle.push("dispose");
+			}),
+		};
+		const bind = spyOn(messagingHost, "bindSessionMessaging").mockImplementation(async () => {
+			lifecycle.push("bind");
+			return binding;
+		});
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		try {
+			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+			const session = harness.findSession(created.sessionId)!;
+			expect(bind).toHaveBeenCalledWith(session, { directPrint: false });
+			// Peers must not wake a conversation the client has not been told about yet.
+			expect(binding.ready).not.toHaveBeenCalled();
+			await advanceBootstrapGuard();
+			expect(binding.ready).toHaveBeenCalledTimes(1);
+			await harness.agent.closeSession({ sessionId: created.sessionId });
+			expect(lifecycle).toEqual(["bind", "ready", "dispose"]);
+		} finally {
+			bind.mockRestore();
+			vi.useRealTimers();
 			harness.abortController.abort();
 		}
 	});
