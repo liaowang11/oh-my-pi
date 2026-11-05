@@ -177,6 +177,8 @@ import {
 	type SessionWorktree,
 	type WorktreeExitPlan,
 } from "../session/session-worktree";
+import { bindSessionMessaging } from "../session/messaging-host";
+import { claimSessionName } from "../messaging/names";
 import type { ShakeMode } from "../session/shake-types";
 import { BUILTIN_SLASH_COMMAND_RESERVED_NAMES, buildTuiBuiltinSlashCommands } from "../slash-commands/builtin-registry";
 import { buildStaticInlineHint } from "../slash-commands/builtin-completions";
@@ -2034,6 +2036,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	#eventBus?: EventBus;
 	#subagentEventBus?: EventBus;
 	#eventBusUnsubscribers: Array<() => void> = [];
+	#messagingBinding?: { ready(): void; dispose(): Promise<void> };
 	/** Mirror of `tui.mouse`, read by the TUI's per-frame inline mouse tracking probe. */
 	#mouseCapture = false;
 	/** A link-scheme change awaits its transcript rebuild; any rebuild before it covers it. */
@@ -2440,7 +2443,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.composer.playWelcomeIntro();
 	}
 
-	async init(options: InteractiveModeInitOptions = {}): Promise<void> {
+	async init(options: InteractiveModeInitOptions & { name?: string } = {}): Promise<void> {
 		if (this.isInitialized) return;
 		this.#idleMaintenanceActivity.scheduledTurn = target =>
 			target === this.session &&
@@ -2481,6 +2484,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			saveDraft: text => this.sessionManager.saveDraft(text),
 			disposeSession: async reason => {
 				await this.#btwController.dispose();
+				await this.#messagingBinding?.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 					reason,
@@ -2817,6 +2821,18 @@ export class InteractiveMode implements InteractiveModeContext {
 		// startup; early dialog answers do not require that readiness signal.
 		if (options.autoStartCollab === true) this.collabController.autoStart();
 
+		this.#messagingBinding = await bindSessionMessaging(this.session, {
+			directPrint: false,
+			askApproval: (view, signal, onPresented) =>
+				this.#extensionUiController.askCrossSessionApproval(view, signal, onPresented),
+		});
+		if (options.name !== undefined) {
+			const taken = new Set(
+				(await this.session.messaging?.listSessions())?.flatMap(item => (item.name === null ? [] : [item.name])),
+			);
+			await this.sessionManager.setSessionName(claimSessionName(options.name, taken), "user");
+		}
+
 		// Initialize hooks with TUI-based UI context
 		await logger.time("InteractiveMode.init:hooks", () => this.initHooksAndCustomTools());
 		// A live `disabledExtensions` edit suspends or resumes extensions: drop (or restore) their link
@@ -3039,6 +3055,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		this.syncIdleMaintenanceView();
 		// Publish native send readiness even when no user input triggers another frame.
 		this.ui.requestRender();
+		this.#messagingBinding.ready();
 	}
 
 	/** Reload the title-generation system prompt override for the provided working
@@ -8438,6 +8455,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			if (this.#signalTeardown) {
 				await this.#signalTeardown();
 			} else {
+				await this.#messagingBinding?.dispose();
 				await this.session.dispose({
 					mnemopiConsolidateTimeoutMs: SHUTDOWN_CONSOLIDATE_BUDGET_MS,
 				});

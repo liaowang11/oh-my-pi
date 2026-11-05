@@ -79,6 +79,7 @@ import {
 import { cfgGoalContinuationModes } from "../../goals/settings";
 import { goalContinuationActivity } from "../../goals/state";
 import { MCPManager } from "../../mcp/manager";
+import { claimSessionName } from "../../messaging/names";
 import { reconnectMcpManagerServer } from "../../mcp/oauth-reauth";
 import type { MCPServerConfig } from "../../mcp/types";
 import { loadAllExtensions } from "../../modes/components/extensions/state-manager";
@@ -93,6 +94,7 @@ import { autosaveApprovedPlan } from "../../plan-mode/plan-autosave";
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
+import { bindSessionMessaging } from "../../session/messaging-host";
 import {
 	bashExecutionToText,
 	formatFileMention,
@@ -592,6 +594,7 @@ type ManagedSessionRecord = {
 	// Capture at registration, independently of prompt turns. Delivery opens
 	// after the bootstrap guard or a client prompt proves the session is known.
 	lifetimeUnsubscribe: (() => void) | undefined;
+	messagingBinding: { ready(): void; dispose(): Promise<void> } | undefined;
 	commandMetadataUnsubscribe: (() => void) | undefined;
 	lifetimeUpdatesReady: boolean;
 	pendingLifetimeEvents: Array<{ event: AgentSessionEvent; autonomous: boolean }> | undefined;
@@ -711,6 +714,8 @@ type AcpSessionHandle = {
 	setToolUIContext: (uiContext: ExtensionUIContext, hasUI: boolean) => void;
 	// The bus the session's task tool publishes subagent frames on.
 	eventBus?: EventBus;
+	// `--name`: the cross-session messaging name to claim for this conversation.
+	name?: string;
 };
 
 type CreateAcpSession = (
@@ -876,10 +881,16 @@ function normalizeCreatedAcpSession(created: AgentSession | AcpSessionHandle): {
 	session: AgentSession;
 	setToolUIContext: AcpSessionHandle["setToolUIContext"] | undefined;
 	eventBus: EventBus | undefined;
+	name: string | undefined;
 } {
 	return "session" in created
-		? { session: created.session, setToolUIContext: created.setToolUIContext, eventBus: created.eventBus }
-		: { session: created, setToolUIContext: undefined, eventBus: undefined };
+		? {
+				session: created.session,
+				setToolUIContext: created.setToolUIContext,
+				eventBus: created.eventBus,
+				name: created.name,
+			}
+		: { session: created, setToolUIContext: undefined, eventBus: undefined, name: undefined };
 }
 
 type AcpSpeechOption = {
@@ -2541,14 +2552,14 @@ export class AcpAgent implements Agent {
 	}
 
 	async #createNewSessionRecord(cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus, name } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
 		);
 		// The session file stays lazy (written with the first assistant message),
 		// so a session/new that is never prompted leaves nothing on disk.
-		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, undefined, eventBus);
+		return await this.#registerPreparedSession(session, mcpServers, setToolUIContext, undefined, eventBus, name);
 	}
 
 	async #loadManagedSession(sessionId: string, cwd: string, mcpServers: McpServer[]): Promise<ManagedSessionRecord> {
@@ -2603,7 +2614,7 @@ export class AcpAgent implements Agent {
 
 	async #forkManagedSession(params: ForkSessionRequest): Promise<ManagedSessionRecord> {
 		const sourcePath = await this.#resolveForkSourceSessionPath(params.sessionId);
-		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus, name } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(params.cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -2637,6 +2648,7 @@ export class AcpAgent implements Agent {
 			setToolUIContext,
 			undefined,
 			eventBus,
+			name,
 		);
 	}
 
@@ -2678,7 +2690,7 @@ export class AcpAgent implements Agent {
 		mcpServers: McpServer[],
 		protocolSessionId: string,
 	): Promise<ManagedSessionRecord> {
-		const { session, setToolUIContext, eventBus } = normalizeCreatedAcpSession(
+		const { session, setToolUIContext, eventBus, name } = normalizeCreatedAcpSession(
 			await this.#createSession(path.resolve(cwd), {
 				interactivePrompts: this.#clientCapabilities?.elicitation?.form != null,
 			}),
@@ -2707,6 +2719,7 @@ export class AcpAgent implements Agent {
 			setToolUIContext,
 			protocolSessionId,
 			eventBus,
+			name,
 		);
 		if (continuation) {
 			record.pendingNotices.push({ severity: "info", title: formatSessionContinuationNotice(continuation) });
@@ -2778,6 +2791,7 @@ export class AcpAgent implements Agent {
 		setToolUIContext: ((uiContext: ExtensionUIContext, hasUI: boolean) => void) | undefined,
 		protocolSessionId = session.sessionId,
 		eventBus: EventBus | undefined,
+		name?: string,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext, protocolSessionId);
 		// Registered before extensions start: a `session_start` handler can already replace the durable session.
@@ -2845,6 +2859,12 @@ export class AcpAgent implements Agent {
 				this.#handleLifetimeEvent(record, event);
 			});
 			record.lifetimeUnsubscribe = unsubscribeEvents;
+			record.messagingBinding = await bindSessionMessaging(session, { directPrint: false });
+			if (name !== undefined) {
+				const sessions = (await session.messaging?.listSessions()) ?? [];
+				const taken = new Set(sessions.flatMap(other => (other.name === null ? [] : [other.name])));
+				await session.setSessionName(claimSessionName(name, taken), "user");
+			}
 			await this.#restoreStoredGoal(session);
 			await this.#configureExtensions(record);
 			await this.#configureMcpServers(record, mcpServers);
@@ -2903,6 +2923,7 @@ export class AcpAgent implements Agent {
 			pendingPromptDispatches: [],
 			extensionUserMessageTasks: new Set(),
 			lifetimeUnsubscribe: undefined,
+			messagingBinding: undefined,
 			commandMetadataUnsubscribe: undefined,
 			lifetimeUpdatesReady: false,
 			pendingLifetimeEvents: undefined,
@@ -4760,6 +4781,7 @@ export class AcpAgent implements Agent {
 			if (options.runStateSnapshot && (isPromptTurnInFlight(record.promptTurn) || record.session.isStreaming)) {
 				this.#setRunState(record, "running", undefined, true);
 			}
+			record.messagingBinding?.ready();
 			void this.#emitBootstrapUpdates(sessionId, record);
 			void this.#emitDiscoveredModelOptions(sessionId, record);
 		}, ACP_BOOTSTRAP_RACE_GUARD_MS);
@@ -5613,7 +5635,7 @@ export class AcpAgent implements Agent {
 				setServiceTier: (family, tier) => record.session.setServiceTierFamily(family, tier),
 				getSessionName: () => record.session.sessionManager.getSessionName(),
 				setSessionName: async name => {
-					await record.session.sessionManager.setSessionName(name, "user");
+					await record.session.setSessionName(name, "user");
 				},
 			},
 			{
@@ -5803,6 +5825,12 @@ export class AcpAgent implements Agent {
 	async #disposeSessionRecord(record: ManagedSessionRecord, reason?: postmortem.Reason): Promise<void> {
 		record.lifetimeUnsubscribe?.();
 		record.commandMetadataUnsubscribe?.();
+		try {
+			await record.messagingBinding?.dispose();
+		} catch (error) {
+			logger.warn("Failed to dispose ACP messaging binding", { error });
+		}
+		record.messagingBinding = undefined;
 		record.pendingLifetimeEvents = undefined;
 		record.titleUnsubscribe?.();
 		record.promptSuggestionAbort?.abort();
