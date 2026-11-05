@@ -3336,6 +3336,10 @@ export class SessionManager {
 		return this.#sessionFile;
 	}
 
+	getStorage(): SessionStorage {
+		return this.#storage;
+	}
+
 	/**
 	 * Whether the current session has actually been materialized to durable
 	 * storage (the JSONL exists on disk / in the active storage backend).

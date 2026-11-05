@@ -6,6 +6,7 @@
  * the agent-core queue; there is no separate display mirror to splice.
  */
 import { afterEach, beforeEach, describe, expect, it, type Mock, vi } from "bun:test";
+import * as fs from "node:fs/promises";
 import * as path from "node:path";
 import { Agent } from "@oh-my-pi/pi-agent-core";
 import type { ImageContent, TextContent } from "@oh-my-pi/pi-ai";
@@ -25,6 +26,7 @@ import {
 	type SkillPromptDetails,
 	USER_INTERRUPT_LABEL,
 } from "@oh-my-pi/pi-coding-agent/session/messages";
+import { SCHEDULED_NOTIFICATION_KIND } from "@oh-my-pi/pi-coding-agent/session/scheduled-notification";
 import { SessionManager } from "@oh-my-pi/pi-coding-agent/session/session-manager";
 import { Container } from "@oh-my-pi/pi-tui";
 import { TempDir } from "@oh-my-pi/pi-utils";
@@ -565,7 +567,13 @@ interface SessionFixture {
 	session: AgentSession;
 }
 
-async function createRealSession(): Promise<SessionFixture> {
+interface SessionFixtureOptions {
+	persisted?: boolean;
+	beginSessionFork?: () => Promise<void>;
+	completeSessionFork?: (result: { oldSessionFile: string; newSessionFile: string } | undefined) => Promise<void>;
+}
+
+async function createRealSession(options: SessionFixtureOptions = {}): Promise<SessionFixture> {
 	const tempDir = TempDir.createSync("@pi-skill-queue-real-");
 	const authStorage = await AuthStorage.create(path.join(tempDir.path(), "testauth.db"));
 	authStorage.keys.setRuntime("anthropic", "test-key");
@@ -584,9 +592,13 @@ async function createRealSession(): Promise<SessionFixture> {
 
 	const session = new AgentSession({
 		agent,
-		sessionManager: SessionManager.inMemory(),
+		sessionManager: options.persisted
+			? SessionManager.create(tempDir.path(), path.join(tempDir.path(), "sessions"))
+			: SessionManager.inMemory(),
 		settings: Settings.isolated(),
 		modelRegistry,
+		beginSessionFork: options.beginSessionFork,
+		completeSessionFork: options.completeSessionFork,
 	});
 
 	return { tempDir, authStorage, session };
@@ -722,6 +734,488 @@ describe("AgentSession derived queued custom display", () => {
 		await session.abort({ reason: USER_INTERRUPT_LABEL });
 		expect(session.agent.hasQueuedMessages()).toBe(false);
 		expect(session.agent.state.messages).toMatchObject([{ role: "custom", content: "peer pinged you" }]);
+	});
+
+	it("allows the same scheduled prompt after its prior wake turn completes", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const prompt = vi.spyOn(session.agent, "prompt");
+
+		await session.deliverScheduledPrompt("retry backup");
+		await session.waitForIdle();
+		await session.deliverScheduledPrompt("retry backup");
+
+		expect(prompt).toHaveBeenCalledTimes(2);
+	});
+
+	it("acknowledges an idle scheduled prompt after the wake turn starts", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const wake = Promise.withResolvers<void>();
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			await wake.promise;
+		});
+		let accepted = false;
+		const delivery = session.deliverScheduledPrompt("idle backup").then(() => {
+			accepted = true;
+		});
+		const scheduled = Promise.withResolvers<void>();
+		setImmediate(scheduled.resolve);
+		await scheduled.promise;
+		await delivery;
+		expect(accepted).toBe(true);
+
+		wake.resolve();
+	});
+
+	it("rejects an idle scheduled prompt when wake injection fails", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		const prompt = vi
+			.spyOn(session.agent, "prompt")
+			.mockRejectedValueOnce(new Error("wake failed"))
+			.mockResolvedValue();
+
+		await expect(session.deliverScheduledPrompt("retry backup")).rejects.toThrow("wake failed");
+		await expect(session.deliverScheduledPrompt("retry backup")).resolves.toBeUndefined();
+		expect(prompt).toHaveBeenCalledTimes(2);
+	});
+
+	it("counts a streaming scheduled prompt kept by an interrupt as delivered", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const delivery = session.deliverScheduledPrompt("streaming backup");
+		const scheduled = Promise.withResolvers<void>();
+		setImmediate(scheduled.resolve);
+		await scheduled.promise;
+
+		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+		// An interrupt records agent-side queued work instead of dropping it, so the
+		// scheduler must not retry the prompt.
+		session.clearQueue({ forInterrupt: true });
+		await expect(delivery).resolves.toBeUndefined();
+		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+	});
+
+	it("settles a consumed streaming prompt before event subscribers run", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const delivery = session.deliverScheduledPrompt("streaming backup");
+		const scheduled = Promise.withResolvers<void>();
+		setImmediate(scheduled.resolve);
+		await scheduled.promise;
+		const message = session.agent.peekSteeringQueue()[0];
+		if (!message) throw new Error("Expected queued scheduled prompt");
+		session.subscribe(event => {
+			if (event.type === "message_end" && event.message === message) session.beginDispose();
+		});
+
+		session.agent.emitExternalEvent({ type: "message_end", message });
+
+		await expect(delivery).resolves.toBeUndefined();
+	});
+
+	it("rejects a streaming scheduled prompt when disposal begins", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => true });
+		const delivery = session.deliverScheduledPrompt("streaming backup");
+		const scheduled = Promise.withResolvers<void>();
+		setImmediate(scheduled.resolve);
+		await scheduled.promise;
+
+		expect(session.agent.peekSteeringQueue()).toHaveLength(1);
+		session.beginDispose();
+		await expect(delivery).rejects.toThrow("Session disposed before scheduled prompt delivery.");
+	});
+
+	it("drops queued scheduled notifications when starting a new logical session", async () => {
+		fixture = await createRealSession();
+		const { session } = fixture;
+		session.yieldQueue.enqueue(SCHEDULED_NOTIFICATION_KIND, { prompt: "old session work" });
+		expect(session.yieldQueue.has(SCHEDULED_NOTIFICATION_KIND)).toBe(true);
+
+		await session.newSession();
+
+		expect(session.yieldQueue.has(SCHEDULED_NOTIFICATION_KIND)).toBe(false);
+	});
+
+	it("suspends session services across a new-session transition", async () => {
+		let suspended = false;
+		let aborted = false;
+		const transitions: string[] = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				expect(aborted).toBe(true);
+				suspended = true;
+				transitions.push("suspend");
+			},
+			completeSessionFork: async result => {
+				expect(result).toBeUndefined();
+				suspended = false;
+				transitions.push("resume");
+			},
+		});
+		const { session } = fixture;
+		const abort = session.abort.bind(session);
+		vi.spyOn(session, "abort").mockImplementation(async options => {
+			aborted = true;
+			await abort(options);
+		});
+		const startNewSession = session.sessionManager.newSession.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "newSession").mockImplementation(async options => {
+			expect(suspended).toBe(true);
+			transitions.push("new");
+			await startNewSession(options);
+		});
+
+		await session.newSession();
+
+		expect(suspended).toBe(false);
+		expect(transitions).toEqual(["suspend", "new", "resume"]);
+	});
+
+	it("suspends session services across a session switch", async () => {
+		let suspended = false;
+		let aborted = false;
+		const transitions: string[] = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				expect(aborted).toBe(true);
+				suspended = true;
+				transitions.push("suspend");
+			},
+			completeSessionFork: async result => {
+				expect(result).toBeUndefined();
+				suspended = false;
+				transitions.push("resume");
+			},
+		});
+		const { session } = fixture;
+		const abort = session.abort.bind(session);
+		vi.spyOn(session, "abort").mockImplementation(async options => {
+			aborted = true;
+			await abort(options);
+		});
+		await session.sessionManager.ensureOnDisk();
+		const sessionFile = session.sessionFile;
+		if (!sessionFile) throw new Error("Expected persisted session");
+		const setSessionFile = session.sessionManager.setSessionFile.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "setSessionFile").mockImplementation(async target => {
+			expect(suspended).toBe(true);
+			transitions.push("switch");
+			await setSessionFile(target);
+		});
+
+		await session.switchSession(sessionFile);
+
+		expect(suspended).toBe(false);
+		expect(transitions).toEqual(["suspend", "switch", "resume"]);
+	});
+
+	it("suspends session services across a branch transition", async () => {
+		let suspended = false;
+		const transitions: string[] = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				suspended = true;
+				transitions.push("suspend");
+			},
+			completeSessionFork: async result => {
+				expect(result).toBeUndefined();
+				suspended = false;
+				transitions.push("resume");
+			},
+		});
+		const { session } = fixture;
+		session.sessionManager.appendMessage({ role: "user", content: "ancestor", timestamp: 1 });
+		session.sessionManager.appendMessage({ role: "user", content: "branch point", timestamp: 2 });
+		const entryId = session.sessionManager.getLeafId();
+		if (!entryId) throw new Error("Expected a branchable entry");
+		const createBranchedSession = session.sessionManager.createBranchedSession.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "createBranchedSession").mockImplementation(parentId => {
+			expect(suspended).toBe(true);
+			transitions.push("branch");
+			createBranchedSession(parentId);
+		});
+
+		await session.branch(entryId);
+
+		expect(suspended).toBe(false);
+		expect(transitions).toEqual(["suspend", "branch", "resume"]);
+	});
+
+	it("suspends session services before flushing fork state", async () => {
+		let suspended = false;
+		const transitions: string[] = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				suspended = true;
+				transitions.push("suspend");
+			},
+			completeSessionFork: async () => {
+				suspended = false;
+				transitions.push("resume");
+			},
+		});
+		const { session } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		const flush = session.sessionManager.flush.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "flush").mockImplementation(async () => {
+			expect(suspended).toBe(true);
+			transitions.push("flush");
+			await flush();
+		});
+
+		await session.fork();
+
+		expect(suspended).toBe(false);
+		expect(transitions).toEqual(["suspend", "flush", "resume"]);
+	});
+
+	it("cancels a streaming scheduled delivery before suspending fork services", async () => {
+		let deliverySettled = false;
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				await Promise.resolve();
+				expect(deliverySettled).toBe(true);
+			},
+			completeSessionFork: async () => {},
+		});
+		const { session } = fixture;
+		let streaming = true;
+		Object.defineProperty(session, "isStreaming", { configurable: true, get: () => streaming });
+		const delivery = session.deliverScheduledPrompt("queued before fork");
+		void delivery.catch(() => {
+			deliverySettled = true;
+		});
+		const queued = Promise.withResolvers<void>();
+		setImmediate(queued.resolve);
+		await queued.promise;
+		vi.spyOn(session, "abort").mockImplementation(async () => {
+			streaming = false;
+		});
+		await session.sessionManager.ensureOnDisk();
+
+		await expect(session.fork()).resolves.toBe(true);
+		await expect(delivery).rejects.toThrow("Session changed before scheduled prompt delivery.");
+	});
+
+	it("resumes fork services after adopting the fork session identity", async () => {
+		let resumedSessionId: string | undefined;
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async () => {
+				resumedSessionId = fixture?.session.agent.sessionId;
+			},
+		});
+		const { session } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		const previousSessionId = session.agent.sessionId;
+		await expect(session.fork()).resolves.toBe(true);
+
+		expect(session.agent.sessionId).not.toBe(previousSessionId);
+		expect(resumedSessionId).toBe(session.agent.sessionId);
+	});
+
+	it("resumes session services when the pre-fork flush fails", async () => {
+		let resumes = 0;
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async () => {
+				resumes++;
+			},
+		});
+		const { session } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		vi.spyOn(session.sessionManager, "flush").mockRejectedValue(new Error("flush persistence failed"));
+
+		await expect(session.fork()).rejects.toThrow("flush persistence failed");
+
+		expect(resumes).toBe(1);
+	});
+
+	it("resumes session services when the pre-branch flush fails", async () => {
+		let resumes = 0;
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async () => {
+				resumes++;
+			},
+		});
+		const { session } = fixture;
+		session.sessionManager.appendMessage({ role: "user", content: "ancestor", timestamp: 1 });
+		session.sessionManager.appendMessage({ role: "user", content: "branch point", timestamp: 2 });
+		const entryId = session.sessionManager.getLeafId();
+		if (!entryId) throw new Error("Expected a branchable entry");
+		vi.spyOn(session.sessionManager, "flush").mockRejectedValue(new Error("flush persistence failed"));
+
+		await expect(session.branch(entryId)).rejects.toThrow("flush persistence failed");
+
+		expect(resumes).toBe(1);
+	});
+
+	it("retries committed fork finalization with the fork paths", async () => {
+		const finalized: Array<{ oldSessionFile: string; newSessionFile: string } | undefined> = [];
+		const recovered = Promise.withResolvers<void>();
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async result => {
+				finalized.push(result);
+				if (finalized.length === 1) throw new Error("sidecar copy failed");
+				recovered.resolve();
+			},
+		});
+		const { session } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		const oldSessionFile = session.sessionFile;
+		if (!oldSessionFile) throw new Error("Expected persisted source session");
+
+		await expect(session.fork()).resolves.toBe(true);
+		await recovered.promise;
+
+		const newSessionFile = session.sessionFile;
+		if (!newSessionFile) throw new Error("Expected persisted fork session");
+		expect(newSessionFile).not.toBe(oldSessionFile);
+		expect(finalized).toEqual([
+			{ oldSessionFile, newSessionFile },
+			{ oldSessionFile, newSessionFile },
+		]);
+	});
+
+	it("cancels stale service recovery when a newer transition starts", async () => {
+		const finalized: Array<{ oldSessionFile: string; newSessionFile: string } | undefined> = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async result => {
+				finalized.push(result);
+				if (finalized.length === 1) throw new Error("fork resume failed");
+			},
+		});
+		const { session, tempDir } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		await expect(session.fork()).resolves.toBe(true);
+		const newCwd = path.join(tempDir.path(), "newer-transition");
+		await fs.mkdir(newCwd);
+
+		await session.moveSession(newCwd);
+		await Bun.sleep(400);
+
+		expect(finalized).toHaveLength(2);
+		expect(finalized[0]).toBeDefined();
+		expect(finalized[1]).toBeUndefined();
+	});
+
+	it("suspends session services while moving persisted artifacts", async () => {
+		let suspended = false;
+		const transitions: string[] = [];
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				suspended = true;
+				transitions.push("suspend");
+			},
+			completeSessionFork: async result => {
+				expect(result).toBeUndefined();
+				suspended = false;
+				transitions.push("resume");
+			},
+		});
+		const { session, tempDir } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		const moveTo = session.sessionManager.moveTo.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "moveTo").mockImplementation(async (...args) => {
+			expect(suspended).toBe(true);
+			transitions.push("move");
+			await moveTo(...args);
+		});
+		const newCwd = path.join(tempDir.path(), "moved-cwd");
+		await fs.mkdir(newCwd);
+
+		await session.moveSession(newCwd);
+
+		expect(suspended).toBe(false);
+		expect(transitions).toEqual(["suspend", "move", "resume"]);
+	});
+
+	it("defers a scheduled wake requested during a session move until the move settles", async () => {
+		const order: string[] = [];
+		let delivery: Promise<void> | undefined;
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {
+				delivery = fixture?.session.deliverScheduledPrompt("fired mid-move");
+			},
+			completeSessionFork: async () => {},
+		});
+		const { session, tempDir } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		vi.spyOn(session.agent, "prompt").mockImplementation(async () => {
+			order.push("wake");
+		});
+		const moveTo = session.sessionManager.moveTo.bind(session.sessionManager);
+		vi.spyOn(session.sessionManager, "moveTo").mockImplementation(async (...args) => {
+			// Let the delivery's deferred batch run while the move is still in flight.
+			const tick = Promise.withResolvers<void>();
+			setImmediate(tick.resolve);
+			await tick.promise;
+			order.push("move");
+			await moveTo(...args);
+		});
+		const newCwd = path.join(tempDir.path(), "wake-safe-move");
+		await fs.mkdir(newCwd);
+
+		await session.moveSession(newCwd);
+		await delivery;
+
+		expect(order).toEqual(["move", "wake"]);
+	});
+
+	it("retries move resumption without blocking session idle", async () => {
+		let attempts = 0;
+		const retryStarted = Promise.withResolvers<void>();
+		const finishRetry = Promise.withResolvers<void>();
+		const resumed = Promise.withResolvers<void>();
+		fixture = await createRealSession({
+			persisted: true,
+			beginSessionFork: async () => {},
+			completeSessionFork: async () => {
+				attempts += 1;
+				if (attempts === 1) throw new Error("sidecar read failed");
+				retryStarted.resolve();
+				await finishRetry.promise;
+				resumed.resolve();
+			},
+		});
+		const { session, tempDir } = fixture;
+		await session.sessionManager.ensureOnDisk();
+		const newCwd = path.join(tempDir.path(), "committed-move");
+		await fs.mkdir(newCwd);
+
+		await expect(session.moveSession(newCwd)).resolves.toBeUndefined();
+		await retryStarted.promise;
+		const reachedIdle = await Promise.race([
+			session.agent.waitForIdle().then(() => true),
+			Bun.sleep(100).then(() => false),
+		]);
+		finishRetry.resolve();
+		await resumed.promise;
+
+		expect(reachedIdle).toBe(true);
+		expect(session.sessionManager.getCwd()).toBe(newCwd);
+		expect(attempts).toBe(2);
 	});
 
 	it("counts a queued advisor card as pending work but keeps it out of chips and restore", async () => {
