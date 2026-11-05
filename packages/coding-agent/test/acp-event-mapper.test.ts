@@ -131,6 +131,37 @@ class ReplayTestSession {
 }
 
 describe("ACP event mapper", () => {
+	it("shows another session's raw message as its own agent message and keeps local IRC off the stream", () => {
+		const incoming = (remote: boolean) =>
+			({
+				type: "irc_message",
+				message: {
+					role: "custom",
+					customType: "irc:incoming",
+					content: "escaped model text",
+					display: true,
+					timestamp: Date.now(),
+					details: { remote, from: "release notes", message: "Raw <text> for the editor", shortId: "1234abcd" },
+				},
+			}) as AgentSessionEvent;
+		const updates = mapAgentSessionEventToAcpSessionUpdates(incoming(true), "editor-id");
+		expect(updates).toEqual([
+			{
+				sessionId: "editor-id",
+				update: {
+					sessionUpdate: "agent_message_chunk",
+					content: {
+						type: "text",
+						text: "**Message from another session @release notes:** Raw <text> for the editor",
+					},
+					messageId: expect.any(String),
+				},
+			},
+		]);
+		expectAcpNotifications(updates);
+		expect(mapAgentSessionEventToAcpSessionUpdates(incoming(false), "editor-id")).toEqual([]);
+	});
+
 	it("attaches a stable messageId to live assistant chunks", () => {
 		const assistantMessage = makeAssistantMessage("chunk");
 		const getMessageId = (message: unknown): string | undefined =>

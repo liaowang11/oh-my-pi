@@ -682,6 +682,8 @@ export class Settings {
 	#changeListeners: (Set<SettingChangeListener> | undefined)[] = [];
 	/** Forwarders of every change into live {@link overlay} children. */
 	#childForwarders = new Set<SettingChangeListener>();
+	/** Forwarders of this instance's layer rebuilds into live {@link overlay} children's layer observers. */
+	#childLayerForwarders = new Set<() => void>();
 	/** Instance this overlay reads through to ({@link overlay}); overlays never persist or write back. */
 	#parent: Settings | undefined;
 	/** A subagent-derived view inherits its parent's grant authority; host-created overlays do not. */
@@ -892,6 +894,16 @@ export class Settings {
 			target.#applyParentChange(setting);
 		};
 		this.#childForwarders.add(forward);
+		const forwardLayers = () => {
+			const target = ref.deref();
+			if (!target) {
+				this.#childLayerForwarders.delete(forwardLayers);
+				return;
+			}
+			target.#syncParent();
+			target.#notifyLayersChanged();
+		};
+		this.#childLayerForwarders.add(forwardLayers);
 		return child;
 	}
 
@@ -1039,7 +1051,8 @@ export class Settings {
 
 	/**
 	 * Calls `listener` synchronously after every rebuild of this instance's own layers or scope
-	 * (writes, reloads, re-scopes; not a parent's changes). Returns the unsubscribe.
+	 * (writes, reloads, re-scopes), and of an {@link overlay} parent's layers, so raw-layer
+	 * observers (messaging policy) see project edits a trusted effective value masks. Returns the unsubscribe.
 	 */
 	onLayersChange(listener: () => void): () => void {
 		this.#layerListeners.add(listener);
@@ -1839,6 +1852,12 @@ export class Settings {
 	get revision(): number {
 		this.#syncParent();
 		return this.#revision;
+	}
+
+	/** Raw runtime or CLI-config layer, cloned; overlay children include their parent's layer. */
+	getLayerRaw(layer: "runtime" | "overlay"): RawSettings {
+		const own = structuredClone(layer === "runtime" ? this.#overrides : this.#configOverlay);
+		return this.#parent ? this.#deepMerge(this.#parent.getLayerRaw(layer), own) : own;
 	}
 
 	/**
@@ -4266,7 +4285,11 @@ export class Settings {
 	#rebuildMerged(): void {
 		this.#remerge();
 		this.#layerGeneration++;
-		if (this.#layerListeners.size === 0) return;
+		this.#notifyLayersChanged();
+	}
+
+	/** Tells {@link onLayersChange} observers, then live overlay children, that the layers moved. */
+	#notifyLayersChanged(): void {
 		for (const listener of Array.from(this.#layerListeners)) {
 			try {
 				listener();
@@ -4274,6 +4297,7 @@ export class Settings {
 				logger.warn("Settings: layer-change listener failed", { error: String(error) });
 			}
 		}
+		for (const forward of Array.from(this.#childLayerForwarders)) forward();
 	}
 
 	/** Rebuilds the merged view from the own layers over the parent's current view. */
