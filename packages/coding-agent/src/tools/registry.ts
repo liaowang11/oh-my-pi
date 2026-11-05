@@ -9,6 +9,7 @@ import type { EffectiveExtensionRoots } from "../capability/types";
 import type { EvalPreludeDefinition } from "../eval/preludes";
 import type { PromptTemplate } from "../config/prompt-templates";
 import type { Settings } from "../config/settings";
+import type { CronManager } from "../cron";
 import { EditTool } from "../edit";
 import { checkPythonKernelAvailability } from "../eval/py/kernel";
 import type { ToolPathWithSource } from "../extensibility/custom-tools";
@@ -58,6 +59,7 @@ import { BashTool } from "./bash";
 import { type BuiltinToolName, type HiddenToolName, normalizeToolName, normalizeToolNames } from "./builtin-names";
 import { type CheckpointState, CheckpointTool, type CompletedRewindState, RewindTool } from "./checkpoint";
 import { ContextNotesTool, NewContextTool } from "./context-notes";
+import { CronCreateTool, CronDeleteTool, CronListTool } from "./cron";
 import { DebugTool } from "./debug";
 import { EvalTool } from "./eval";
 import { resolveEvalBackends } from "./eval-backends";
@@ -438,6 +440,8 @@ export interface ToolSession {
 	agentOutputManager?: AgentOutputManager;
 	/** Manager of this session's root, shared only with that root's subagents. */
 	asyncJobManager?: AsyncJobManagerApi;
+	/** Scheduler the cron tools create, list, and delete jobs through. */
+	cronManager?: CronManager;
 	/** MCP manager visible to subagents without relying on the process-global singleton. */
 	mcpManager?: MCPManagerApi;
 	/** This session's view of {@link mcpManager}; subagents it spawns start from it. Unset for the owner. */
@@ -621,6 +625,9 @@ export const HIDDEN_TOOLS: Record<HiddenToolName, ToolFactory> = {
 	think: () => new ThinkTool(),
 	yield: s => new YieldTool(s),
 	goal: s => new GoalTool(s),
+	cron_create: s => new CronCreateTool(s),
+	cron_list: s => new CronListTool(s),
+	cron_delete: s => new CronDeleteTool(s),
 };
 
 export type ToolName = BuiltinToolName;
