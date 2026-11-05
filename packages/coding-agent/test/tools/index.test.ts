@@ -428,4 +428,13 @@ describe("createTools", () => {
 		expect(requested).toContain("cron_list");
 		expect(requested).toContain("cron_delete");
 	});
+
+	it("adds the cron tools to a top-level default set when cron.enabled is on, never to subagents", async () => {
+		const settings = createSettingsWithOverrides({ "tools.xdev": false, "cron.enabled": true });
+		const top = (await createTools(createTestSession({ settings }))).map(t => t.name);
+		expect(top).toEqual(expect.arrayContaining(["cron_create", "cron_list", "cron_delete"]));
+
+		const sub = (await createTools(createTestSession({ settings, taskDepth: 1 }))).map(t => t.name);
+		expect(sub).not.toContain("cron_create");
+	});
 });
