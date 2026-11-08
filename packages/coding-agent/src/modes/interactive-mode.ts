@@ -351,17 +351,8 @@ import { SSHCommandController } from "./controllers/ssh-command-controller";
 import { TanCommandController } from "./controllers/tan-command-controller";
 import { TodoCommandController } from "./controllers/todo-command-controller";
 import { imageReferenceHyperlink, setImageBlobWriter } from "@oh-my-pi/pi-tui/prompt/image-references";
-import { describeLoopCondition, evaluateLoopCondition, type LoopConditionVerdict } from "./loop-condition";
-import {
-	consumeLoopLimitIteration,
-	createLoopLimitRuntime,
-	describeLoopLimit,
-	describeLoopLimitRuntime,
-	isLoopDurationExpired,
-	isLoopLimitExhausted,
-	parseLoopArgs,
-	type LoopLimitConfig,
-} from "./loop-limit";
+import { isLoopDurationExpired, parseLoopArgs, type LoopLimitConfig } from "./loop-limit";
+import { LoopModeState } from "./loop-mode";
 import type { LoopConditionConfig, LoopLimitRuntime } from "@oh-my-pi/pi-tui/status-line/loop";
 import { OAuthManualInputManager } from "./oauth-manual-input";
 import { formatPersistenceNotice } from "./persistence-failure";
@@ -1421,11 +1412,37 @@ export class InteractiveMode implements InteractiveModeContext {
 	goalModePaused = false;
 	vibeModeEnabled = false;
 	planModePlanFilePath: string | undefined = undefined;
-	loopModeEnabled = false;
-	loopModePaused = false;
-	loopPrompt: string | undefined = undefined;
-	loopLimit: LoopLimitRuntime | undefined = undefined;
-	loopCondition: LoopConditionConfig | undefined = undefined;
+	readonly #loop = new LoopModeState();
+	get loopModeEnabled(): boolean {
+		return this.#loop.enabled;
+	}
+	set loopModeEnabled(value: boolean) {
+		this.#loop.enabled = value;
+	}
+	get loopModePaused(): boolean {
+		return this.#loop.paused;
+	}
+	set loopModePaused(value: boolean) {
+		this.#loop.paused = value;
+	}
+	get loopPrompt(): string | undefined {
+		return this.#loop.prompt;
+	}
+	set loopPrompt(value: string | undefined) {
+		this.#loop.prompt = value;
+	}
+	get loopLimit(): LoopLimitRuntime | undefined {
+		return this.#loop.limit;
+	}
+	set loopLimit(value: LoopLimitRuntime | undefined) {
+		this.#loop.limit = value;
+	}
+	get loopCondition(): LoopConditionConfig | undefined {
+		return this.#loop.condition;
+	}
+	set loopCondition(value: LoopConditionConfig | undefined) {
+		this.#loop.condition = value;
+	}
 	/** Last state reported through `mode_changed`; starts inactive so a restored session's modes are reported too. */
 	#reportedModeState: SessionModeState = {
 		plan: { status: "inactive" },
@@ -1452,7 +1469,6 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * `#cancelLoopAutoSubmit` only clears the pending timer — without this the
 	 * child process would outlive the loop it was gating.
 	 */
-	#loopConditionAbort: AbortController | undefined;
 	#loopAutoSubmitTimer: NodeJS.Timeout | undefined;
 	#pendingLoopIterations = 0;
 	#todoAutoClearTimer: NodeJS.Timeout | undefined;
@@ -3475,17 +3491,26 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		// An exhausted budget ends the loop regardless of the condition, so check
-		// it first: the user's command must not run one last time for nothing.
-		if (isLoopLimitExhausted(this.loopLimit)) {
-			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
+		// The shared gate (budget, then the `--while` / `--until` condition) sits
+		// before the budget consume so a halt never burns an iteration that did
+		// not run, and after the blocked-check/defer above so a streaming turn
+		// cannot re-run the command on every retry tick.
+		const sessionId = this.sessionManager.getSessionId();
+		const verdict = await this.#loop.checkIteration({
+			cwd: this.sessionManager.getCwd(),
+			timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
+			sessionId,
+			isSessionCurrent: () => this.sessionManager.getSessionId() === sessionId,
+		});
+		// Running the condition is an await point: Esc (pauseLoop) or a second
+		// /loop (disableLoopMode) can land mid-command, so re-check the same
+		// guards the method entry used before acting on a now-stale verdict.
+		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return;
+		if (verdict.kind === "aborted") return;
+		if (verdict.kind === "stop") {
+			this.disableLoopMode(verdict.message);
 			return;
 		}
-
-		// The gate sits before the budget consume so a halt never burns an
-		// iteration that did not run, and after the blocked-check/defer above so
-		// a streaming turn cannot re-run the command on every retry tick.
-		if (this.loopCondition && !(await this.#passesLoopCondition(prompt))) return;
 
 		// The gate awaited a child process: a turn may have started meanwhile
 		// (async job, idle flush), so re-check before spending budget or
@@ -3507,7 +3532,7 @@ export class InteractiveMode implements InteractiveModeContext {
 			return;
 		}
 
-		if (!consumeLoopLimitIteration(this.loopLimit)) {
+		if (!this.#loop.consumeIteration()) {
 			this.disableLoopMode("Loop limit reached. Loop mode disabled.");
 			return;
 		}
@@ -3519,52 +3544,6 @@ export class InteractiveMode implements InteractiveModeContext {
 			await this.handleClearCommand();
 		}
 		this.#submitLoopPromptWhenReady(prompt);
-	}
-
-	/**
-	 * Evaluate the `--while` / `--until` condition for one iteration.
-	 *
-	 * Returns false when the loop must not continue: either the condition said
-	 * to stop (already reported through {@link disableLoopMode}) or the loop was
-	 * paused/disabled while the command was still running.
-	 */
-	async #passesLoopCondition(prompt: string): Promise<boolean> {
-		const condition = this.loopCondition;
-		if (!condition) return true;
-
-		const controller = new AbortController();
-		// A prior evaluation can still be in flight when the next iteration
-		// starts (the user submitted mid-command); drop it instead of leaking a
-		// child process that Esc can no longer reach.
-		this.#abortLoopCondition();
-		this.#loopConditionAbort = controller;
-		const sessionId = this.sessionManager.getSessionId();
-		let verdict: LoopConditionVerdict;
-		try {
-			verdict = await evaluateLoopCondition(condition, {
-				cwd: this.sessionManager.getCwd(),
-				timeoutMs: cfgLoopConditionTimeoutMs.get(settings),
-				signal: controller.signal,
-				sessionId,
-				isSessionCurrent: () => this.sessionManager.getSessionId() === sessionId,
-			});
-		} finally {
-			if (this.#loopConditionAbort === controller) this.#loopConditionAbort = undefined;
-		}
-
-		// Running the condition is an await point: Esc (pauseLoop) or a second
-		// /loop (disableLoopMode) can land mid-command, so re-check the same
-		// guards the method entry used before acting on a now-stale verdict.
-		if (!this.loopModeEnabled || this.loopPrompt !== prompt || !this.onInputCallback) return false;
-		if (verdict.kind === "continue") return true;
-		if (verdict.kind === "aborted") return false;
-		this.disableLoopMode(verdict.message);
-		return false;
-	}
-
-	#abortLoopCondition(): void {
-		this.#loopConditionAbort?.abort();
-		this.#loopConditionAbort = undefined;
 	}
 
 	#syncLoopModeStatus(): void {
@@ -3581,14 +3560,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	}
 
 	disableLoopMode(message = "Loop mode disabled."): void {
-		const wasEnabled = this.loopModeEnabled;
-		this.loopModeEnabled = false;
-		this.loopModePaused = false;
-		this.loopPrompt = undefined;
-		this.loopLimit = undefined;
-		this.loopCondition = undefined;
+		const wasEnabled = this.#loop.disable();
 		this.#cancelLoopAutoSubmit();
-		this.#abortLoopCondition();
 		this.#syncLoopModeStatus();
 		if (wasEnabled) {
 			this.showStatus(message);
@@ -3602,9 +3575,7 @@ export class InteractiveMode implements InteractiveModeContext {
 		// iteration, and that iteration's turn is about to be superseded either
 		// way. Abort immediately instead of letting it run for up to the
 		// configured timeout in parallel with the turn it can no longer gate.
-		this.#abortLoopCondition();
-		this.loopPrompt = prompt;
-		this.loopModePaused = false;
+		this.#loop.setPrompt(prompt);
 		this.#syncLoopModeStatus();
 	}
 
@@ -3624,10 +3595,8 @@ export class InteractiveMode implements InteractiveModeContext {
 	 * user submits becomes the new loop prompt and resumes iteration.
 	 */
 	pauseLoop(): void {
-		this.loopPrompt = undefined;
-		this.loopModePaused = true;
+		this.#loop.pause();
 		this.#cancelLoopAutoSubmit();
-		this.#abortLoopCondition();
 		this.#syncLoopModeStatus();
 	}
 
@@ -3654,21 +3623,11 @@ export class InteractiveMode implements InteractiveModeContext {
 		condition: LoopConditionConfig | undefined,
 		hasPrompt: boolean,
 	): void {
-		this.loopModeEnabled = true;
-		this.loopModePaused = false;
-		this.loopPrompt = undefined;
-		this.loopLimit = createLoopLimitRuntime(limit);
-		this.loopCondition = condition;
+		this.#loop.enable(limit, condition);
 		this.#syncLoopModeStatus();
-		const limitSuffix = limit ? ` Limited to ${describeLoopLimit(limit)}.` : "";
-		const remainingSuffix = this.loopLimit ? ` ${describeLoopLimitRuntime(this.loopLimit)}.` : "";
 		// The condition is a *continuation* signal: the first iteration always
 		// runs, and it is re-evaluated before each subsequent one.
-		const conditionSuffix = condition ? ` Continuing ${describeLoopCondition(condition)}.` : "";
-		const tail = hasPrompt ? "Repeating it after each turn." : "Your next prompt will repeat after each turn.";
-		this.showStatus(
-			`Loop mode enabled.${limitSuffix}${remainingSuffix}${conditionSuffix} ${tail} ${appKey(this.keybindings, "app.interrupt")} suspends the ongoing loop; /loop again to disable.`,
-		);
+		this.showStatus(this.#loop.describeEnabled(limit, hasPrompt, appKey(this.keybindings, "app.interrupt")));
 	}
 
 	#getSessionModeState(): SessionModeState {
@@ -8269,7 +8228,7 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #planOwnedWorktreeExit(signal: AbortSignal): Promise<WorktreeExitPlan[]> {
 		const policy = cfgWorktreeOnExit.get(this.settings);
 		if (policy === "keep" || this.#ownedWorktrees.length === 0) return [];
-		this.#abortLoopCondition();
+		this.#loop.abortCondition();
 		this.#cancelLoopAutoSubmit();
 		try {
 			await this.session.abort();
@@ -8376,9 +8335,9 @@ export class InteractiveMode implements InteractiveModeContext {
 	async #teardown(): Promise<void> {
 		// An in-flight loop condition (or a deferred auto-submit timer) must not
 		// outlive session disposal: an unaborted `sleep 30`-style condition can
-		// resolve mid-teardown and drive `#passesLoopCondition` into invoking the
+		// resolve mid-teardown and drive `#loopIteration` into invoking the
 		// pending input callback against a session that is already disposing.
-		this.#abortLoopCondition();
+		this.#loop.abortCondition();
 		this.#cancelLoopAutoSubmit();
 
 		// `#beginClose()` already acknowledged the close; escalate only once the
