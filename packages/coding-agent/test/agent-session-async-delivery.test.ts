@@ -137,13 +137,15 @@ describe("AgentSession owner-routed async delivery", () => {
 		expect(deliveredImages).toEqual([image]);
 	});
 
-	it("keeps ACP follow-ups visible during final output and folds only completions after end_turn", async () => {
+	it("keeps ACP follow-ups visible during final output and streams idle wakeups after end_turn as turns", async () => {
 		await using temp = await TempDir.create("@acp-async-delivery-");
 		const model = getBundledModel("anthropic", "claude-sonnet-4-5")!;
 		const mock = createMockModel({
 			responses: [
 				{ content: ["First answer"] },
 				{ content: ["Open-prompt follow-up"] },
+				{ content: ["Late result turn"] },
+				{ content: ["Cron turn"] },
 				{ content: ["Next user answer"] },
 			],
 		});
@@ -173,30 +175,37 @@ describe("AgentSession owner-routed async delivery", () => {
 		const connection = {
 			sessionUpdate: async (notification: SessionNotification) => {
 				updates.push(notification);
-				if (
-					holdOutput &&
-					mock.calls.length === 1 &&
-					!session.isStreaming &&
-					notification.update.sessionUpdate === "session_info_update"
-				) {
-					holdOutput = false;
-					outputBlocked.resolve();
-					await releaseOutput.promise;
-				}
 			},
 			extNotification: async () => {},
 			signal: new AbortController().signal,
 			closed: Promise.withResolvers<void>().promise,
 		} as unknown as AgentSideConnection;
+		// The fork sends no title or usage update when nothing changed, so there is no
+		// end-of-turn notification to hold on; hold the prompt's own async-delivery
+		// drain instead, which runs after the model stops and before the prompt resolves.
+		const drain = session.drainAsyncJobDeliveriesForAcp.bind(session);
+		vi.spyOn(session, "drainAsyncJobDeliveriesForAcp").mockImplementation(async options => {
+			if (holdOutput && mock.calls.length === 1) {
+				holdOutput = false;
+				outputBlocked.resolve();
+				await releaseOutput.promise;
+			}
+			return drain(options);
+		});
 		const acp = new AcpAgent(connection, async () => session);
 		try {
 			await acp.initialize({ protocolVersion: 1, clientCapabilities: {} });
 			const created = await acp.newSession({ cwd: temp.path(), mcpServers: [] });
+			let firstSettled = false;
 			const firstPrompt = acp.prompt({
 				sessionId: created.sessionId,
 				prompt: [{ type: "text", text: "First user prompt" }],
 			});
+			void firstPrompt.finally(() => {
+				firstSettled = true;
+			});
 			await outputBlocked.promise;
+			expect(firstSettled).toBe(false);
 			manager.register("task", "open-prompt result", async () => "OPEN_ACP_RESULT", {
 				id: "open-acp-result",
 				ownerId: "Lead",
@@ -214,35 +223,48 @@ describe("AgentSession owner-routed async delivery", () => {
 			releaseOutput.resolve();
 			expect((await firstPrompt).stopReason).toBe("end_turn");
 
+			// The fork's ACP relay streams agent-initiated turns, so a completion or a
+			// cron fire after end_turn wakes the agent instead of waiting for a prompt.
+			const streamed = (text: string) =>
+				updates.some(
+					notification =>
+						notification.update.sessionUpdate === "agent_message_chunk" &&
+						notification.update.content.type === "text" &&
+						notification.update.content.text.includes(text),
+				);
 			manager.register("task", "late result", async () => "LATE_ACP_RESULT", {
 				id: "late-acp-result",
 				ownerId: "Lead",
 			});
 			await session.settleAsyncWork();
-			expect(mock.calls).toHaveLength(2);
-			expect(session.isStreaming).toBe(false);
-			expect(session.hasPendingAsyncWork()).toBe(false);
-
-			const nextPrompt = await acp.prompt({
-				sessionId: created.sessionId,
-				prompt: [{ type: "text", text: "Next user prompt" }],
-			});
-			expect(nextPrompt.stopReason).toBe("end_turn");
+			await session.waitForIdle();
 			expect(mock.calls).toHaveLength(3);
 			expect(
-				mock.calls[2]?.context.messages.filter(message =>
+				mock.calls[2]?.context.messages.some(message =>
 					typeof message.content === "string"
 						? message.content.includes("LATE_ACP_RESULT")
 						: message.content.some(
 								content => content.type === "text" && content.text.includes("LATE_ACP_RESULT"),
 							),
 				),
-			).toHaveLength(1);
-			expect(
-				sessionManager
-					.getEntries()
-					.filter(entry => entry.type === "custom_message" && entry.customType === "async-result"),
-			).toHaveLength(2);
+			).toBe(true);
+			await Bun.sleep(0);
+			expect(streamed("Late result turn")).toBe(true);
+
+			await session.deliverScheduledPrompt("CRON_FIRED");
+			await session.waitForIdle();
+			expect(mock.calls).toHaveLength(4);
+			expect(JSON.stringify(mock.calls[3]?.context.messages)).toContain("CRON_FIRED");
+			await Bun.sleep(0);
+			expect(streamed("Cron turn")).toBe(true);
+
+			const nextPrompt = await acp.prompt({
+				sessionId: created.sessionId,
+				prompt: [{ type: "text", text: "Next user prompt" }],
+			});
+			expect(nextPrompt.stopReason).toBe("end_turn");
+			expect(mock.calls).toHaveLength(5);
+			expect(streamed("Next user answer")).toBe(true);
 		} finally {
 			releaseOutput.resolve();
 			await acp.dispose();

@@ -83,6 +83,12 @@ export interface ClientBridge {
 	readonly capabilities: ClientBridgeCapabilities;
 	/** ACP v1 clients cannot show server-initiated turns as busy after prompt response. */
 	readonly deferAgentInitiatedTurns?: boolean;
+	/**
+	 * The client is shown turns the agent starts on its own (the fork's ACP
+	 * lifetime relay streams them), so idle wakeups — late background results,
+	 * cron fires — may start a turn even while `deferAgentInitiatedTurns` holds.
+	 */
+	readonly streamsAgentInitiatedTurns?: boolean;
 	readTextFile?(params: { path: string; line?: number; limit?: number }): Promise<string>;
 	writeTextFile?(params: { path: string; content: string }): Promise<void>;
 	createTerminal?(params: ClientBridgeCreateTerminalParams): Promise<ClientBridgeTerminalHandle>;
