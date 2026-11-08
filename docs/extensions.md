@@ -1004,12 +1004,12 @@ editor.
 #### Launching terminal commands
 
 `ctx.ui.openTerminal(request)` is available only in the interactive TUI. It creates a
-multiplexer pane or provider-native group (a tmux window, Zellij/Herdr/Orca tab, or CMUX
-workspace—not an OS window) and returns the reported native ID, plus a `warning` when
+multiplexer pane or provider-native group (a tmux window, Zellij/Herdr/Orca tab, Rex
+window, or CMUX workspace—not an OS window) and returns the reported native ID, plus a `warning` when
 the provider started the command but could not show it where requested. RPC, ACP,
 print, and headless contexts do not provide this optional method. The request type and
 supported provider set derive from canonical launch capabilities: tmux, Zellij,
-Herdr, CMUX, and Orca are supported; screen and wmux remain recognized by the
+Herdr, CMUX, Orca, and Rex are supported; screen and wmux remain recognized by the
 multiplexer taxonomy but are currently unsupported.
 
 Provider-specific session detection is centralized in
@@ -1017,8 +1017,8 @@ Provider-specific session detection is centralized in
 `hasTerminalMultiplexerSession(provider, env)` checks explicit session markers, while
 `classifyTerminalMultiplexer(env)` names the multiplexer hosting the process: session
 markers first, then a `tmux`/`screen` `TERM` fallback, then outer applications such as
-Orca, so a multiplexer running inside Orca wins. `isInsideTerminalMultiplexer(env)` is
-true only when the classified multiplexer owns the screen grid; Orca keeps the
+Orca and Rex, so a multiplexer running inside them wins. `isInsideTerminalMultiplexer(env)` is
+true only when the classified multiplexer owns the screen grid; Orca and Rex keep the
 direct-terminal render path. A classified multiplexer does not prove that a nested
 provider session or a native pane ID exists.
 
@@ -1068,6 +1068,11 @@ Targets are provider-native IDs/refs, with different meanings by placement:
   defaults to worktree `id:<ORCA_WORKTREE_ID>`; an application label alone is
   insufficient to detect an Orca session. Targets, titles, and commands are passed
   as `--flag=value`, so a value starting with `--` stays data.
+- Rex pane placement splits a block beside `REX_BLOCK` (right, or below for
+  `direction: "down"`) in session `REX_SESSION`; window placement opens a window in
+  that session. Detection requires a nonempty `REX_SESSION`; `TERM_PROGRAM=rex` alone
+  is not a session. Rex takes no target, names only panes (as the block label), and
+  passes values as `--flag=value`. The CLI reports no ID.
 - CMUX pane placement targets a surface ID; workspace placement targets a window
   ID. Both targets may be omitted when the corresponding CMUX context is active.
   An explicit surface target is authoritative and is not combined with the ambient

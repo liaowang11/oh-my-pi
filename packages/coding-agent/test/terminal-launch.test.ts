@@ -564,6 +564,57 @@ describe("terminal launch dispatcher", () => {
 		expect(tab.calls.map(call => call.argv)).toEqual([["zellij", "--version"]]);
 	});
 
+	it("splits a Rex pane beside the calling block in its session", async () => {
+		const { calls, launch } = createHarness({ REX_SESSION: "s-1", REX_BLOCK: "b-7" }, [{ stdout: "", exitCode: 0 }]);
+		const result = await launch({
+			multiplexer: "rex",
+			placement: "pane",
+			command: ["omp", "--fork", "/sessions/a.jsonl"],
+			cwd: "/repo",
+			direction: "down",
+			name: "fork of a",
+			focus: false,
+		});
+		expect(calls).toEqual([
+			{
+				argv: [
+					"rex",
+					"split",
+					"-s",
+					"s-1",
+					"-b",
+					"b-7",
+					"--split=below",
+					"--cwd=/repo",
+					"--label=fork of a",
+					"--focus=false",
+					"--",
+					"omp",
+					"--fork",
+					"/sessions/a.jsonl",
+				],
+				cwd: "/repo",
+				env: undefined,
+			},
+		]);
+		expect(result).toEqual({ multiplexer: "rex", placement: "pane" });
+	});
+
+	it("opens a Rex window in the calling session", async () => {
+		const { calls, launch } = createHarness({ REX_SESSION: "s-1", REX_BLOCK: "b-7" }, [{ stdout: "", exitCode: 0 }]);
+		const result = await launch({ multiplexer: "rex", placement: "window", command: ["omp"], cwd: "/repo" });
+		expect(calls.map(call => call.argv)).toEqual([["rex", "window", "new", "-s", "s-1", "--cwd=/repo", "--", "omp"]]);
+		expect(result).toEqual({ multiplexer: "rex", placement: "window" });
+	});
+
+	it("refuses a Rex launch outside a Rex session without invoking the CLI", async () => {
+		const { calls, launch } = createHarness({ TERM_PROGRAM: "rex" }, []);
+		await expect(launch({ multiplexer: "rex", placement: "pane", command: ["omp"], cwd: "/repo" })).rejects.toThrow(
+			"rex launch requires an active Rex session.",
+		);
+		expect(calls).toEqual([]);
+	});
+
 	it("reports a Zellij launch without an ID when an older CLI prints none", async () => {
 		const { calls, launch } = createHarness({ ZELLIJ: "0" }, [{ stdout: "", exitCode: 0 }]);
 		const result = await launch({ multiplexer: "zellij", placement: "pane", command: ["omp"], cwd: "/repo" });
