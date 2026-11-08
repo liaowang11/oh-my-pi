@@ -5,13 +5,13 @@
  * a multiplexer-family `TERM` only classifies when no marker does (it survives
  * `sudo` without `-E`, `su` and env-sanitizing launchers that strip the
  * markers). Nested layers resolve innermost-first in a fixed precedence order;
- * outer applications (Orca) rank last so a multiplexer running inside them wins.
+ * outer applications (Orca, Rex) rank last so a multiplexer running inside them wins.
  */
 
 export type Env = Readonly<Record<string, string | undefined>>;
 
 /** Every multiplexer (or pane host) the driver recognizes. */
-export type MultiplexerId = "herdr" | "tmux" | "screen" | "zellij" | "cmux" | "wmux" | "orca";
+export type MultiplexerId = "herdr" | "tmux" | "screen" | "zellij" | "cmux" | "wmux" | "orca" | "rex";
 
 const SESSION_MARKERS: Record<MultiplexerId, (env: Env) => boolean> = {
 	// HERDR_ENV=1 or a pane/tab/workspace id (they survive launchers that drop HERDR_ENV);
@@ -26,6 +26,8 @@ const SESSION_MARKERS: Record<MultiplexerId, (env: Env) => boolean> = {
 	wmux: env => env.WMUX === "1" || Boolean(env.WMUX_SURFACE_ID),
 	// Orca terminals expose paired, nonempty pane/worktree ids.
 	orca: env => Boolean(env.ORCA_PANE_KEY?.trim() && env.ORCA_WORKTREE_ID?.trim()),
+	// Rex blocks export their session (`REX_SESSION`) and block (`REX_BLOCK`); the session names the host.
+	rex: env => Boolean(env.REX_SESSION?.trim()),
 };
 
 /** Session-marker precedence when several layers are present (the first match is the layer we talk to). */
@@ -47,6 +49,7 @@ export const MULTIPLEXER_ENV_KEYS: readonly string[] = [
 	"WMUX_SURFACE_ID",
 	"ORCA_PANE_KEY",
 	"ORCA_WORKTREE_ID",
+	"REX_SESSION",
 	"TERM",
 ];
 
@@ -68,23 +71,24 @@ function multiplexerForTerm(env: Env): "tmux" | "screen" | null {
 
 /**
  * The multiplexer hosting the process, or null for a direct terminal: session
- * markers first, then the `TERM` fallback, then Orca.
+ * markers first, then the `TERM` fallback, then Orca and Rex.
  */
 export function classifyMultiplexer(env: Env): MultiplexerId | null {
 	for (const id of PRECEDENCE) if (SESSION_MARKERS[id](env)) return id;
 	const family = multiplexerForTerm(env);
 	if (family) return family;
 	if (SESSION_MARKERS.orca(env)) return "orca";
+	if (SESSION_MARKERS.rex(env)) return "rex";
 	return null;
 }
 
 /**
  * Whether the classified multiplexer owns the screen grid (no scrollback
- * rebuild, anchored resize, skipped probes). Orca keeps the direct-terminal path.
+ * rebuild, anchored resize, skipped probes). Orca and Rex keep the direct-terminal path.
  */
 export function insideMultiplexer(env: Env): boolean {
 	const id = classifyMultiplexer(env);
-	return id !== null && id !== "orca";
+	return id !== null && id !== "orca" && id !== "rex";
 }
 
 /** Whether this is a remote session (the terminal is on the other side of an SSH hop). */
