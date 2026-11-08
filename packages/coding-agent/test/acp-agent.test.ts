@@ -4942,7 +4942,7 @@ describe("ACP agent", () => {
 		expect(names).not.toContain("copy");
 		expect(names).toContain("plan");
 		expect(names).toContain("guided-goal");
-		expect(names).not.toContain("loop");
+		expect(names).toContain("loop");
 		expect(names).not.toContain("login");
 		expect(names).not.toContain("new");
 		expect(names).toContain("handoff");
