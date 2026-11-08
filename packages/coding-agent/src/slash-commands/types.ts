@@ -1,5 +1,6 @@
 import type { Settings } from "../config/settings";
 import type { SlashCommandIconName } from "@oh-my-pi/pi-tui/theme/symbols";
+import type { LoopModeState } from "../modes/loop-mode";
 import type { InteractiveModeContext, SubmittedUserInput } from "../modes/types";
 import type { ConversationPosition } from "../modes/utils/conversation-position";
 import type { MCPManager } from "../mcp/manager";
@@ -135,6 +136,8 @@ export interface SlashCommandRuntime {
 	 * those servers resolve like configured ones.
 	 */
 	mcpManager?: MCPManager | undefined;
+	/** The session's `/loop` state; provided only by the ACP host, which runs the iterations. */
+	loop?: LoopModeState;
 	/** ACP host mode switch; absent from the RPC text-command host. */
 	setAcpMode?: (modeId: "default" | "plan" | "vibe") => Promise<void>;
 	notifyTitleChanged?: () => Promise<void> | void;

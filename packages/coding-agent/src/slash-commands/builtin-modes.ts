@@ -32,7 +32,8 @@ import {
 } from "../config/model-presets";
 import { isGoalInterviewActive } from "../goals/mode";
 import { describeLoopCondition } from "../modes/loop-condition";
-import { describeLoopLimitRuntime } from "../modes/loop-limit";
+import { describeLoopLimitRuntime, parseLoopArgs } from "../modes/loop-limit";
+import { cfgLoopMode } from "../modes/settings";
 import type { InteractiveModeContext } from "../modes/types";
 import ratchetKickoffPrompt from "../prompts/ratchet-kickoff.md" with { type: "text" };
 import type { AgentSession } from "../session/agent-session";
@@ -605,8 +606,29 @@ export const BUILTIN_MODE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> = [
 		get description() {
 			return `Toggle loop mode. While enabled, the next prompt you send re-submits after every yield. Bound it with a count/duration, or gate it with \`--until '<cmd>'\` / \`--while '<cmd>'\` — the command's exit status decides whether the next iteration runs. ${formatKeyHint("escape")} suspends the ongoing loop; /loop again to disable.`;
 		},
+		acpDescription:
+			"Toggle loop mode: your next prompt re-runs after every turn, bounded by a count/duration or gated by --while/--until '<cmd>'. Cancelling suspends the loop; /loop again to disable.",
 		inlineHint: "[count|duration] [--while|--until '<cmd>'] [prompt]",
 		allowArgs: true,
+		handleAcp: async (command, runtime) => {
+			const loop = runtime.loop;
+			if (!loop) return usage("Loop mode is unavailable in this host.", runtime);
+			if (loop.disable()) {
+				await runtime.output("Loop mode disabled.");
+				return commandConsumed();
+			}
+			const parsed = parseLoopArgs(command.args);
+			if (typeof parsed === "string") return usage(parsed, runtime);
+			// ACP has no way to start a new session between iterations.
+			if (cfgLoopMode.get(runtime.settings) === "reset") {
+				return usage('loop.mode "reset" is unavailable over ACP; set it to "prompt" or "compact".', runtime);
+			}
+			loop.enable(parsed.limit, parsed.condition);
+			await runtime.output(loop.describeEnabled(parsed.limit, Boolean(parsed.prompt), "Cancelling the turn"));
+			// The inline prompt runs as the first iteration and becomes the loop prompt.
+			if (parsed.prompt) return { prompt: parsed.prompt };
+			return commandConsumed();
+		},
 		getTuiAutocompleteDescription: runtime => {
 			if (!runtime.ctx.loopModeEnabled) return "Loop: off";
 			if (runtime.ctx.loopModePaused) return "Loop: paused";
