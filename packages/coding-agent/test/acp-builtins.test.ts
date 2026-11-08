@@ -977,7 +977,6 @@ describe("ACP builtin slash commands", () => {
 			"/resume",
 			"/tree",
 			"/branch",
-			"/loop",
 			"/hotkeys",
 			"/extensions",
 			"/copy",
