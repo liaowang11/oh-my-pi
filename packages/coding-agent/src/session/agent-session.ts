@@ -2657,7 +2657,11 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 			injectIdle: async messages => {
 				const first = messages[0];
 				if (!first) return;
-				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#allowAcpAgentInitiatedTurns) {
+				if (
+					this.#clientBridge?.deferAgentInitiatedTurns &&
+					!this.#clientBridge.streamsAgentInitiatedTurns &&
+					!this.#allowAcpAgentInitiatedTurns
+				) {
 					this.#recordWithoutTurn(messages);
 					return;
 				}
