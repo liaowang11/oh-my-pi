@@ -2815,7 +2815,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
 				// A background job may have made a prelude's first call: its guide rides the job's delivery.
 				const guide = this.#tools.takeEvalPreludeGuide();
 				const messages = guide ? [...delivered, guide] : delivered;
-				if (this.#clientBridge?.deferAgentInitiatedTurns) {
+				if (this.#clientBridge?.deferAgentInitiatedTurns && !this.#clientBridge.streamsAgentInitiatedTurns) {
 					this.#recordWithoutTurn(messages);
 					return;
 				}
