@@ -238,7 +238,14 @@ import { cfgDisabledExtensions, cfgExtensions } from "../../extensibility/settin
 import { cfgPlanEnabled } from "../../plan-mode/settings";
 import { cfgSessionWorktreeScope } from "../../session/settings";
 import { PREDICTION_DEADLINE_MS, predictNextMessages } from "../controllers/composer-prediction-controller";
-import { cfgComposerPredictionAlternatives, cfgComposerPredictions, cfgRecapEnabled } from "../settings";
+import { LoopModeState } from "../loop-mode";
+import {
+	cfgComposerPredictionAlternatives,
+	cfgComposerPredictions,
+	cfgLoopConditionTimeoutMs,
+	cfgLoopMode,
+	cfgRecapEnabled,
+} from "../settings";
 import { promptSuggestionsMeta } from "./acp-prompt-suggestions";
 
 const ACP_DEFAULT_MODE_ID = "default";
@@ -376,6 +383,13 @@ type PromptTurnState = {
 	 * of chained background-job deliveries, so none can settle this prompt.
 	 */
 	parked: boolean;
+	/**
+	 * The turn ended and `/loop` is deciding whether to re-run its prompt (the
+	 * budget, the `--while`/`--until` command, a `loop.mode` compaction). The
+	 * session is idle meanwhile, so a new `session/prompt` must cancel this
+	 * turn as it would a streaming one instead of queueing behind the loop.
+	 */
+	loopGate?: boolean;
 	usageBaseline: UsageStatistics;
 	modelUsageBaseline: Map<string, ModelTokenStatistics>;
 	unsubscribe: (() => void) | undefined;
@@ -638,6 +652,9 @@ type ManagedSessionRecord = {
 	// turn that did no tool work, or repeated the previous one, stops the chain
 	// until the user speaks again.
 	goalContinuation: { pendingTurns: number; previousActivity: string | undefined; stalled: boolean };
+	// `/loop` state. Iterations run inside the prompt turn they repeat, so
+	// `session/cancel` suspends the loop as Esc does in the TUI.
+	loop: LoopModeState;
 	// Present while vibe mode is active: the owner scope and pre-vibe toolset
 	// `exitVibeMode` needs to kill workers and restore tools.
 	vibeMode: VibeModeHandle | undefined;
@@ -1843,7 +1860,7 @@ export class AcpAgent implements Agent {
 		// idle new turn (queued normally) or inside the abort window — where
 		// the implicit cancel below matches the user's stop intent. No
 		// resubmission bookkeeping is needed here anymore.
-		if (activeTurn && !activeTurn.settled && record.session.isStreaming) {
+		if (activeTurn && !activeTurn.settled && (record.session.isStreaming || activeTurn.loopGate)) {
 			// New prompt arrived while the previous turn is still in-flight (e.g. the
 			// client sent a message immediately after pressing stop, before or without
 			// a preceding session/cancel notification). Implicitly cancel the running
@@ -2074,6 +2091,7 @@ export class AcpAgent implements Agent {
 			setAcpMode: async modeId => {
 				await this.setSessionMode({ sessionId: record.protocolSessionId, modeId });
 			},
+			loop: record.loop,
 			notifyTitleChanged: async () => {
 				await this.#pushSessionInfoUpdate(record);
 			},
@@ -2091,9 +2109,11 @@ export class AcpAgent implements Agent {
 		if (builtinResult !== false) {
 			if ("prompt" in builtinResult) {
 				const residualBaseline = new Set(record.extensionUserMessageTasks);
+				if (!builtinResult.synthetic) record.loop.setPrompt(builtinResult.prompt);
 				const residualAgentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
 					record.session.prompt(builtinResult.prompt, { images, synthetic: builtinResult.synthetic }),
 				);
+				this.#pauseLoopIfLocal(record, builtinResult.prompt, residualAgentInvoked);
 				// A residual prompt can itself resolve locally (extension command,
 				// custom-TS command, file prompt template). No agent turn means no
 				// `agent_end`, so the prompt turn must be settled here — same pairing
@@ -2115,9 +2135,13 @@ export class AcpAgent implements Agent {
 		}
 
 		const extensionPromptBaseline = new Set(record.extensionUserMessageTasks);
+		// While `/loop` is on, the prompt becomes the one re-run after each yield.
+		// Set before dispatch: the turn's `agent_end` decides the next iteration.
+		record.loop.setPrompt(text);
 		const agentInvoked = await this.#promptWhenIdle(record, promptTurn, () =>
 			record.session.prompt(text, { images }),
 		);
+		this.#pauseLoopIfLocal(record, text, agentInvoked);
 		// Extension and custom-TS commands are handled locally inside session.prompt().
 		// An ACP extension command can still call pi.sendUserMessage(), which starts
 		// an async nested prompt through the extension runtime. Keep the ACP turn
@@ -2183,6 +2207,15 @@ export class AcpAgent implements Agent {
 		}
 	}
 
+	/**
+	 * A loop prompt that ran no agent turn (an extension command handled
+	 * locally) would only repeat that local work: suspend the loop instead, as
+	 * the TUI does.
+	 */
+	#pauseLoopIfLocal(record: ManagedSessionRecord, text: string, agentInvoked: boolean): void {
+		if (!agentInvoked && record.loop.prompt === text) record.loop.pause();
+	}
+
 	async #tryRunSkillCommand(record: ManagedSessionRecord, text: string): Promise<boolean> {
 		if (!record.session.skillsSettings?.enableSkillCommands) {
 			return false;
@@ -2196,6 +2229,7 @@ export class AcpAgent implements Agent {
 			return false;
 		}
 		const built = await record.session.buildUserSkillPrompt(skill, parsed);
+		record.loop.setPrompt(text);
 		await this.#promptWhenIdle(record, record.promptTurn, () =>
 			record.session.promptCustomMessage({
 				customType: SKILL_PROMPT_MESSAGE_TYPE,
@@ -2299,6 +2333,9 @@ export class AcpAgent implements Agent {
 		promptTurn.cancelRequested = true;
 		promptTurn.abortController.abort();
 		promptTurn.unsubscribe?.();
+		// Cancel is ACP's Esc: it suspends `/loop` (dropping the prompt and any
+		// running condition) without disabling it.
+		if (record.loop.enabled) record.loop.pause();
 		// The compaction's own end event can no longer reach this turn. The send
 		// is queued now, so `cancelled` precedes the prompt response.
 		void record.compaction.reset();
@@ -2776,7 +2813,7 @@ export class AcpAgent implements Agent {
 	#enableIdleMaintenance(record: ManagedSessionRecord): void {
 		if (!clientSupportsNotices(this.#clientCapabilities)) cfgRecapEnabled.override(record.session.settings, false);
 		record.session.enableIdleMaintenance({
-			scheduledTurn: () => record.goalContinuation.pendingTurns > 0,
+			scheduledTurn: () => record.goalContinuation.pendingTurns > 0 || record.promptTurn?.loopGate === true,
 			onRecap: recap => {
 				this.#sendSessionNotices(record, [recapNotice(recap)]).catch((error: unknown) => {
 					logger.debug("Failed to send ACP idle recap", { acpSessionId: record.protocolSessionId, error });
@@ -2944,6 +2981,7 @@ export class AcpAgent implements Agent {
 				this.#compactionReportOptions(),
 			),
 			goalContinuation: { pendingTurns: 0, previousActivity: undefined, stalled: false },
+			loop: new LoopModeState(),
 			vibeMode: undefined,
 			planProposal: undefined,
 			approvedPlan: undefined,
@@ -3161,7 +3199,15 @@ export class AcpAgent implements Agent {
 				stopReason: this.#resolveStopReason(event, promptTurn.cancelRequested),
 				...this.#turnUsage(record, promptTurn),
 			};
-			if (response.stopReason === "end_turn" && this.#continueGoalInPromptTurn(record, promptTurn, response)) {
+			if (response.stopReason === "end_turn" && this.#continueLoopInPromptTurn(record, promptTurn, response)) {
+				return;
+			}
+			// An enabled loop owns what follows a yield, as in the TUI: no goal continuation.
+			if (
+				response.stopReason === "end_turn" &&
+				!record.loop.enabled &&
+				this.#continueGoalInPromptTurn(record, promptTurn, response)
+			) {
 				return;
 			}
 			this.#finishPrompt(record, response);
@@ -3274,6 +3320,90 @@ export class AcpAgent implements Agent {
 				},
 			);
 		return true;
+	}
+
+	/**
+	 * Re-run the `/loop` prompt inside the prompt turn that just ended, as goal
+	 * continuations do: the client shows the session busy for the whole loop,
+	 * `session/cancel` stops it (and suspends the loop), and the response
+	 * settles only when the loop stops. Each iteration's own `agent_end`
+	 * re-enters here.
+	 */
+	#continueLoopInPromptTurn(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState,
+		response: PromptResponse,
+	): boolean {
+		const loop = record.loop;
+		const prompt = loop.prompt;
+		if (!loop.enabled || loop.paused || prompt === undefined) return false;
+		if (promptTurn.cancelRequested || record.promptTurn !== promptTurn) return false;
+		promptTurn.loopGate = true;
+		void this.#runLoopIteration(record, promptTurn, response, prompt);
+		return true;
+	}
+
+	async #runLoopIteration(
+		record: ManagedSessionRecord,
+		promptTurn: PromptTurnState,
+		response: PromptResponse,
+		prompt: string,
+	): Promise<void> {
+		const { session, loop } = record;
+		let dispatched = false;
+		const current = () => !promptTurn.cancelRequested && !promptTurn.settled && record.promptTurn === promptTurn;
+		const stop = async (message: string): Promise<void> => {
+			loop.disable();
+			await this.#emitCommandOutput(record, message);
+			this.#finishPrompt(record, response);
+		};
+		try {
+			const sessionId = session.sessionManager.getSessionId();
+			const verdict = await loop.checkIteration({
+				cwd: session.sessionManager.getCwd(),
+				sessionId,
+				isSessionCurrent: () => session.sessionManager.getSessionId() === sessionId,
+				timeoutMs: cfgLoopConditionTimeoutMs.get(session.settings),
+			});
+			// A cancel already settled the turn (and suspended the loop).
+			if (!current()) return;
+			if (verdict.kind === "stop") return await stop(verdict.message);
+			if (verdict.kind === "aborted" || !loop.enabled || loop.prompt !== prompt) {
+				this.#finishPrompt(record, response);
+				return;
+			}
+			if (!loop.consumeIteration()) return await stop("Loop limit reached. Loop mode disabled.");
+			if (cfgLoopMode.get(session.settings) === "compact") {
+				// As in the TUI, a failed or no-op compaction is reported and the
+				// iteration still runs.
+				try {
+					await session.compact();
+				} catch (error) {
+					if (!current()) return;
+					await this.#emitCommandOutput(
+						record,
+						`Compaction before the next loop iteration failed: ${error instanceof Error ? error.message : String(error)}`,
+					);
+				}
+				if (!current()) return;
+			}
+			promptTurn.loopGate = false;
+			dispatched = true;
+			const agentInvoked =
+				(await this.#tryRunSkillCommand(record, prompt)) ||
+				(await this.#promptWhenIdle(record, promptTurn, () => session.prompt(prompt)));
+			if (!agentInvoked && current()) {
+				loop.pause();
+				this.#finishPrompt(record, response);
+			}
+		} catch (error) {
+			loop.pause();
+			if (current()) this.#finishPrompt(record, undefined, error);
+		} finally {
+			// Once dispatched, this iteration's `agent_end` may already have opened
+			// the next iteration's gate on the same turn: leave that flag alone.
+			if (!dispatched) promptTurn.loopGate = false;
+		}
 	}
 
 	#trackGoalContinuation(record: ManagedSessionRecord, event: AgentSessionEvent): void {
@@ -5835,6 +5965,7 @@ export class AcpAgent implements Agent {
 		record.titleUnsubscribe?.();
 		record.promptSuggestionAbort?.abort();
 		record.promptSuggestionAbort = undefined;
+		record.loop.disable();
 		// Delivers the end of children still running before the session kills them,
 		// but a client that stops reading must not hold the close: this path is also
 		// the fallback when cancel cleanup times out.
