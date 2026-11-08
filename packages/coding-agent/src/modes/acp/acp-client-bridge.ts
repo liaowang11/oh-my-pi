@@ -46,7 +46,7 @@ export function createAcpClientBridge(
 		requestPermission: true,
 	};
 
-	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true };
+	const bridge: ClientBridge = { capabilities, deferAgentInitiatedTurns: true, streamsAgentInitiatedTurns: true };
 
 	if (capabilities.readTextFile) {
 		bridge.readTextFile = async params => {
