@@ -11,6 +11,7 @@ import { continuesConversation } from "../modes/utils/conversation-position";
 import { claimSessionName, isReservedAddress, RESERVED_SESSION_NAME_ERROR } from "../messaging/names";
 import { cleanSessionTitle } from "../session/session-title-slot";
 import type { FreshSessionResult, HandoffResult } from "../session/agent-session";
+import { dispatchBackgroundTan } from "../session/background-tan";
 import { COMPACT_MODES, parseCompactArgs } from "../session/compact-modes";
 import { USER_INTERRUPT_LABEL } from "../session/messages";
 import { resolveResumableSession, resolveResumeTarget } from "../session/session-listing";
@@ -519,6 +520,20 @@ export const BUILTIN_LIFECYCLE_SLASH_COMMANDS: ReadonlyArray<SlashCommandSpec> =
 		description: "Run a full background agent on tangential work",
 		inlineHint: "<work>",
 		allowArgs: true,
+		// Prompt attachments do not reach builtin commands over ACP, so the clone gets text only.
+		handleAcp: async (command, runtime) => {
+			const result = await dispatchBackgroundTan(command.args, {
+				session: runtime.session,
+				sessionManager: runtime.sessionManager,
+				settings: runtime.settings,
+				mcpManager: runtime.mcpManager,
+			});
+			if (result.status !== "dispatched") return usage(result.message, runtime);
+			await runtime.output(
+				`Dispatched background tan ${result.jobId}. Its report comes back as a new turn when it finishes.`,
+			);
+			return commandConsumed();
+		},
 		handleTui: async (command, runtime) => {
 			const work = command.text.slice(`/${command.name}`.length).trim();
 			await runWithDetachedDraft(command, runtime, () => runtime.ctx.handleTanCommand(work, runtime.input?.images), {
