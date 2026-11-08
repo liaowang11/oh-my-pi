@@ -108,6 +108,17 @@ describe("terminal multiplexer classification", () => {
 		expect(classifyTerminalMultiplexer({ ORCA_WORKTREE_ID: "worktree-1" })).toBe(null);
 	});
 
+	it("classifies Rex after nested multiplexers without moving it off the direct render path", () => {
+		const rexEnv = { REX_SESSION: "s-1", REX_BLOCK: "b-7", TERM_PROGRAM: "rex" };
+		expect(classifyTerminalMultiplexer(rexEnv)).toBe("rex");
+		expect(isInsideTerminalMultiplexer(rexEnv)).toBe(false);
+		expect(classifyTerminalMultiplexer({ ...rexEnv, TMUX: "session" })).toBe("tmux");
+		expect(classifyTerminalMultiplexer({ ...rexEnv, ZELLIJ: "session" })).toBe("zellij");
+		expect(classifyTerminalMultiplexer({ TERM_PROGRAM: "rex" })).toBe(null);
+		expect(classifyTerminalMultiplexer({ REX_BLOCK: "b-7" })).toBe(null);
+		expect(classifyTerminalMultiplexer({ REX_SESSION: " " })).toBe(null);
+	});
+
 	it("recognizes session markers through the generic render-path gate", () => {
 		expect(isInsideTerminalMultiplexer({ HERDR_PANE_ID: "p1" })).toBe(true);
 		expect(isInsideTerminalMultiplexer({ WMUX: "1" })).toBe(true);
