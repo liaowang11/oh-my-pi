@@ -157,6 +157,18 @@ jobs:
    # check compares hashes only (no splice); on failure the job evaluates the
    # extension once and uploads the refreshed lockfile, so a contributor
    # without bazelisk can commit it as-is.
+   sync_rust_sdk:
+      name: Verify Rust SDK
+      runs-on: ubuntu-24.04
+      steps:
+         - uses: actions/checkout@v4
+         - name: Check Rust SDK
+           run: cargo check --manifest-path sdk/rust/omp-rpc/Cargo.toml --all-targets
+         - name: Check Rust SDK formatting
+           run: cargo fmt --manifest-path sdk/rust/omp-rpc/Cargo.toml -- --check
+         - name: Lint Rust SDK
+           run: cargo clippy --manifest-path sdk/rust/omp-rpc/Cargo.toml --all-targets -- -D warnings
+
    bazel_lock:
       name: Check MODULE.bazel.lock freshness
       runs-on: ubuntu-22.04
