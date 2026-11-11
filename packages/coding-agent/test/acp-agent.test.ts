@@ -7812,6 +7812,148 @@ describe("ACP agent", () => {
 				expect(states(harness, sessionId)).toEqual(["running", "requires_action", "idle:cancelled"]);
 				harness.abortController.abort();
 			});
+
+			it("names a permission request's wait as blocked on permission", async () => {
+				const { harness, sessionId, bridge, answer, permissionAsked, finishPrompt, response } =
+					await permissionHarness();
+				const outcome = bridge().requestPermission!(TOOL_CALL, OPTIONS, new AbortController().signal);
+				await permissionAsked;
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({
+					state: "requires_action",
+					_meta: { blocked: { kind: "permission" } },
+				});
+
+				answer();
+				await outcome;
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({ state: "running" });
+				finishPrompt();
+				await response;
+				harness.abortController.abort();
+			});
+		});
+
+		describe("extension dialogs", () => {
+			async function dialogHarness(): Promise<{
+				harness: AgentHarness;
+				sessionId: string;
+				ui: () => ExtensionUIContext;
+				answer: (content: Record<string, unknown>) => void;
+				asked: () => Promise<CreateElicitationRequest>;
+				finishPrompt: () => void;
+				response: Promise<PromptResponse>;
+			}> {
+				const pending: Array<{
+					request: CreateElicitationRequest;
+					resolve: (value: CreateElicitationResponse) => void;
+				}> = [];
+				let notify = Promise.withResolvers<void>();
+				const harness = await createHarness({
+					clientCapabilities: { ...STATE_UPDATE_CAPABILITIES, elicitation: { form: {} } } as ClientCapabilities,
+					extensionRunners: true,
+					elicitationHandler: request => {
+						const { promise, resolve } = Promise.withResolvers<CreateElicitationResponse>();
+						pending.push({ request, resolve });
+						notify.resolve();
+						return promise;
+					},
+				});
+				const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+				const session = harness.findSession(created.sessionId)!;
+				const finishPrompt = holdPromptStreaming(session);
+				const response = harness.agent.prompt({
+					sessionId: created.sessionId,
+					prompt: [{ type: "text", text: "do the thing" }],
+				});
+				await Bun.sleep(0);
+				return {
+					harness,
+					sessionId: created.sessionId,
+					ui: () => session.extensionRunner!.getUIContext(),
+					answer: content => {
+						const next = pending.pop()!;
+						next.resolve({ action: "accept", content } as CreateElicitationResponse);
+					},
+					asked: async () => {
+						if (pending.length === 0) {
+							await notify.promise;
+							notify = Promise.withResolvers<void>();
+						}
+						return pending.at(-1)!.request;
+					},
+					finishPrompt,
+					response,
+				};
+			}
+
+			it("names a select's wait as blocked on a question, then runs again", async () => {
+				const { harness, sessionId, ui, answer, asked, finishPrompt, response } = await dialogHarness();
+				const choice = ui().select("Pick one", ["a", "b"]);
+				await asked();
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({
+					state: "requires_action",
+					_meta: { blocked: { kind: "question", msg: "Pick one" } },
+				});
+
+				answer({ value: "a" });
+				expect(await choice).toBe("a");
+				expect(states(harness, sessionId)).toEqual(["running", "requires_action", "running"]);
+				finishPrompt();
+				await response;
+				harness.abortController.abort();
+			});
+
+			it("names a confirm's wait as blocked on permission", async () => {
+				const { harness, sessionId, ui, answer, asked, finishPrompt, response } = await dialogHarness();
+				const confirmed = ui().confirm("Delete it?", "");
+				await asked();
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({
+					state: "requires_action",
+					_meta: { blocked: { kind: "permission", msg: "Delete it?" } },
+				});
+				answer({ value: true });
+				expect(await confirmed).toBe(true);
+				finishPrompt();
+				await response;
+				harness.abortController.abort();
+			});
+
+			it("shows the newest open dialog and falls back to the one under it", async () => {
+				const { harness, sessionId, ui, answer, asked, finishPrompt, response } = await dialogHarness();
+				const confirmed = ui().confirm("Delete it?", "");
+				await asked();
+				const typed = ui().input("Name?");
+				await asked();
+				expect(stateUpdates(harness, sessionId).slice(-2)).toEqual([
+					{ state: "requires_action", _meta: { blocked: { kind: "permission", msg: "Delete it?" } } },
+					{ state: "requires_action", _meta: { blocked: { kind: "question", msg: "Name?" } } },
+				]);
+
+				answer({ value: "x" });
+				expect(await typed).toBe("x");
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({
+					state: "requires_action",
+					_meta: { blocked: { kind: "permission", msg: "Delete it?" } },
+				});
+				answer({ value: false });
+				await confirmed;
+				expect(stateUpdates(harness, sessionId).at(-1)).toEqual({ state: "running" });
+				finishPrompt();
+				await response;
+				harness.abortController.abort();
+			});
+
+			it("does not report a dialog opened while no turn runs", async () => {
+				const { harness, sessionId, ui, answer, asked, finishPrompt, response } = await dialogHarness();
+				finishPrompt();
+				await response;
+				const before = harness.updates.length;
+				const choice = ui().select("Pick one", ["a"]);
+				await asked();
+				answer({ value: "a" });
+				await choice;
+				expect(states(harness, sessionId, before)).toEqual([]);
+				harness.abortController.abort();
+			});
 		});
 
 		it("sends nothing when loading an idle stored session", async () => {
