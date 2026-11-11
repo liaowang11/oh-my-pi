@@ -156,6 +156,7 @@ import {
 	TTS_SPEED_OPTIONS,
 } from "../../tts/models";
 import type { EventBus } from "../../utils/event-bus";
+import type { BlockedKind } from "../../utils/run-status";
 import { enterVibeMode, exitVibeMode, type VibeModeHandle, vibeParentSessionOf } from "../../vibe/mode";
 import { VibeSessionRegistry } from "../../vibe/runtime";
 import { canonicalizeMessage } from "@oh-my-pi/pi-tui/chat/thinking-display";
@@ -682,8 +683,12 @@ type ManagedSessionRecord = {
 	extensionUserMessageTasks: Set<Promise<void>>;
 	// The `state_update` state last sent (see `#setRunState`); a session starts idle.
 	runState: RunStateUpdate["state"];
-	// `session/request_permission` requests awaiting the client.
-	pendingPermissions: number;
+	// Waits on the user, newest last: `session/request_permission` requests and
+	// extension dialogs awaiting the client (see `#holdBlocked`).
+	blockedHolds: AcpBlockedStatus[];
+	// The `_meta.blocked` the last `requires_action` carried, so a change of
+	// newest wait is sent and a repeat is not.
+	runStateBlockedKey: string | undefined;
 };
 
 type ReplayableMessage = {
@@ -1016,6 +1021,22 @@ function buildAcpSpeechModelsCatalog(): Record<string, unknown> {
  * `undefined` means the user dismissed the form, and a failed request is not
  * a user decision.
  */
+/** What an ACP session waits on the user for, as `state_update._meta.blocked` reports it. */
+export type AcpBlockedStatus = { kind: BlockedKind; msg?: string };
+
+/** A dialog title as one line short enough for a status row; undefined when blank. */
+function withMessage(kind: BlockedKind, msg: string | undefined): AcpBlockedStatus {
+	return msg ? { kind, msg } : { kind };
+}
+
+function blockedMessage(text: string | undefined): string | undefined {
+	const line = text?.replace(/\s+/g, " ").trim();
+	if (!line) return undefined;
+	return line.length > BLOCKED_MESSAGE_MAX ? `${line.slice(0, BLOCKED_MESSAGE_MAX - 1)}…` : line;
+}
+
+const BLOCKED_MESSAGE_MAX = 200;
+
 async function elicitFormFromAcpClient(
 	connection: AgentSideConnection,
 	sessionId: string,
@@ -1024,11 +1045,13 @@ async function elicitFormFromAcpClient(
 	properties: Record<string, ElicitationPropertySchema>,
 	required: string[] | undefined,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
+	holdBlocked?: () => () => void,
 ): Promise<Record<string, ElicitationContentValue> | undefined> {
 	const signal = dialogOptions?.signal;
 	if (signal?.aborted) {
 		return undefined;
 	}
+	const releaseBlocked = holdBlocked?.();
 	const { promise, resolve, reject } = Promise.withResolvers<CreateElicitationResponse | undefined>();
 	const request = new AbortController();
 	let settled = false;
@@ -1038,6 +1061,7 @@ async function elicitFormFromAcpClient(
 		settled = true;
 		clearTimeout(timeoutId);
 		signal?.removeEventListener("abort", onAbort);
+		releaseBlocked?.();
 		if (!answered) request.abort();
 		done();
 	};
@@ -1109,6 +1133,7 @@ async function elicitFromAcpClient(
 	message: string,
 	property: ElicitationPropertySchema,
 	dialogOptions: ExtensionUIDialogOptions | undefined,
+	holdBlocked?: () => () => void,
 ): Promise<ElicitationContentValue | undefined> {
 	try {
 		const content = await elicitFormFromAcpClient(
@@ -1119,6 +1144,7 @@ async function elicitFromAcpClient(
 			{ value: property },
 			["value"],
 			dialogOptions,
+			holdBlocked,
 		);
 		return content?.value;
 	} catch {
@@ -1296,8 +1322,12 @@ export function createAcpExtensionUiContext(
 	connection: AgentSideConnection,
 	getSessionId: () => string,
 	clientCapabilities: ClientCapabilities | undefined,
+	holdBlocked?: (status: AcpBlockedStatus) => () => void,
 ): ExtensionUIContext {
 	const supportsForm = clientCapabilities?.elicitation?.form != null;
+	// Mirrors the TUI's dialog kinds: a confirm asks for approval, the rest for an answer.
+	const blockedOn = (kind: BlockedKind, title: string | undefined) =>
+		holdBlocked ? () => holdBlocked(withMessage(kind, blockedMessage(title))) : undefined;
 	const airClient = isAirClient(clientCapabilities);
 	const supportsNotices = clientSupportsNotices(clientCapabilities);
 	return {
@@ -1311,6 +1341,7 @@ export function createAcpExtensionUiContext(
 				title,
 				{ type: "string", enum: options.map(getExtensionUISelectOptionLabel) },
 				dialogOptions,
+				blockedOn("question", title),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -1323,6 +1354,7 @@ export function createAcpExtensionUiContext(
 				message.trim().length > 0 ? `${title}\n\n${message}` : title,
 				{ type: "boolean" },
 				dialogOptions,
+				blockedOn("permission", title),
 			);
 			return typeof value === "boolean" ? value : false;
 		},
@@ -1341,6 +1373,7 @@ export function createAcpExtensionUiContext(
 				// Empty / whitespace-only placeholders are treated as absent.
 				{ type: "string", ...(placeholder?.trim() ? { description: placeholder } : {}) },
 				dialogOptions,
+				blockedOn("question", title),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -1420,6 +1453,7 @@ export function createAcpExtensionUiContext(
 						dialogOptions?.onTimeout?.();
 					},
 				},
+				blockedOn("question", questions[0]?.question),
 			);
 			if (timedOut) return timedOutAskDialogResult(questions);
 			if (!content) return undefined;
@@ -1471,6 +1505,7 @@ export function createAcpExtensionUiContext(
 						dialogOptions?.onTimeout?.();
 					},
 				},
+				blockedOn("question", undefined),
 			);
 			if (timedOut) return { data: defaultFormData(form), timedOut: true };
 			if (!content) return undefined;
@@ -1507,6 +1542,7 @@ export function createAcpExtensionUiContext(
 				title,
 				{ type: "string", ...(prefill ? { default: prefill } : {}) },
 				dialogOptions,
+				blockedOn("question", title),
 			);
 			return typeof value === "string" ? value : undefined;
 		},
@@ -2859,20 +2895,18 @@ export class AcpAgent implements Agent {
 		name?: string,
 	): Promise<ManagedSessionRecord> {
 		const record = this.#createManagedSessionRecord(session, setToolUIContext, protocolSessionId);
+		// Releases for the open permission requests, oldest first: the bridge
+		// reports a settle without saying which request settled.
+		const permissionReleases: Array<() => void> = [];
 		// Registered before extensions start: a `session_start` handler can already replace the durable session.
 		session.registerSessionChangeCallback(() => this.#rememberHandleSession(record));
 		session.setClientBridge({
 			...createAcpClientBridge(this.#connection, record.protocolSessionId, this.#clientCapabilities, {
 				onPermissionPending: () => {
-					if (++record.pendingPermissions === 1 && record.runState === "running") {
-						this.#setRunState(record, "requires_action");
-					}
+					permissionReleases.push(this.#holdBlocked(record, { kind: "permission" }));
 				},
 				onPermissionSettled: () => {
-					// A cancelled run already went idle; its withdrawn request must not revive it.
-					if (--record.pendingPermissions === 0 && record.runState === "requires_action") {
-						this.#setRunState(record, "running");
-					}
+					permissionReleases.shift()?.();
 				},
 			}),
 			get deferAgentInitiatedTurns() {
@@ -3014,7 +3048,8 @@ export class AcpAgent implements Agent {
 			planProposal: undefined,
 			approvedPlan: undefined,
 			runState: "idle",
-			pendingPermissions: 0,
+			blockedHolds: [],
+			runStateBlockedKey: undefined,
 		};
 		this.#recordsBySession.set(session, record);
 		return record;
@@ -3500,13 +3535,49 @@ export class AcpAgent implements Agent {
 		idle?: Omit<Extract<RunStateUpdate, { state: "idle" }>, "state">,
 		force = false,
 	): void {
-		if (!this.#stateUpdates || (record.runState === state && !force)) return;
+		if (!this.#stateUpdates) return;
+		// While the user owes an answer, a running turn shows the newest wait instead.
+		const blocked = state === "idle" ? undefined : record.blockedHolds.at(-1);
+		if (blocked) state = "requires_action";
+		const blockedKey = blocked ? JSON.stringify(blocked) : undefined;
+		if (record.runState === state && record.runStateBlockedKey === blockedKey && !force) return;
 		record.runState = state;
-		const update: SessionUpdate = { sessionUpdate: "state_update", state, ...(state === "idle" ? idle : {}) };
+		record.runStateBlockedKey = blockedKey;
+		const update: SessionUpdate = {
+			sessionUpdate: "state_update",
+			state,
+			...(state === "idle" ? idle : {}),
+			...(blocked ? { _meta: { blocked } } : {}),
+		};
 		void this.#sendQuietly(
 			this.#connection.sessionUpdate({ sessionId: record.protocolSessionId, update }),
 			"state update",
 		);
+	}
+
+	/**
+	 * Mark the run blocked on the user while `status` waits, the ACP side of the
+	 * TUI's `holdBlockedStatus`: a running turn reports `requires_action` with
+	 * the newest open wait as `_meta.blocked`, and the returned release drops
+	 * the hold, showing the next newest or `running` again. A wait opened or
+	 * released while no turn runs reports nothing; the session index row still
+	 * reads the holds.
+	 */
+	#holdBlocked(record: ManagedSessionRecord, status: AcpBlockedStatus): () => void {
+		const hold = { ...status };
+		record.blockedHolds.push(hold);
+		this.#publishBlocked(record);
+		return () => {
+			const index = record.blockedHolds.indexOf(hold);
+			if (index === -1) return;
+			record.blockedHolds.splice(index, 1);
+			this.#publishBlocked(record);
+		};
+	}
+
+	#publishBlocked(record: ManagedSessionRecord): void {
+		// A cancelled run already went idle; its withdrawn request must not revive it.
+		if (record.runState === "running" || record.runState === "requires_action") this.#setRunState(record, "running");
 	}
 
 	async #forwardSessionEvent(
@@ -4506,6 +4577,7 @@ export class AcpAgent implements Agent {
 			resolvedTitle,
 			planContent,
 			turnSignal,
+			() => this.#holdBlocked(record, withMessage("permission", blockedMessage(`Review plan: ${resolvedTitle}`))),
 		);
 		const details: PlanApprovalDetails = {
 			planFilePath,
@@ -4650,6 +4722,7 @@ export class AcpAgent implements Agent {
 		title: string,
 		planContent: string,
 		signal: AbortSignal | undefined,
+		holdBlocked?: () => () => void,
 	): Promise<boolean> {
 		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
 		if (!supportsForm) return true;
@@ -4666,6 +4739,7 @@ export class AcpAgent implements Agent {
 			message,
 			{ type: "string", enum: [APPROVE_OPTION, REFINE_OPTION] },
 			signal ? { signal } : undefined,
+			holdBlocked,
 		);
 		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
 		// timeout, or any other non-approve response falls through to refine
@@ -4802,9 +4876,9 @@ export class AcpAgent implements Agent {
 		const forkedFrom = parentSessionId(session.parentSessionPath);
 		if (forkedFrom) fields.forkedFrom = forkedFrom;
 		const running = record !== undefined && (isPromptTurnInFlight(record.promptTurn) || record.session.isStreaming);
-		// `pendingPermissions` is counted for every client; `runState` only for one that opted into `state_update`.
+		// `blockedHolds` are kept for every client; `runState` only for one that opted into `state_update`.
 		fields.state = running
-			? record.pendingPermissions > 0
+			? record.blockedHolds.length > 0
 				? "requires_action"
 				: "running"
 			: session.status === "error"
@@ -5778,6 +5852,7 @@ export class AcpAgent implements Agent {
 			this.#connection,
 			() => record.protocolSessionId,
 			this.#clientCapabilities,
+			status => this.#holdBlocked(record, status),
 		);
 		if (this.#clientCapabilities?.elicitation?.form != null) {
 			record.setToolUIContext?.(uiContext, true);
