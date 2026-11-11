@@ -9157,6 +9157,44 @@ describe("ACP async tasks", () => {
 		harness.abortController.abort();
 	});
 
+	it("describes a /tan job by the user's verbatim request, keeping its label as the name", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const gate = Promise.withResolvers<string>();
+		const request = "find every caller of parseConfig\nand list the ones that ignore errors";
+
+		const jobId = manager.register("task", "/tan find every caller of parseConfig…", () => gate.promise, {
+			ownerId: "Main",
+			request,
+		});
+		await pollUntil(() => asyncTaskUpdates(harness).length === 1);
+
+		expect(asyncTaskUpdates(harness)[0]).toMatchObject({
+			sessionUpdate: "async_task_spawned",
+			asyncTaskId: jobId,
+			name: "/tan find every caller of parseConfig…",
+			taskType: "task",
+			description: request,
+			showInTranscript: true,
+		});
+		gate.resolve("done");
+		await manager.waitForAll();
+		harness.abortController.abort();
+	});
+
+	it("still leaves a subagent's task job to the subagent relay", async () => {
+		const manager = createManager();
+		const harness = await createHarness({ clientCapabilities: AIR_ASYNC_TASKS, asyncJobManager: manager });
+		await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+
+		manager.register("task", "Explore", async () => "done", { ownerId: "Main" });
+		await manager.waitForAll();
+		await Bun.sleep(0);
+		expect(asyncTaskUpdates(harness)).toEqual([]);
+		harness.abortController.abort();
+	});
+
 	it("sends no async task frames to a client without the AIR asyncTasks capability", async () => {
 		const manager = createManager();
 		const harness = await createHarness({ clientCapabilities: {}, asyncJobManager: manager });
