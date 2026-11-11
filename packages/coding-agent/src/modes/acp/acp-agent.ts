@@ -97,6 +97,7 @@ import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
 import { bindSessionMessaging } from "../../session/messaging-host";
 import {
 	bashExecutionToText,
+	type CustomMessage,
 	formatFileMention,
 	isSilentAbort,
 	pythonExecutionToText,
@@ -5496,6 +5497,14 @@ export class AcpAgent implements Agent {
 	): SessionNotification[] {
 		if (message.role === "assistant") {
 			return this.#replayAssistantMessage(sessionId, message, cwd, replayedToolCallIds, replayedToolCallArgs);
+		}
+		// Another agent's message is no user prompt: replay it as the live session
+		// showed it (another session's as its labelled card, a local agent's not at all).
+		if (message.role === "custom" && (message as { customType?: unknown }).customType === "irc:incoming") {
+			return mapAgentSessionEventToAcpSessionUpdates(
+				{ type: "irc_message", message: message as unknown as CustomMessage },
+				sessionId,
+			);
 		}
 		if (
 			message.role === "user" ||
