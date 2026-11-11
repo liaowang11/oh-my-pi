@@ -4548,6 +4548,58 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	}
 
+	it("replays peer messages as the live session showed them, never as the user's prompts", async () => {
+		const harness = await createHarness();
+		const stored = new FakeAgentSession(harness.cwdA);
+		harness.sessions.push(stored);
+		stored.sessionManager.appendMessage({
+			role: "user",
+			content: [{ type: "text", text: "watch the build" }],
+			timestamp: Date.now(),
+		});
+		stored.sessionManager.appendMessage(makeAssistantMessage("waiting"));
+		// A message from another session, as `deliverRemote` records it (also the
+		// turn injected after a "Wait interrupted by message." result).
+		stored.sessionManager.appendCustomMessageEntry(
+			"irc:incoming",
+			'<irc remote="true" from="ci@box">build is green</irc>',
+			true,
+			{ id: "m1", from: "ci@box", message: "build is green", remote: true, shortId: "ci" },
+			"agent",
+		);
+		// A local agent's message, which the live session does not render; array
+		// content would otherwise replay as a user prompt.
+		stored.sessionManager.appendCustomMessageEntry(
+			"irc:incoming",
+			[{ type: "text", text: '<irc from="Explore">found 3 callers</irc>' }],
+			true,
+			{ from: "Explore", message: "found 3 callers" },
+			"agent",
+		);
+		stored.sessionManager.appendMessage(makeAssistantMessage("great"));
+		await stored.sessionManager.ensureOnDisk();
+		await stored.sessionManager.flush();
+
+		await harness.agent.loadSession({ sessionId: stored.sessionId, cwd: harness.cwdA, mcpServers: [] });
+
+		const replayed = harness.updates.filter(notification => notification.sessionId === stored.sessionId);
+		const texts = (kind: string) =>
+			replayed
+				.filter(notification => notification.update.sessionUpdate === kind)
+				.map(notification => (notification.update as { content: { text?: string } }).content.text ?? "");
+		expect(texts("user_message_chunk")).toEqual(["watch the build"]);
+		expect(texts("agent_message_chunk")).toContain("**Message from another session @ci@box:** build is green");
+		expect(
+			[...texts("user_message_chunk"), ...texts("agent_message_chunk")].some(text =>
+				text.includes("found 3 callers"),
+			),
+		).toBe(false);
+		expectAcpNotifications(harness.updates);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("replays assistant tool calls and matching results without duplicating the start", async () => {
 		const harness = await createHarness();
 		const stored = new FakeAgentSession(harness.cwdA);
