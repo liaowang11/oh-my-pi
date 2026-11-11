@@ -6,7 +6,9 @@
  * {@link ASYNC_TASK_STOP_METHOD}. Wire shapes match claude-agent-acp.
  *
  * `task` jobs are skipped: subagents already reach the client as child
- * sessions through `AcpSubagentRelay`. A job a subagent started goes to that
+ * sessions through `AcpSubagentRelay`. A `/tan` job (a `task` job carrying
+ * its `request`) is relayed, described by that request: its clone is not a
+ * subagent, so nothing else shows it. A job a subagent started goes to that
  * subagent's child session, also once the subagent has finished, as in
  * claude-agent-acp.
  */
@@ -127,7 +129,8 @@ export class AcpAsyncTaskRelay {
 
 	#onChange(event: AsyncJobChangeEvent): void {
 		const { job } = event;
-		if (job.type === "task") return;
+		// A `/tan` job is the exception: its clone is no subagent, so this card is its only one.
+		if (job.type === "task" && job.request === undefined) return;
 		// A reused id is a new job: drop any state left by the previous one,
 		// including the session it was announced on.
 		if (event.kind === "registered") this.#forget(job.id);
@@ -199,11 +202,12 @@ export class AcpAsyncTaskRelay {
 				asyncTaskId: job.id,
 				name: job.label,
 				taskType: job.type === "bash" ? "shell" : job.type,
-				description: job.label,
+				// A `/tan` job's label previews the request; the card quotes it whole.
+				description: job.request ?? job.label,
 				// Per-type choice, to confirm against the JetBrains client: a bash job
 				// already has its own tool_call card in the transcript, an eval cell
-				// promoted to the background does not render one worth keeping.
-				showInTranscript: job.type === "eval",
+				// promoted to the background or a `/tan` job does not render one.
+				showInTranscript: job.type !== "bash",
 				canStop: true,
 				...(job.outputFilePath ? { outputFilePath: job.outputFilePath } : {}),
 				...(job.toolCallId ? { toolCallId: job.toolCallId } : {}),
