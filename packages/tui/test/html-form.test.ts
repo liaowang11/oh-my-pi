@@ -283,7 +283,7 @@ describe("html form", () => {
 			expect(onTimeout).toHaveBeenCalledWith(form.data(), [
 				{
 					name: "db",
-					question: "Which store should ledger use?",
+					question: "Database",
 					option: "SQLite",
 					value: "sqlite",
 					text: "pasted",
@@ -442,7 +442,7 @@ describe("html form", () => {
 			expect(onTimeout).toHaveBeenCalledWith(form.data(), [
 				{
 					name: "db",
-					question: "Which store should ledger use?",
+					question: "Database",
 					option: "SQLite",
 					value: "sqlite",
 					text: "draft",
@@ -720,7 +720,7 @@ describe("html form", () => {
 			const form = parseHtmlForm(DB_FORM);
 			expect(defaultFormData(form)).toEqual({ db: "sqlite", extras: ["ci"], region: "us", workers: 4, notes: "" });
 			expect(formAnswers(form, { db: "pg", extras: [], region: "eu", workers: 2, notes: "" })).toEqual([
-				{ name: "db", question: "Which store should ledger use?", answer: "Postgres" },
+				{ name: "db", question: "Database", answer: "Postgres" },
 				{ name: "extras", question: "Extras", answer: "" },
 				{ name: "region", question: "Region", answer: "EU" },
 				{ name: "workers", question: "Workers", answer: "2" },
@@ -1207,7 +1207,7 @@ describe("html form", () => {
 			for (let press = 0; press < 3; press++) form.handleInput(DOWN); // Postgres, Other, then CI
 			expect(form.debugState().focus).toBe("extras=ci");
 			let rows = plain(form);
-			expect(rowAfter(rows, "✓ Which store should ledger use?")).toMatch(/✓ SQLite.*Postgres/);
+			expect(rowAfter(rows, "✓ Database")).toMatch(/✓ SQLite.*Postgres/);
 			expect(rows.some(row => row.includes("○ Postgres"))).toBe(false);
 			expect(rows.some(row => row.includes("☐ Docker"))).toBe(true);
 			form.handleInput("\x1b[A");
@@ -1246,7 +1246,7 @@ describe("html form", () => {
 			form.handleInput(TAB); // Submit
 			let rows = plain(form);
 			expect(rows.some(row => row.includes("❯ Submit"))).toBe(true);
-			expect(rowAfter(rows, "✓ Which store should ledger use?")).toContain("✓ SQLite");
+			expect(rowAfter(rows, "✓ Database")).toContain("✓ SQLite");
 			expect(rowAfter(rows, "○ Workers")).toContain("94");
 			expect(rows.some(row => row.includes("○ Postgres") || row.includes("☐ Docker"))).toBe(false);
 			form.handleInput(ENTER);
@@ -1256,7 +1256,7 @@ describe("html form", () => {
 			expect(rows.some(row => row.includes("│ 94"))).toBe(true);
 			expect(rows.some(row => row.includes("Must be at most 8"))).toBe(true);
 			expect(rows.some(row => row.includes("Submit  1 to fix"))).toBe(true);
-			expect(rowAfter(rows, "✓ Which store should ledger use?")).toContain("✓ SQLite");
+			expect(rowAfter(rows, "✓ Database")).toContain("✓ SQLite");
 		});
 
 		it("rows: the skip notice is the panel's last line, the panel keeping its height", () => {

@@ -478,7 +478,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 	}
 
 	async execute(
-		_toolCallId: string,
+		toolCallId: string,
 		params: AskParams,
 		signal?: AbortSignal,
 		_onUpdate?: AgentToolUpdateCallback<AskToolDetails>,
@@ -563,6 +563,7 @@ export class AskTool implements AgentTool<typeof askSchema, AskToolDetails> {
 						timeout,
 						signal: dialogSignal,
 						acceptImages: true,
+						toolCallId,
 						onAbandon: partial => {
 							given = partial;
 						},
