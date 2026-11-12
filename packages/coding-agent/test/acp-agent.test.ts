@@ -7021,7 +7021,7 @@ describe("ACP agent", () => {
 			]);
 		});
 
-		it("marks the Other field for an AIR client under both custom-answer keys", async () => {
+		it("marks legacy and HTML Other fields for an AIR client under both custom-answer keys", async () => {
 			const { connection, calls } = createElicitConnection(async () => ({ action: "accept", content: {} }));
 			const ctx = createAcpExtensionUiContext(connection, () => "session-ask-air", {
 				...FORM_CAPABILITIES,
@@ -7035,6 +7035,16 @@ describe("ACP agent", () => {
 			expect(request.requestedSchema.properties.q0__other?._meta).toEqual({
 				_askUserQuestionCustomAnswer: { questionId: "q0", isCustomAnswer: true },
 				jetbrains: { air: { version: 1, customAnswer: { questionId: "q0", isCustomAnswer: true } } },
+			});
+
+			await ctx.formDialog!(
+				'<form><label><input type="radio" name="choice" value="a"> A</label><label><input type="radio" name="choice" value="b"> B</label></form>',
+			);
+			const htmlRequest = calls[1]!;
+			if (!isFormElicitation(htmlRequest)) throw new Error("expected form-mode elicitation");
+			expect(htmlRequest.requestedSchema.properties.choice__other?._meta).toEqual({
+				_askUserQuestionCustomAnswer: { questionId: "choice", isCustomAnswer: true },
+				jetbrains: { air: { version: 1, customAnswer: { questionId: "choice", isCustomAnswer: true } } },
 			});
 		});
 
@@ -7189,6 +7199,8 @@ describe("ACP agent", () => {
   <p>Staging is green; production has a pending migration.</p>
   <fieldset>
     <legend>Target</legend>
+    <p>Choose the environment to deploy.</p>
+    <p>Production needs approval.</p>
     <label><input type="radio" name="target" value="staging" checked> Staging</label>
     <label><input type="radio" name="target" value="prod"> Production</label>
   </fieldset>
@@ -7215,19 +7227,26 @@ describe("ACP agent", () => {
 			expect(calls).toHaveLength(1);
 			const request = calls[0]!;
 			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
-			expect(request.message).toContain("Staging is green; production has a pending migration.");
+			expect(request.message).toBe("Staging is green; production has a pending migration.");
+			expect(request).not.toHaveProperty("toolCallId");
 			expect(request.requestedSchema.required).toEqual(["replicas"]);
 			expect(request.requestedSchema.properties).toEqual({
 				target: {
 					type: "string",
 					title: "Target",
+					description: "Choose the environment to deploy.\n\nProduction needs approval.",
 					oneOf: [
 						{ const: "staging", title: "Staging" },
 						{ const: "prod", title: "Production" },
 					],
 					default: "staging",
 				},
-				target__other: { type: "string", title: "Target — Other", description: "Your own answer instead" },
+				target__other: {
+					type: "string",
+					title: "Other (type your own)",
+					description: "Type your own answer, or add a note to the option you chose above (optional).",
+					_meta: { _askUserQuestionCustomAnswer: { questionId: "target", isCustomAnswer: true } },
+				},
 				checks: {
 					type: "array",
 					title: "Checks",
@@ -7241,8 +7260,9 @@ describe("ACP agent", () => {
 				},
 				checks__other: {
 					type: "string",
-					title: "Checks — Other",
-					description: "Another answer, added to those checked",
+					title: "Other (type your own)",
+					description: "Type your own answer to add to your selection above (optional).",
+					_meta: { _askUserQuestionCustomAnswer: { questionId: "checks", isCustomAnswer: true } },
 				},
 				notify: { type: "boolean", title: "Notify the channel", default: false },
 				replicas: { type: "number", title: "Replicas", minimum: 1, maximum: 5, default: 2 },
@@ -7257,6 +7277,32 @@ describe("ACP agent", () => {
 					replicas: 3,
 					notes: "ship it",
 				},
+			});
+		});
+
+		it("keeps context between options and trailing context with that group, and merges text hints", async () => {
+			const { connection, calls } = createElicitConnection(async () => ({ action: "accept", content: {} }));
+			const ctx = createAcpExtensionUiContext(connection, () => "session-context", FORM_CAPABILITIES);
+			await ctx.formDialog!(`<form>
+  <fieldset><legend>Store</legend>
+    <p>Use a durable store.</p>
+    <label><input type="radio" name="store" value="sqlite"> SQLite</label>
+    <p>Redis needs a service.</p>
+    <label><input type="radio" name="store" value="redis"> Redis</label>
+    <p>Choose a compliant region.</p>
+    <label>Region <input name="region" placeholder="us or eu"></label>
+    <pre>Check residency before submitting.</pre>
+  </fieldset>
+</form>`);
+			const request = calls[0]!;
+			if (!isFormElicitation(request)) throw new Error("expected form-mode elicitation");
+			expect(request.requestedSchema.properties.store).toMatchObject({
+				title: "Use a durable store.",
+				description: "Store\n\nRedis needs a service.",
+			});
+			expect(request.requestedSchema.properties.region).toMatchObject({
+				title: "Region",
+				description: "Choose a compliant region.\n\nCheck residency before submitting.\n\nus or eu",
 			});
 		});
 
