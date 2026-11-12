@@ -125,17 +125,17 @@ import { DEFAULT_STT_MODEL_KEY, STT_MODELS } from "../../stt/models";
 import { refreshAgentDiscovery } from "../../task";
 import { AUTO_THINKING, parseConfiguredThinkingLevel } from "../../thinking/levels";
 import {
+	blockText,
 	choiceValue,
 	defaultFormData,
+	fieldContexts,
 	fieldQuestions,
-	formContext,
 	type HtmlFormData,
 	type HtmlFormValue,
 	isArrayChoice,
-	OTHER_LABEL,
 	textValue,
 } from "../../tools/html-form/data";
-import { type ChoiceField, type HtmlForm, parseHtmlForm, spansText } from "../../tools/html-form/parse";
+import { type ChoiceField, type FormField, type HtmlForm, parseHtmlForm, spansText } from "../../tools/html-form/parse";
 import { ToolError } from "../../tools/tool-errors";
 import { formatPathRelativeToCwd } from "../../tools/path-utils";
 import { isProposeToolCall } from "../../tools/resolve";
@@ -1090,6 +1090,7 @@ async function elicitFormFromAcpClient(
 			{
 				mode: "form",
 				sessionId,
+				...(dialogOptions?.toolCallId ? { toolCallId: dialogOptions.toolCallId } : {}),
 				message,
 				requestedSchema: {
 					type: "object",
@@ -1112,6 +1113,16 @@ async function elicitFormFromAcpClient(
 				);
 			},
 		);
+	// The tool's raw input may already be on screen. Redraw it after the form
+	// request so clients can hide that input while its linked form is pending.
+	if (dialogOptions?.toolCallId) {
+		void connection
+			.sessionUpdate({
+				sessionId,
+				update: { sessionUpdate: "tool_call_update", toolCallId: dialogOptions.toolCallId, status: "in_progress" },
+			})
+			.catch(error => logger.warn("ACP elicitation tool update failed", { sessionId, error }));
+	}
 	const response = await promise;
 	if (!isAcceptedElicitation(response) || !response.content) {
 		return undefined;
@@ -1150,6 +1161,21 @@ async function elicitFromAcpClient(
 	}
 }
 
+/** Keep question context with its controls and only standalone introductory sections in the message. */
+function formElicitationLayout(form: HtmlForm): { message: string; descriptions: Map<FormField, string> } {
+	const intro: string[] = [];
+	for (const section of form.sections) {
+		if (section.blocks.some(block => block.kind === "field" && block.field.name)) break;
+		const title = spansText(section.title).trim();
+		if (title) intro.push(title);
+		for (const block of section.blocks) {
+			const text = blockText(block);
+			if (text?.trim()) intro.push(text);
+		}
+	}
+	return { message: intro.join("\n\n") || "Fill in the form", descriptions: fieldContexts(form, false) };
+}
+
 /**
  * Property holding each "Other" choice field's free-text answer:
  * `<name>__other` ({@link OTHER_SUFFIX}), with more underscores while another
@@ -1176,17 +1202,24 @@ function otherProperties(form: HtmlForm): Map<ChoiceField, string> {
  * "Other" answer ({@link otherProperties}). Preselected options and prefilled
  * text are the properties' defaults.
  */
-function formElicitationSchema(form: HtmlForm): {
+function formElicitationSchema(
+	form: HtmlForm,
+	airClient: boolean,
+): {
+	message: string;
 	properties: Record<string, ElicitationPropertySchema>;
 	required: string[];
 } {
 	const questions = fieldQuestions(form);
+	const { message, descriptions } = formElicitationLayout(form);
 	const others = otherProperties(form);
 	const properties: Record<string, ElicitationPropertySchema> = {};
 	const required: string[] = [];
 	for (const field of form.fields) {
 		if (!field.name) continue;
 		const title = questions.get(field) ?? field.name;
+		const context = descriptions.get(field);
+		const description = context ? { description: context } : {};
 		if (field.required) required.push(field.name);
 		if (field.kind === "choice") {
 			const options = field.options.filter(option => !option.disabled);
@@ -1196,41 +1229,58 @@ function formElicitationSchema(form: HtmlForm): {
 			}));
 			const checked = options.filter(option => option.checked).map(option => option.value);
 			if (isArrayChoice(field)) {
-				properties[field.name] = { type: "array", title, items: { anyOf: entries }, default: checked };
+				properties[field.name] = {
+					type: "array",
+					title,
+					...description,
+					items: { anyOf: entries },
+					default: checked,
+				};
 			} else if (field.multi) {
 				// A lone checkbox renders as one box: its own label says what checking it means.
 				const boxLabel = entries[0]?.title;
+				const details = [
+					boxLabel !== undefined && title !== field.name && title !== boxLabel ? title : undefined,
+					context,
+				]
+					.filter(Boolean)
+					.join("\n\n");
 				properties[field.name] = {
 					type: "boolean",
 					title: boxLabel ?? title,
-					...(boxLabel !== undefined && title !== field.name && title !== boxLabel ? { description: title } : {}),
+					...(details ? { description: details } : {}),
 					default: checked.length > 0,
 				};
 			} else {
 				properties[field.name] = {
 					type: "string",
 					title,
+					...description,
 					oneOf: entries,
 					...(checked[0] !== undefined ? { default: checked[0] } : {}),
 				};
 			}
 			const other = others.get(field);
 			if (other !== undefined) {
+				const customAnswer = { questionId: field.name, isCustomAnswer: true };
+				const meta = { [CUSTOM_ANSWER_META_KEY]: customAnswer };
 				properties[other] = {
 					type: "string",
-					title: `${title} — ${OTHER_LABEL}`,
-					description: field.multi ? "Another answer, added to those checked" : "Your own answer instead",
+					title: OTHER_OPTION,
+					description: field.multi ? OTHER_MULTI_DESCRIPTION : OTHER_SINGLE_DESCRIPTION,
+					_meta: airClient ? withAirMeta(meta, AIR_CUSTOM_ANSWER_KEY, customAnswer) : meta,
 				};
 			}
 			continue;
 		}
-		const description = field.placeholder.trim() ? { description: field.placeholder } : {};
+		const details = [context, field.placeholder.trim()].filter(Boolean).join("\n\n");
+		const textDescription = details ? { description: details } : {};
 		if (field.type === "number" || field.type === "range") {
 			const value = textValue(field, field.value);
 			properties[field.name] = {
 				type: "number",
 				title,
-				...description,
+				...textDescription,
 				...(field.min !== undefined ? { minimum: field.min } : {}),
 				...(field.max !== undefined ? { maximum: field.max } : {}),
 				...(typeof value === "number" ? { default: value } : {}),
@@ -1240,13 +1290,13 @@ function formElicitationSchema(form: HtmlForm): {
 		properties[field.name] = {
 			type: "string",
 			title,
-			...description,
+			...textDescription,
 			...(field.minLength !== undefined ? { minLength: field.minLength } : {}),
 			...(field.maxLength !== undefined ? { maxLength: field.maxLength } : {}),
 			...(field.value ? { default: field.value } : {}),
 		};
 	}
-	return { properties, required };
+	return { message, properties, required };
 }
 
 /** Form data from an accepted elicitation of {@link formElicitationSchema}, keeping only values the form offers. */
@@ -1469,14 +1519,13 @@ export function createAcpExtensionUiContext(
 		formDialog: async (html, dialogOptions) => {
 			if (!supportsForm) return undefined;
 			const form = parseHtmlForm(html);
-			const { properties, required } = formElicitationSchema(form);
+			const { message, properties, required } = formElicitationSchema(form, airClient);
 			let timedOut = false;
 			const content = await elicitFormFromAcpClient(
 				connection,
 				getSessionId(),
 				"formDialog",
-				// Section titles and captions already title the field properties ({@link formContext}).
-				formContext(form).join("\n\n") || "Fill in the form",
+				message,
 				properties,
 				required.length > 0 ? required : undefined,
 				{
