@@ -226,6 +226,8 @@ export function timedOutAskDialogResult(questions: ExtensionAskDialogQuestion[])
  * UI dialog options for extensions.
  */
 export interface ExtensionUIDialogOptions {
+	/** Tool call presenting this dialog, so protocol hosts can associate its form. */
+	toolCallId?: string;
 	signal?: AbortSignal;
 	timeout?: number;
 	/** Invoked when the UI times out while waiting for a selection/input */
