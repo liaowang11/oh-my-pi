@@ -174,6 +174,14 @@ export function ownSessionLine(session: { readonly messaging?: MessagingService 
 	return service ? `This session: ${service.ownAddress() ?? "(unnamed)"} [${service.ownShortId()}]` : undefined;
 }
 
+/** The session's address with its short id, as `/list-agents` shows it; the short id alone when unnamed. */
+export function ownMessagingName(session: { readonly messaging?: MessagingService }): string | undefined {
+	const service = session.messaging;
+	if (!service) return undefined;
+	const address = service.ownAddress();
+	return address === null ? service.ownShortId() : `${address} [${service.ownShortId()}]`;
+}
+
 export async function renderOtherSessionsSection(
 	session: Pick<AgentSession, "settings"> & { readonly messaging?: MessagingService },
 	signal?: AbortSignal,

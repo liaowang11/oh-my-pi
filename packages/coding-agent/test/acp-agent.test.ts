@@ -3451,6 +3451,52 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
+	it("reports the cross-session messaging name with its short id, once per change", async () => {
+		const harness = await createHarness();
+		vi.useFakeTimers();
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		const address: { name: string | null } = { name: "agent-shell-3f" };
+		Object.defineProperty(session, "messaging", {
+			value: { ownAddress: () => address.name, ownShortId: () => "3fa2c9d1" },
+			configurable: true,
+		});
+		await advanceBootstrapGuard();
+		vi.useRealTimers();
+		const nameUpdates = (from = 0) =>
+			harness.updates
+				.slice(from)
+				.filter(
+					update =>
+						update.sessionId === created.sessionId && update.update.sessionUpdate === "session_info_update",
+				)
+				.map(update => update.update._meta?.claudeCode)
+				.filter(meta => meta !== undefined);
+		for (let attempt = 0; attempt < 100 && nameUpdates().length === 0; attempt++) await Bun.sleep(5);
+
+		// As claude-agent-acp sends it, so a client reads both the same way.
+		expect(nameUpdates()).toEqual([{ messagingName: { address: "agent-shell-3f [3fa2c9d1]" } }]);
+
+		// An unchanged name is not re-sent at the turn's end.
+		const turn = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "one" }] });
+		expect(nameUpdates(turn)).toEqual([]);
+
+		// A changed name reaches the client even when the title is unchanged.
+		address.name = "reviewer";
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "two" }] });
+		expect(nameUpdates(turn)).toEqual([{ messagingName: { address: "reviewer [3fa2c9d1]" } }]);
+
+		// An unnamed session answers to its short id alone.
+		address.name = null;
+		const unnamed = harness.updates.length;
+		await harness.agent.prompt({ sessionId: created.sessionId, prompt: [{ type: "text", text: "three" }] });
+		expect(nameUpdates(unnamed)).toEqual([{ messagingName: { address: "3fa2c9d1" } }]);
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
 	it("publishes the predicted next prompt as _meta.promptSuggestions and clears it on the next prompt", async () => {
 		const harness = await createHarness();
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
