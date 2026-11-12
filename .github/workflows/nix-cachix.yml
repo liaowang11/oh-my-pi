@@ -17,14 +17,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - runner: macos-15
+          - runner: macos-26
             system: aarch64-darwin
-          - runner: ubuntu-24.04
-            system: x86_64-linux
-          - runner: ubuntu-24.04-arm
-            system: aarch64-linux
     steps:
       - uses: actions/checkout@93cb6efe18208431cddfb8368fd83d5badbf9bfd
+        with:
+          ref: 984f6f47870532e735d2d059718b529c42555dfc
       - uses: cachix/install-nix-action@96951a368ba55167b55f1c916f7d416bac6505fe
         with:
           github_access_token: ${{ secrets.GITHUB_TOKEN }}
