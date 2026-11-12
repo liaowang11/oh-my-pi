@@ -93,7 +93,7 @@ import { autosaveApprovedPlan, planSaveFileName } from "../../plan-mode/plan-aut
 import type { AgentSession, AgentSessionEvent } from "../../session/agent-session";
 import type { MountedMCPToolRouteSource } from "../../session/session-tools";
 import { BlobStore, resolveImageDataSync } from "../../session/blob-store";
-import { bindSessionMessaging } from "../../session/messaging-host";
+import { bindSessionMessaging, ownMessagingName } from "../../session/messaging-host";
 import {
 	bashExecutionToText,
 	type CustomMessage,
@@ -640,6 +640,8 @@ type ManagedSessionRecord = {
 	// The title `#pushSessionInfoUpdate` last sent, so an unchanged one is not
 	// re-sent at every turn end or by the rename that already pushed it.
 	sentTitle: string | undefined;
+	// The cross-session messaging name `#pushSessionInfoUpdate` last sent.
+	sentMessagingName: string | undefined;
 	// The AIR goal snapshot (JSON) `#pushGoalUpdate` last sent, so an unchanged
 	// goal is not re-sent; `undefined` until one was sent.
 	sentGoal: string | undefined;
@@ -3059,6 +3061,7 @@ export class AcpAgent implements Agent {
 			asyncTaskRelay: undefined,
 			titleUnsubscribe: undefined,
 			sentTitle: undefined,
+			sentMessagingName: undefined,
 			sentGoal: undefined,
 			sentPromptSuggestions: undefined,
 			promptSuggestionAbort: undefined,
@@ -5237,14 +5240,27 @@ export class AcpAgent implements Agent {
 		}
 	}
 
-	/** Sends the session's title, unless it has none or the client already has it. */
+	/**
+	 * Sends the session's title and cross-session messaging name, each only when
+	 * the client does not have it yet. The name rides in claude-agent-acp's
+	 * `_meta.claudeCode.messagingName` shape, so a client reads both agents' the
+	 * same way.
+	 */
 	async #pushSessionInfoUpdate(record: ManagedSessionRecord, updatedAt = new Date().toISOString()): Promise<void> {
 		const title = record.session.sessionName;
-		if (!title || title === record.sentTitle) return;
-		record.sentTitle = title;
+		const sendTitle = !!title && title !== record.sentTitle;
+		const messagingName = ownMessagingName(record.session);
+		const sendName = messagingName !== undefined && messagingName !== record.sentMessagingName;
+		if (!sendTitle && !sendName) return;
+		if (sendTitle) record.sentTitle = title;
+		if (sendName) record.sentMessagingName = messagingName;
 		await this.#connection.sessionUpdate({
 			sessionId: record.protocolSessionId,
-			update: { sessionUpdate: "session_info_update", title, updatedAt },
+			update: {
+				sessionUpdate: "session_info_update",
+				...(sendTitle ? { title, updatedAt } : {}),
+				...(sendName ? { _meta: { claudeCode: { messagingName: { address: messagingName } } } } : {}),
+			},
 		});
 	}
 
