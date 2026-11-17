@@ -618,6 +618,19 @@ export const cfgAcpRenderSvg = register({
 	},
 });
 
+export const cfgAcpRenderEmbeds = register({
+	id: "acp.renderEmbeds",
+	type: "boolean",
+	default: false,
+	ui: {
+		tab: "appearance",
+		group: "Display",
+		label: "ACP: Invite Embedded Images",
+		description:
+			"Invite the agent to show pictures as markdown images in ACP sessions (no web pages). The client loads them, remote addresses included. Turn on only when your ACP client renders them",
+	},
+});
+
 export const cfgTuiAutoGraph = register({
 	id: "tui.autoGraph",
 	type: "enum",

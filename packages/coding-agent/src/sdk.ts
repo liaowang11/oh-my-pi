@@ -469,6 +469,7 @@ import {
 	cfgTuiReactions,
 	cfgTuiAutoGraph,
 	cfgTuiRenderMermaid,
+	cfgAcpRenderEmbeds,
 	cfgTuiRenderEmbeds,
 	cfgTuiRenderSvg,
 } from "./modes/settings";
@@ -1073,8 +1074,9 @@ export interface CreateAgentSessionOptions {
 	 */
 	tuiTranscript?: boolean;
 	/**
-	 * Replies render in an ACP client. The `acp.renderMermaid` / `acp.renderSvg` settings
-	 * then decide which figures the system prompt invites; table charts stay TUI-only.
+	 * Replies render in an ACP client. The `acp.renderMermaid` / `acp.renderSvg` /
+	 * `acp.renderEmbeds` settings then decide which figures the system prompt invites
+	 * (`acp.renderEmbeds`: markdown images only); table charts and `<iframe>` stay TUI-only.
 	 * Ignored for subagents and when `tuiTranscript` is set. Default: false.
 	 */
 	acpTranscript?: boolean;
@@ -4723,6 +4725,7 @@ async function createAgentSessionScoped(options: CreateAgentSessionOptions): Pro
 					: acpTranscript && cfgAcpRenderMermaid.get(settings),
 				renderSvg: tuiTranscript ? cfgTuiRenderSvg.get(settings) : acpTranscript && cfgAcpRenderSvg.get(settings),
 				renderEmbeds: tuiTranscript && cfgTuiRenderEmbeds.get(settings),
+				renderImages: !tuiTranscript && acpTranscript && cfgAcpRenderEmbeds.get(settings),
 				autoGraph: tuiTranscript && cfgTuiAutoGraph.get(settings) !== "off",
 				reactions: agentKind === "main" && options.hasUI === true && cfgTuiReactions.get(settings),
 				encourageEdits: cfgEncourageEdits.get(settings),
