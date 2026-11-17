@@ -82,4 +82,26 @@ describe("visuals guidance in the system prompt", () => {
 			expect(prompt).not.toContain("```svg");
 		}
 	});
+
+	it("invites markdown images, never <iframe>, in an ACP session that turned them on", async () => {
+		const acp = await promptFor({ hasUI: true, acpTranscript: true }, { "acp.renderEmbeds": true });
+		expect(acp).toContain("`![alt](src)`");
+		expect(acp).not.toContain("<img");
+		expect(acp).not.toContain("<iframe");
+
+		// Off by default, ignored outside ACP, and never reaches ACP subagents.
+		const acpDefault = await promptFor({ hasUI: true, acpTranscript: true });
+		const rpc = await promptFor({ hasUI: true }, { "acp.renderEmbeds": true });
+		const subagent = await promptFor(
+			{ hasUI: true, acpTranscript: true, taskDepth: 1 },
+			{ "acp.renderEmbeds": true },
+		);
+		for (const prompt of [acpDefault, rpc, subagent]) {
+			expect(prompt).not.toContain("`![alt](src)`");
+		}
+
+		// The TUI keeps its own invitation, iframes included.
+		const tui = await promptFor({ hasUI: true, tuiTranscript: true }, { "acp.renderEmbeds": true });
+		expect(tui).toContain("<iframe");
+	});
 });

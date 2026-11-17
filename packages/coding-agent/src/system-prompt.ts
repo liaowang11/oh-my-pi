@@ -53,6 +53,7 @@ import { cfgEvalAutoBackgroundEnabled } from "./eval/settings";
 import { cfgTtsrBuiltinRules, cfgTtsrDisabledRules, cfgTtsrEnabled } from "./export/ttsr-settings";
 import {
 	cfgAcpRenderMermaid,
+	cfgAcpRenderEmbeds,
 	cfgAcpRenderSvg,
 	cfgTuiAutoGraph,
 	cfgTuiReactions,
@@ -106,6 +107,7 @@ export const cfgSystemPromptInputs = combine({
 	renderEmbeds: cfgTuiRenderEmbeds,
 	acpRenderMermaid: cfgAcpRenderMermaid,
 	acpRenderSvg: cfgAcpRenderSvg,
+	acpRenderEmbeds: cfgAcpRenderEmbeds,
 	autoGraph: cfgTuiAutoGraph,
 	reactions: cfgTuiReactions,
 	encourageEdits: cfgEncourageEdits,
@@ -639,6 +641,8 @@ export interface BuildSystemPromptOptions {
 	renderSvg?: boolean;
 	/** Whether the reader's UI draws `<img>` pictures and `<iframe>` page screenshots, so the prompt offers them. Default: false */
 	renderEmbeds?: boolean;
+	/** Whether the reader's UI (an ACP client) draws markdown images `![alt](src)`, so the prompt offers those but never `<iframe>`. Default: false */
+	renderImages?: boolean;
 	/** Whether the reader's UI charts numeric Markdown tables, so the prompt routes data to tables and forbids duplicate charts. Default: false */
 	autoGraph?: boolean;
 	/** Whether the TUI lifts an opening emoji into a reaction badge on the user's message. Default: false */
@@ -779,6 +783,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		renderMermaid = true,
 		renderSvg = false,
 		renderEmbeds = false,
+		renderImages = false,
 		autoGraph = false,
 		reactions = false,
 		encourageEdits = true,
@@ -1166,6 +1171,7 @@ export async function buildSystemPrompt(options: BuildSystemPromptOptions = {}):
 		renderMermaid,
 		renderSvg,
 		renderEmbeds,
+		renderImages,
 		autoGraph,
 		reactions,
 		encourageEdits,
