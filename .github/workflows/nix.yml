@@ -1,34 +1,8 @@
 name: OMP Nix
 
+# On-demand runs only; the fork uses its Cachix workflow for package builds.
 on:
-  push:
-    branches: [main]
-    paths:
-      - ".github/workflows/nix.yml"
-      - ".cargo/**"
-      - "flake.nix"
-      - "flake.lock"
-      - "nix/**"
-      - "bun.lock"
-      - "package.json"
-      - "patches/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
-      - "rust-toolchain.toml"
-      - "packages/**"
-      - "crates/**"
-      - "scripts/**"
-      - "docs/**"
-  # PRs only evaluate when nix inputs change; main pushes cover every other
-  # path, and fork PRs would otherwise queue an approval each time.
-  pull_request:
-    branches: [main]
-    paths:
-      - ".github/workflows/nix.yml"
-      - "flake.nix"
-      - "flake.lock"
-      - "nix/**"
-      - "bun.lock"
+  workflow_dispatch:
 
 concurrency:
   group: "${{ github.workflow }}-${{ github.ref }}"
