@@ -2071,16 +2071,20 @@ describe("ACP agent", () => {
 	});
 
 	describe("approved plan reporting", () => {
-		const PROPOSE_ARGS = { path: "xd://propose", content: "words-counter" };
+		const PROPOSE_ARGS = { title: "words-counter" };
 		const PLAN_TEXT = "# Words Counter\n\nFile contents.\n";
 		const airCaps = (capabilities: string[]): ClientCapabilities => ({
 			_meta: { jetbrains: { air: { version: 1, capabilities } } },
 		});
 
-		/** Drive one `xd://propose` tool call through the lifetime subscription; returns what the client got. */
+		/** Drive one `propose` tool call through the lifetime subscription; returns what the client got. */
 		async function proposePlan(
 			clientCapabilities: ClientCapabilities | undefined,
 			decision: "approve" | "refine" = "approve",
+			call: { toolName: string; args: Record<string, unknown>; exitCode?: number } = {
+				toolName: "propose",
+				args: PROPOSE_ARGS,
+			},
 		) {
 			const harness = await createHarness(
 				decision === "refine"
@@ -2109,9 +2113,32 @@ describe("ACP agent", () => {
 			};
 
 			const from = harness.updates.length;
-			emit({ type: "tool_execution_start", toolCallId: "propose-1", toolName: "write", args: PROPOSE_ARGS });
-			const result = await session.planProposalHandler!("words-counter");
-			emit({ type: "tool_execution_end", toolCallId: "propose-1", toolName: "write", result, isError: false });
+			emit({ type: "tool_execution_start", toolCallId: "propose-1", toolName: call.toolName, args: call.args });
+			const proposed = await session.planProposalHandler!("words-counter");
+			// A `bash` call records the command's run on its own result; the call fails when the shell exits nonzero.
+			const result =
+				call.toolName === "bash"
+					? {
+							content: [],
+							details: {
+								toolCommands: [
+									{
+										tool: "propose",
+										mode: "execute",
+										exitCode: call.exitCode ?? 0,
+										inner: (proposed as { details?: unknown }).details,
+									},
+								],
+							},
+						}
+					: proposed;
+			emit({
+				type: "tool_execution_end",
+				toolCallId: "propose-1",
+				toolName: call.toolName,
+				result,
+				isError: call.toolName === "bash",
+			});
 			await Bun.sleep(10);
 
 			const sent = harness.updates.slice(from).filter(update => update.sessionId === created.sessionId);
@@ -2141,6 +2168,19 @@ describe("ACP agent", () => {
 			expect(withoutCap.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
 		});
 
+		it("reports a plan approved by a `propose` command run from bash by that command's exit, not the call's", async () => {
+			const bashCall = { toolName: "bash", args: { command: "propose words-counter; false" } };
+			const approved = await proposePlan({ plan: {} }, "approve", bashCall);
+			expect(approved.updates.map(update => update.sessionUpdate)).toEqual([
+				"tool_call",
+				"tool_call_update",
+				"plan_update",
+			]);
+
+			const failed = await proposePlan({ plan: {} }, "approve", { ...bashCall, exitCode: 1 });
+			expect(failed.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+		});
+
 		it("sends no plan_update for a plan sent back for refinement", async () => {
 			const refined = await proposePlan({ plan: {} }, "refine");
 			expect(refined.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
@@ -2162,7 +2202,7 @@ describe("ACP agent", () => {
 				{
 					sessionUpdate: "tool_call",
 					toolCallId: "propose-1:plan-file-clear",
-					name: "write",
+					name: "propose",
 					title: "Exited Plan Mode",
 					kind: "switch_mode",
 					status: "completed",
@@ -2191,7 +2231,7 @@ describe("ACP agent", () => {
 				listener({
 					type: "tool_execution_start",
 					toolCallId: "propose-1",
-					toolName: "write",
+					toolName: "propose",
 					args: PROPOSE_ARGS,
 				} as AgentSessionEvent);
 			}

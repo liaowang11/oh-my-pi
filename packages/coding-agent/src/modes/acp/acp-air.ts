@@ -13,7 +13,7 @@ import type { ClientCapabilities } from "@oh-my-pi/pi-utils/acp";
 /** Background tasks surfaced as `async_task_*` session updates. */
 export const AIR_ASYNC_TASKS_CAPABILITY = "asyncTasks";
 /**
- * The plan of an `xd://propose` call is a file: `rawInput.planFilePath` names
+ * The plan of a `propose` call is a file: `rawInput.planFilePath` names
  * it, and the client reads the plan from it.
  */
 export const AIR_PLAN_FILE_CAPABILITY = "planFile";

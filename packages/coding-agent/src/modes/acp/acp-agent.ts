@@ -138,7 +138,7 @@ import {
 import { type ChoiceField, type FormField, type HtmlForm, parseHtmlForm, spansText } from "../../tools/html-form/parse";
 import { ToolError } from "../../tools/tool-errors";
 import { formatPathRelativeToCwd } from "../../tools/path-utils";
-import { isProposeToolCall } from "../../tools/resolve";
+import { isProposeToolCall, proposeDispatchDetails } from "../../tools/resolve";
 import { existingPlanFileSync, resolvePlanFilePath } from "../../plan-mode/plan-files";
 import type { Goal } from "../../tools/details/goal";
 import {
@@ -671,7 +671,8 @@ type ManagedSessionRecord = {
 	// Present while vibe mode is active: the owner scope and pre-vibe toolset
 	// `exitVibeMode` needs to kill workers and restore tools.
 	vibeMode: VibeModeHandle | undefined;
-	// The `xd://propose` call in flight, and for an AIR `planFile` client the
+	// The `propose` call in flight (direct, or a `bash` command that runs it),
+	// and for an AIR `planFile` client the
 	// plan file its input names. Read from the start event: the proposal
 	// handler can run before that event is forwarded.
 	planProposal: { toolCallId: string; planFilePath: string | undefined } | undefined;
@@ -3652,7 +3653,13 @@ export class AcpAgent implements Agent {
 			await delivery;
 		}
 		if (event.type === "tool_execution_end" && record.planProposal?.toolCallId === event.toolCallId) {
-			const delivery = this.#reportApprovedPlan(record, event.toolCallId, event.toolName, event.isError === true);
+			const delivery = this.#reportApprovedPlan(
+				record,
+				event.toolCallId,
+				event.toolName,
+				// A `bash` call can fail after its `propose` command succeeded, or succeed after it failed.
+				proposeDispatchDetails(event.toolName, event.result) === undefined,
+			);
 			onDelivery?.(delivery);
 			await delivery;
 		}
@@ -3685,9 +3692,11 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Note an `xd://propose` call as it starts. For an AIR `planFile` client,
-	 * the plan file is the one its title names, else the plan-mode state's,
-	 * when it exists; the approval may later settle on another file.
+	 * Note a `propose` call as it starts. For an AIR `planFile` client, the
+	 * plan file is the one a direct call's title names, else the plan-mode
+	 * state's, when it exists; the approval may later settle on another file.
+	 * A `bash` call carries the title inside its command, so it starts with the
+	 * plan-mode state's file.
 	 */
 	#trackPlanProposal(
 		record: ManagedSessionRecord,
@@ -3698,7 +3707,7 @@ export class AcpAgent implements Agent {
 		let planFilePath: string | undefined;
 		if (clientSupportsPlanFile(this.#clientCapabilities)) {
 			const { session } = record;
-			for (const url of [proposedPlanFileUrl(args?.content), session.getPlanModeState()?.planFilePath]) {
+			for (const url of [proposedPlanFileUrl(args?.title), session.getPlanModeState()?.planFilePath]) {
 				planFilePath = url ? this.#existingAcpPlanFile(session, url) : undefined;
 				if (planFilePath) break;
 			}
@@ -3735,13 +3744,13 @@ export class AcpAgent implements Agent {
 		record: ManagedSessionRecord,
 		toolCallId: string,
 		toolName: string,
-		isError: boolean,
+		failed: boolean,
 	): Promise<void> {
 		const approved = record.approvedPlan;
 		const planFilePath = approved?.planFilePath ?? record.planProposal?.planFilePath;
 		record.planProposal = undefined;
 		record.approvedPlan = undefined;
-		if (!approved || isError) return;
+		if (!approved || failed) return;
 		const sessionId = record.protocolSessionId;
 		if (planFilePath) {
 			await this.#connection.sessionUpdate({
