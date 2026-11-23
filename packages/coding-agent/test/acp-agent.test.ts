@@ -929,6 +929,21 @@ async function flushMicrotasks(): Promise<void> {
 	await Promise.resolve();
 }
 
+/** Answers plan prompts with `optionIds` in turn, then cancels; keeps every request. */
+function answerPlanPrompts(...optionIds: string[]) {
+	const requests: RequestPermissionRequest[] = [];
+	const signals: Array<AbortSignal | undefined> = [];
+	const handler = async (request: RequestPermissionRequest, signal?: AbortSignal) => {
+		requests.push(request);
+		signals.push(signal);
+		const optionId = optionIds.shift();
+		return (
+			optionId ? { outcome: { outcome: "selected", optionId } } : { outcome: { outcome: "cancelled" } }
+		) as RequestPermissionResponse;
+	};
+	return { requests, signals, handler };
+}
+
 async function createStoredSession(harness: AgentHarness): Promise<FakeAgentSession> {
 	const session = new FakeAgentSession(harness.cwdA);
 	harness.sessions.push(session);
@@ -1765,7 +1780,7 @@ describe("ACP agent", () => {
 	});
 
 	it("plan-proposal handler approves the agent-named plan and exits plan mode on submit", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ requestPermissionHandler: answerPlanPrompts("plan-approve").handler });
 		cfgPlanEnabled.set(Settings.instance, true);
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -1825,7 +1840,7 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 	it("plan-proposal handler autosaves the approved plan without leaking the path", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ requestPermissionHandler: answerPlanPrompts("plan-approve").handler });
 		cfgPlanEnabled.set(Settings.instance, true);
 		cfgPlanAutosave.set(Settings.instance, true);
 
@@ -1860,7 +1875,7 @@ describe("ACP agent", () => {
 	});
 
 	it("plan-proposal handler approves and notes autosave failure without the path", async () => {
-		const harness = await createHarness();
+		const harness = await createHarness({ requestPermissionHandler: answerPlanPrompts("plan-approve").handler });
 		cfgPlanEnabled.set(Settings.instance, true);
 		const blocker = path.join(harness.cwdA, "blocker");
 		await Bun.write(blocker, "x");
@@ -1895,15 +1910,15 @@ describe("ACP agent", () => {
 		await Bun.sleep(0);
 	});
 
-	it("plan-proposal handler treats dismissed elicitation as refine, never approves", async () => {
-		// Regression for the P1 review finding on #1870: when a form-capable
-		// ACP client dismissed/cancelled the elicitation, the handler was
-		// returning the dismissal as approval — silently granting write
-		// access without explicit consent. Dismissal MUST fall through to
-		// refine semantics: plan mode stays active, the plan file stays put,
-		// and no mode/config updates are emitted.
+	it("plan-proposal handler treats a cancelled plan prompt as refine, never approves", async () => {
+		// Dismissal MUST fall through to refine semantics: plan mode stays
+		// active, the plan file stays put, and no mode/config updates are
+		// emitted. The prompt is a permission request even for a form client.
+		const elicitationHandler = vi.fn(async () => ({ action: "accept", content: { value: "Approve and execute" } }));
 		const harness = await createHarness({
-			elicitationHandler: async () => ({ action: "cancel" }),
+			clientCapabilities: { elicitation: { form: {} } },
+			elicitationHandler: elicitationHandler as never,
+			requestPermissionHandler: answerPlanPrompts().handler,
 		});
 		cfgPlanEnabled.set(Settings.instance, true);
 
@@ -1943,20 +1958,42 @@ describe("ACP agent", () => {
 					notification.update.currentModeId === "default",
 			),
 		).toBe(false);
+		expect(elicitationHandler).not.toHaveBeenCalled();
+
+		harness.abortController.abort();
+		await Bun.sleep(0);
+	});
+
+	it("plan-proposal handler keeps plan mode when the client cannot be asked", async () => {
+		// No permission support and no form support: nothing approves the plan.
+		const harness = await createHarness();
+		cfgPlanEnabled.set(Settings.instance, true);
+
+		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
+		const session = harness.findSession(created.sessionId)!;
+		await harness.agent.setSessionMode({ sessionId: created.sessionId, modeId: "plan" });
+		const localOptions = {
+			getArtifactsDir: () => session.sessionManager.getArtifactsDir(),
+			getSessionId: () => session.sessionManager.getSessionId(),
+		};
+		cleanupRoots.push(resolveLocalUrlToPath("local://", localOptions));
+		await Bun.write(resolveLocalUrlToPath("local://PLAN.md", localOptions), "# Words Counter\n\nFile contents.");
+
+		const result = (await session.planProposalHandler!("words-counter")) as {
+			content: Array<{ type: string; text: string }>;
+		};
+
+		expect(result.content[0]?.text).toMatch(/refinement requested/i);
+		expect(session.planModeState?.enabled).toBe(true);
+		expect(session.planReferencePath).toBeUndefined();
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
 	});
 
 	it("plan-proposal Save writes the plan into the working directory and asks again", async () => {
-		const requests: CreateElicitationRequest[] = [];
-		const answers = ["Save plan", "Approve and execute"];
-		const harness = await createHarness({
-			elicitationHandler: async request => {
-				requests.push(request);
-				return { action: "accept", content: { value: answers.shift()! } };
-			},
-		});
+		const { requests, handler: requestPermissionHandler } = answerPlanPrompts("plan-save", "plan-save");
+		const harness = await createHarness({ requestPermissionHandler });
 		cfgPlanEnabled.set(Settings.instance, true);
 
 		const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -1974,13 +2011,16 @@ describe("ACP agent", () => {
 		const saved = path.join(harness.cwdA, "WORDS_COUNTER_PLAN.md");
 		expect(await Bun.file(saved).text()).toBe("# Words Counter\n\nFile contents.");
 		expect(requests).toHaveLength(2);
-		const options = (request: CreateElicitationRequest) =>
-			(request as { requestedSchema?: { properties?: { value?: { enum?: string[] } } } }).requestedSchema?.properties
-				?.value?.enum;
-		expect(options(requests[0]!)).toEqual(["Approve and execute", "Save plan", "Refine plan"]);
-		expect((requests[1] as { message: string }).message).toContain(`Saved plan to ${saved}`);
-		// The second answer approved: plan mode is over.
-		expect(session.planModeState).toBeUndefined();
+		const options = (request: RequestPermissionRequest) => request.options.map(option => option.optionId);
+		expect(options(requests[0]!)).toEqual(["plan-approve", "plan-save", "plan-keep-planning"]);
+		// The second prompt offers no Save, so repeating the same answer cannot loop.
+		expect(options(requests[1]!)).toEqual(["plan-approve", "plan-keep-planning"]);
+		expect(requests[1]!.toolCall.content).toContainEqual({
+			type: "content",
+			content: { type: "text", text: `Saved plan to ${saved}.` },
+		});
+		// The repeated Save on the second prompt is not an option there: plan mode stays.
+		expect(session.planModeState?.enabled).toBe(true);
 
 		harness.abortController.abort();
 		await Bun.sleep(0);
@@ -2026,9 +2066,9 @@ describe("ACP agent", () => {
 	it("plan-proposal handler settles as refine and withdraws the dialog when the turn is cancelled", async () => {
 		const elicitationSignals: Array<AbortSignal | undefined> = [];
 		const elicitationOpened = Promise.withResolvers<void>();
-		const { promise: never } = Promise.withResolvers<CreateElicitationResponse>();
+		const { promise: never } = Promise.withResolvers<RequestPermissionResponse>();
 		const harness = await createHarness({
-			elicitationHandler: (_request, signal) => {
+			requestPermissionHandler: (_request, signal) => {
 				elicitationSignals.push(signal);
 				elicitationOpened.resolve();
 				return never;
@@ -2086,14 +2126,17 @@ describe("ACP agent", () => {
 				args: PROPOSE_ARGS,
 			},
 		) {
-			const harness = await createHarness(
-				decision === "refine"
-					? {
-							clientCapabilities: { ...clientCapabilities, elicitation: { form: {} } },
-							elicitationHandler: async () => ({ action: "cancel" }),
-						}
-					: { clientCapabilities },
-			);
+			let from = 0;
+			const prompts = answerPlanPrompts(decision === "approve" ? "plan-approve" : "plan-keep-planning");
+			// How many session updates the client had when each plan prompt arrived.
+			const updatesAtPrompt: number[] = [];
+			const harness = await createHarness({
+				clientCapabilities,
+				requestPermissionHandler: (request, signal) => {
+					updatesAtPrompt.push(harness.updates.length - from);
+					return prompts.handler(request, signal);
+				},
+			});
 			cfgPlanEnabled.set(Settings.instance, true);
 			vi.useFakeTimers();
 			const created = await harness.agent.newSession({ cwd: harness.cwdA, mcpServers: [] });
@@ -2112,7 +2155,7 @@ describe("ACP agent", () => {
 				for (const listener of session.listeners()) listener(event as AgentSessionEvent);
 			};
 
-			const from = harness.updates.length;
+			from = harness.updates.length;
 			emit({ type: "tool_execution_start", toolCallId: "propose-1", toolName: call.toolName, args: call.args });
 			const proposed = await session.planProposalHandler!("words-counter");
 			// A `bash` call records the command's run on its own result; the call fails when the shell exits nonzero.
@@ -2149,56 +2192,143 @@ describe("ACP agent", () => {
 			const updates = sent
 				.map(update => update.update)
 				.filter(update => ["tool_call", "tool_call_update", "plan_update"].includes(update.sessionUpdate));
-			return { updates, planPath };
+			return { updates, planPath, prompts: prompts.requests, updatesAtPrompt };
 		}
+
+		const PLAN_CONTENT = [{ type: "content", content: { type: "text", text: PLAN_TEXT } }];
+
+		it("shows the proposal as an Approve Plan card with the plan, and asks Ready to code?", async () => {
+			const { updates, prompts } = await proposePlan(undefined);
+			expect(updates.map(update => update.sessionUpdate)).toEqual([
+				"tool_call",
+				"tool_call_update",
+				"tool_call_update",
+			]);
+			// The card carries the plan before the prompt goes out, as Claude's ExitPlanMode card does.
+			expect(updates[1]).toMatchObject({
+				toolCallId: "propose-1",
+				title: "Approve Plan",
+				kind: "switch_mode",
+				rawInput: { ...PROPOSE_ARGS, plan: PLAN_TEXT },
+				content: PLAN_CONTENT,
+			});
+			expect(prompts).toHaveLength(1);
+			expect(prompts[0]!.toolCall).toMatchObject({
+				toolCallId: "propose-1",
+				title: "Approve Plan",
+				kind: "switch_mode",
+				rawInput: { ...PROPOSE_ARGS, plan: PLAN_TEXT },
+				content: PLAN_CONTENT,
+			});
+			expect(prompts[0]!.options).toEqual([
+				{ optionId: "plan-approve", name: "Yes, start implementing", kind: "allow_once" },
+				{ optionId: "plan-save", name: "Save the plan to the working directory", kind: "allow_always" },
+				{ optionId: "plan-keep-planning", name: "No, keep planning", kind: "reject_once" },
+			]);
+			expect(prompts[0]!._meta).toBeUndefined();
+			// The result keeps the plan on the card and retitles it.
+			expect(updates[2]).toMatchObject({
+				toolCallId: "propose-1",
+				title: "Exited Plan Mode",
+				kind: "switch_mode",
+				content: PLAN_CONTENT,
+			});
+
+			const air = await proposePlan(airCaps([]));
+			expect(air.prompts[0]!._meta).toEqual({
+				jetbrains: { air: { version: 1, permission: { version: 1, title: "Ready to code?" } } },
+			});
+		});
+
+		it("keeps the Approve Plan title on a plan sent back for refinement", async () => {
+			const { updates } = await proposePlan(undefined, "refine");
+			expect(updates.at(-1)).toMatchObject({ toolCallId: "propose-1", title: "Approve Plan" });
+		});
+
+		it("shows a plan proposed from bash on its own card, sent before the prompt", async () => {
+			const bashCall = { toolName: "bash", args: { command: "propose words-counter" } };
+			const { updates, prompts, updatesAtPrompt } = await proposePlan(undefined, "approve", bashCall);
+			const card = updates.findIndex(
+				update => update.sessionUpdate === "tool_call" && update.toolCallId === "propose-1:plan",
+			);
+			expect(card).toBeGreaterThan(-1);
+			expect(updates[card]).toMatchObject({
+				title: "Approve Plan",
+				kind: "switch_mode",
+				status: "pending",
+				rawInput: { plan: PLAN_TEXT },
+				content: PLAN_CONTENT,
+			});
+			expect(updatesAtPrompt[0]).toBeGreaterThan(card);
+			expect(prompts[0]!.toolCall.toolCallId).toBe("propose-1:plan");
+			expect(
+				updates.find(
+					update => update.sessionUpdate === "tool_call_update" && update.toolCallId === "propose-1:plan",
+				),
+			).toMatchObject({
+				status: "completed",
+				title: "Exited Plan Mode",
+			});
+			// The bash call keeps its own card.
+			for (const update of updates.filter(update => "toolCallId" in update && update.toolCallId === "propose-1")) {
+				expect((update as { title?: string }).title).not.toBe("Approve Plan");
+			}
+		});
 
 		it("sends the approved plan as a markdown plan_update after the propose result, only to plan clients", async () => {
 			const withCap = await proposePlan({ plan: {} });
 			expect(withCap.updates.map(update => update.sessionUpdate)).toEqual([
 				"tool_call",
 				"tool_call_update",
+				"tool_call_update",
 				"plan_update",
 			]);
-			expect(withCap.updates[2]).toEqual({
+			expect(withCap.updates[3]).toEqual({
 				sessionUpdate: "plan_update",
 				plan: { type: "markdown", planId: "plan-mode", content: PLAN_TEXT.trim() },
 			});
 
 			const withoutCap = await proposePlan(undefined);
-			expect(withoutCap.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+			expect(withoutCap.updates.map(update => update.sessionUpdate)).toEqual([
+				"tool_call",
+				"tool_call_update",
+				"tool_call_update",
+			]);
 		});
 
 		it("reports a plan approved by a `propose` command run from bash by that command's exit, not the call's", async () => {
 			const bashCall = { toolName: "bash", args: { command: "propose words-counter; false" } };
 			const approved = await proposePlan({ plan: {} }, "approve", bashCall);
-			expect(approved.updates.map(update => update.sessionUpdate)).toEqual([
-				"tool_call",
-				"tool_call_update",
-				"plan_update",
-			]);
+			expect(
+				approved.updates.map(update => update.sessionUpdate).filter(kind => kind === "plan_update"),
+			).toHaveLength(1);
+			expect(approved.updates.at(-1)?.sessionUpdate).toBe("plan_update");
 
 			const failed = await proposePlan({ plan: {} }, "approve", { ...bashCall, exitCode: 1 });
-			expect(failed.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+			expect(failed.updates.some(update => update.sessionUpdate === "plan_update")).toBe(false);
 		});
 
 		it("sends no plan_update for a plan sent back for refinement", async () => {
 			const refined = await proposePlan({ plan: {} }, "refine");
-			expect(refined.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+			expect(refined.updates.some(update => update.sessionUpdate === "plan_update")).toBe(false);
 		});
 
 		it("names the plan file in rawInput for an AIR planFile client and clears it on approval", async () => {
-			const { updates, planPath } = await proposePlan(airCaps(["planFile"]));
+			const { updates, planPath, prompts } = await proposePlan(airCaps(["planFile"]));
 			expect(updates[0]).toMatchObject({
 				sessionUpdate: "tool_call",
 				toolCallId: "propose-1",
 				rawInput: { ...PROPOSE_ARGS, planFilePath: planPath },
 			});
-			expect(updates[1]).toMatchObject({
-				sessionUpdate: "tool_call_update",
-				toolCallId: "propose-1",
-				rawInput: { ...PROPOSE_ARGS, planFilePath: planPath },
-			});
-			expect(updates.slice(2)).toEqual([
+			// A planFile client reads the plan from the file: no plan text, as claude-agent-acp sends it.
+			for (const update of [updates[1], updates[2], prompts[0]!.toolCall]) {
+				expect(update).toMatchObject({
+					toolCallId: "propose-1",
+					rawInput: { ...PROPOSE_ARGS, planFilePath: planPath },
+				});
+				expect((update as { rawInput: Record<string, unknown> }).rawInput.plan).toBeUndefined();
+			}
+			expect(updates.slice(3)).toEqual([
 				{
 					sessionUpdate: "tool_call",
 					toolCallId: "propose-1:plan-file-clear",
@@ -2212,9 +2342,13 @@ describe("ACP agent", () => {
 			]);
 
 			const other = await proposePlan(airCaps([]));
-			expect(other.updates.map(update => update.sessionUpdate)).toEqual(["tool_call", "tool_call_update"]);
+			expect(other.updates.map(update => update.sessionUpdate)).toEqual([
+				"tool_call",
+				"tool_call_update",
+				"tool_call_update",
+			]);
 			expect(other.updates[0]).toMatchObject({ rawInput: PROPOSE_ARGS });
-			expect((other.updates[1] as { rawInput?: unknown }).rawInput).toBeUndefined();
+			expect((other.updates[1] as { rawInput?: unknown }).rawInput).toEqual({ ...PROPOSE_ARGS, plan: PLAN_TEXT });
 		});
 
 		it("leaves planFilePath out while the proposed plan file does not exist", async () => {

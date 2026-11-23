@@ -164,10 +164,10 @@ async function requestPermission(
 	// a `Reason: ` description, and `defaultToNo` when a stray keystroke must not
 	// approve.
 	const presentation = toolCall.presentation;
-	if (airClient && (presentation?.reason || presentation?.defaultToNo)) {
+	if (airClient && (presentation?.reason || presentation?.defaultToNo || presentation?.title)) {
 		request._meta = withAirMeta(undefined, AIR_PERMISSION_KEY, {
 			version: AIR_EXTENSION_VERSION,
-			title: toolCall.title,
+			title: presentation.title ?? toolCall.title,
 			...(presentation.reason ? { description: `Reason: ${presentation.reason}` } : {}),
 			...(presentation.defaultToNo ? { defaultToNo: true } : {}),
 		});

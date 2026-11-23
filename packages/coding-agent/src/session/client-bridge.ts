@@ -38,6 +38,8 @@ export interface ClientBridgePermissionPresentation {
 	reason?: string;
 	/** A stray keystroke must not approve: the policy forced this prompt over any grant. */
 	defaultToNo?: boolean;
+	/** The prompt's own title, when it differs from the tool call's. */
+	title?: string;
 }
 
 export type ClientBridgePermissionOptionKind = "allow_once" | "allow_always" | "reject_once" | "reject_always";

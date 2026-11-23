@@ -139,6 +139,8 @@ import { type ChoiceField, type FormField, type HtmlForm, parseHtmlForm, spansTe
 import { ToolError } from "../../tools/tool-errors";
 import { formatPathRelativeToCwd } from "../../tools/path-utils";
 import { isProposeToolCall, proposeDispatchDetails } from "../../tools/resolve";
+import { PROPOSE_COMMAND_NAME } from "../../tools/details/resolve";
+import type { ClientBridgePermissionOption } from "../../session/client-bridge";
 import { existingPlanFileSync, resolvePlanFilePath } from "../../plan-mode/plan-files";
 import type { Goal } from "../../tools/details/goal";
 import {
@@ -254,6 +256,39 @@ import { promptSuggestionsMeta } from "./acp-prompt-suggestions";
 
 const ACP_DEFAULT_MODE_ID = "default";
 const ACP_PLAN_MODE_ID = "plan";
+
+/** What the plan card shows, as claude-agent-acp's ExitPlanMode card does. */
+interface PlanCard {
+	title: string;
+	kind: "switch_mode";
+	rawInput: Record<string, unknown>;
+	content?: Array<{ type: "content"; content: { type: "text"; text: string } }>;
+}
+
+/** The card a plan prompt names; `separate` when it is not the `propose` call's own. */
+type PlanCardShown = PlanCard & { toolCallId: string; separate: boolean };
+
+/**
+ * The plan card's fields. A `planFile` client reads the plan from the file
+ * that `planFilePath` names; any other client gets the plan text in
+ * `rawInput.plan` and `content`, once it is known.
+ */
+function planCard(
+	input: object,
+	plan: string | undefined,
+	planFilePath: string | undefined,
+	approved: boolean,
+): PlanCard {
+	const title = approved ? "Exited Plan Mode" : "Approve Plan";
+	if (planFilePath) return { title, kind: "switch_mode", rawInput: { ...input, planFilePath } };
+	if (plan === undefined) return { title, kind: "switch_mode", rawInput: { ...input } };
+	return {
+		title,
+		kind: "switch_mode",
+		rawInput: { ...input, plan },
+		content: [{ type: "content", content: { type: "text", text: plan } }],
+	};
+}
 const ACP_VIBE_MODE_ID = "vibe";
 const DEFAULT_PLAN_FILE_URL = "local://PLAN.md";
 /** A provider error that is the model declining, which ends the turn as `refusal`. */
@@ -267,9 +302,22 @@ const OTHER_SINGLE_DESCRIPTION = "Type your own answer, or add a note to the opt
 const CUSTOM_ANSWER_META_KEY = "_askUserQuestionCustomAnswer";
 // `_meta` key an ask form's option carries its preview under.
 const OPTION_META_KEY = "_claude/askUserQuestionOption";
-const APPROVE_OPTION = "Approve and execute";
-const SAVE_OPTION = "Save plan";
-const REFINE_OPTION = "Refine plan";
+// The plan prompt's options, as claude-agent-acp's "Ready to code?" prompt names them.
+const PLAN_APPROVE_OPTION: ClientBridgePermissionOption = {
+	optionId: "plan-approve",
+	name: "Yes, start implementing",
+	kind: "allow_once",
+};
+const PLAN_SAVE_OPTION: ClientBridgePermissionOption = {
+	optionId: "plan-save",
+	name: "Save the plan to the working directory",
+	kind: "allow_always",
+};
+const PLAN_KEEP_PLANNING_OPTION: ClientBridgePermissionOption = {
+	optionId: "plan-keep-planning",
+	name: "No, keep planning",
+	kind: "reject_once",
+};
 /** Title of the free-text property each `askDialog` question gets beside its options. */
 const OTHER_OPTION = "Other (type your own)";
 /**
@@ -674,8 +722,9 @@ type ManagedSessionRecord = {
 	// The `propose` call in flight (direct, or a `bash` command that runs it),
 	// and for an AIR `planFile` client the
 	// plan file its input names. Read from the start event: the proposal
-	// handler can run before that event is forwarded.
-	planProposal: { toolCallId: string; planFilePath: string | undefined } | undefined;
+	// handler can run before that event is forwarded. `plan` is the text under
+	// review, set once the handler has read it.
+	planProposal: { toolCallId: string; planFilePath: string | undefined; direct: boolean; plan?: string } | undefined;
 	// The plan the proposal handler approved, reported once the propose call's
 	// result reaches the client. Never set for a refined or failed proposal.
 	approvedPlan: { planContent: string; planFilePath: string | undefined } | undefined;
@@ -3712,12 +3761,18 @@ export class AcpAgent implements Agent {
 				if (planFilePath) break;
 			}
 		}
-		record.planProposal = { toolCallId: event.toolCallId, planFilePath };
+		record.planProposal = {
+			toolCallId: event.toolCallId,
+			planFilePath,
+			direct: event.toolName === PROPOSE_COMMAND_NAME,
+		};
 	}
 
 	/**
 	 * Name the plan file in the `rawInput` of the propose call's start and
 	 * result, for an AIR `planFile` client; the approved file wins once known.
+	 * A direct `propose` call is the plan card, as claude-agent-acp shows
+	 * ExitPlanMode: "Approve Plan" (then "Exited Plan Mode"), carrying the plan.
 	 */
 	#withPlanFilePath(record: ManagedSessionRecord, notification: SessionNotification): SessionNotification {
 		const { update } = notification;
@@ -3729,10 +3784,51 @@ export class AcpAgent implements Agent {
 			return notification;
 		}
 		const planFilePath = record.approvedPlan?.planFilePath ?? proposal.planFilePath;
-		if (!planFilePath) return notification;
 		const args = record.toolArgsById.get(update.toolCallId);
 		const input = typeof args === "object" && args !== null && !Array.isArray(args) ? args : {};
+		if (proposal.direct) {
+			const card = planCard(input, proposal.plan, planFilePath, record.approvedPlan !== undefined);
+			return { ...notification, update: { ...update, ...card } };
+		}
+		if (!planFilePath) return notification;
 		return { ...notification, update: { ...update, rawInput: { ...input, planFilePath } } };
+	}
+
+	/**
+	 * Show the plan under review before asking about it: on the direct
+	 * `propose` call's own card, else on a card of its own, so a `bash` call
+	 * keeps its card and the prompt never names a call the client has not seen.
+	 */
+	async #showPlanCard(
+		record: ManagedSessionRecord,
+		plan: string,
+		planFilePath: string | undefined,
+	): Promise<PlanCardShown> {
+		const proposal = record.planProposal;
+		const sessionId = record.protocolSessionId;
+		if (proposal) {
+			proposal.plan = plan;
+			proposal.planFilePath = planFilePath ?? proposal.planFilePath;
+		}
+		if (proposal?.direct) {
+			const notification = this.#withPlanFilePath(record, {
+				sessionId,
+				update: { sessionUpdate: "tool_call_update", toolCallId: proposal.toolCallId },
+			});
+			await this.#sendQuietly(this.#connection.sessionUpdate(notification), "plan card");
+			const shown = notification.update as PlanCard & { toolCallId: string };
+			return { ...shown, separate: false };
+		}
+		const toolCallId = proposal ? `${proposal.toolCallId}:plan` : `plan-proposal-${crypto.randomUUID()}`;
+		const card = planCard({}, plan, planFilePath ?? proposal?.planFilePath, false);
+		await this.#sendQuietly(
+			this.#connection.sessionUpdate({
+				sessionId,
+				update: { sessionUpdate: "tool_call", toolCallId, status: "pending", ...card },
+			}),
+			"plan card",
+		);
+		return { toolCallId, ...card, separate: true };
 	}
 
 	/**
@@ -4592,15 +4688,14 @@ export class AcpAgent implements Agent {
 	/**
 	 * Plan-proposal handler installed while ACP plan mode is active. The agent
 	 * submits the finalized plan by passing its `<slug>`/title to `propose`;
-	 * this handler validates the plan file, normalizes the title, asks the ACP
-	 * client to confirm (via `unstable_createElicitation` when supported), and
-	 * on approval keeps the chosen plan path, exits plan mode, and notifies the
-	 * client so the agent regains full tools.
+	 * this handler validates the plan file, normalizes the title, shows the
+	 * plan on a card and asks the ACP client to approve it with a permission
+	 * prompt, and on approval keeps the chosen plan path, exits plan mode, and
+	 * notifies the client so the agent regains full tools.
 	 *
 	 * Mirrors `InteractiveMode.#handlePlanProposal` for the parts the agent sees
-	 * (same `PlanApprovalDetails` shape). Clients without form-mode elicitation
-	 * get an auto-approve so plan mode is never stranded — the agent always has
-	 * a way out.
+	 * (same `PlanApprovalDetails` shape). Without an answer the plan is sent
+	 * back for refinement: nothing approves it on the user's behalf.
 	 */
 	async #handleAcpPlanProposal(record: ManagedSessionRecord, title: string): Promise<AgentToolResult<unknown>> {
 		const session = record.session;
@@ -4621,21 +4716,22 @@ export class AcpAgent implements Agent {
 			readPlan: url => this.#readAcpPlanFile(session, url),
 			listPlanFiles: () => this.#listAcpLocalPlanFiles(session),
 		});
-		// A turn cancel while the approval dialog is open settles as refine and
-		// withdraws the dialog.
+		const card = await this.#showPlanCard(
+			record,
+			planContent,
+			clientSupportsPlanFile(this.#clientCapabilities)
+				? this.#existingAcpPlanFile(session, planFilePath)
+				: undefined,
+		);
+		// A turn cancel while the approval prompt is open settles as refine and
+		// withdraws the prompt.
 		const turnSignal = record.promptTurn?.abortController.signal;
-		// Save writes the plan into the working directory and asks again, as the TUI review does.
+		// Save writes the plan into the working directory and asks again, as the TUI review
+		// does; the second prompt offers no Save, so a repeated answer cannot loop.
 		let choice: "approve" | "save" | "refine";
 		let note: string | undefined;
 		for (;;) {
-			choice = await this.#requestAcpPlanApprovalChoice(
-				record.protocolSessionId,
-				resolvedTitle,
-				planContent,
-				turnSignal,
-				() => this.#holdBlocked(record, withMessage("permission", blockedMessage(`Review plan: ${resolvedTitle}`))),
-				note,
-			);
+			choice = await this.#requestAcpPlanApprovalChoice(record, card, turnSignal, note);
 			if (choice !== "save") break;
 			const destination = path.resolve(session.sessionManager.getCwd(), planSaveFileName(resolvedTitle));
 			try {
@@ -4646,6 +4742,20 @@ export class AcpAgent implements Agent {
 			}
 		}
 		const approved = choice === "approve";
+		if (card.separate) {
+			await this.#sendQuietly(
+				this.#connection.sessionUpdate({
+					sessionId: record.protocolSessionId,
+					update: {
+						sessionUpdate: "tool_call_update",
+						toolCallId: card.toolCallId,
+						status: "completed",
+						title: approved ? "Exited Plan Mode" : "Approve Plan",
+					},
+				}),
+				"plan card result",
+			);
+		}
 		const details: PlanApprovalDetails = {
 			planFilePath,
 			title: resolvedTitle,
@@ -4776,44 +4886,52 @@ export class AcpAgent implements Agent {
 	}
 
 	/**
-	 * Ask the ACP client to confirm plan approval. Returns `approve` only on an
-	 * explicit `APPROVE_OPTION` selection and `save` on `SAVE_OPTION`. Refine,
-	 * dismissal (`undefined`), or any unrecognized value falls through to refine semantics — the caller
-	 * keeps plan mode active and surfaces guidance text to the agent. Clients
-	 * without `elicitation.form` support auto-approve because there is no
-	 * confirmation surface available; without that, plan mode would strand
-	 * the agent (the bug this method exists to fix).
+	 * Ask the ACP client to approve the plan with a permission prompt on its
+	 * card, as claude-agent-acp's "Ready to code?" prompt does. Returns
+	 * `approve` only on the approve option and `save` on the save option, which
+	 * the prompt offers until a save `note` exists. A cancel, an unknown
+	 * option, a failed request, or a client the agent cannot ask is `refine`:
+	 * plan mode stays active and nothing gains write access.
 	 */
 	async #requestAcpPlanApprovalChoice(
-		sessionId: string,
-		title: string,
-		planContent: string,
+		record: ManagedSessionRecord,
+		card: PlanCardShown,
 		signal: AbortSignal | undefined,
-		holdBlocked?: () => () => void,
 		note?: string,
 	): Promise<"approve" | "save" | "refine"> {
-		const supportsForm = this.#clientCapabilities?.elicitation?.form != null;
-		if (!supportsForm) return "approve";
-		// Include a short preview of the plan so the user has context in the
-		// dialog. Keep the body bounded — Zed renders elicitation messages
-		// inline and a multi-thousand-line plan blows out the dialog.
-		const previewLines = planContent.split("\n").slice(0, 12).join("\n");
-		const ellipsis = planContent.split("\n").length > 12 ? "\n…" : "";
-		const question = `Approve plan "${title}" and start implementation?`;
-		const message = `${note ? `${note}\n\n` : ""}${question}\n\n${previewLines}${ellipsis}`;
-		const value = await elicitFromAcpClient(
-			this.#connection,
-			sessionId,
-			"select",
-			message,
-			{ type: "string", enum: [APPROVE_OPTION, SAVE_OPTION, REFINE_OPTION] },
-			signal ? { signal } : undefined,
-			holdBlocked,
-		);
-		// Approve ONLY on the explicit approve selection. Dismissal, cancel,
-		// timeout, or any other non-approve response falls through to refine
-		// semantics so closing the dialog can never grant write access.
-		return value === APPROVE_OPTION ? "approve" : value === SAVE_OPTION ? "save" : "refine";
+		const requestPermission = record.session.clientBridge?.requestPermission;
+		if (!requestPermission) return "refine";
+		const options = [
+			PLAN_APPROVE_OPTION,
+			...(note === undefined ? [PLAN_SAVE_OPTION] : []),
+			PLAN_KEEP_PLANNING_OPTION,
+		];
+		const content = [
+			...(card.content ?? []),
+			...(note === undefined ? [] : [{ type: "content", content: { type: "text", text: note } }]),
+		];
+		try {
+			const outcome = await requestPermission(
+				{
+					toolCallId: card.toolCallId,
+					toolName: PROPOSE_COMMAND_NAME,
+					title: card.title,
+					kind: card.kind,
+					status: "pending",
+					rawInput: card.rawInput,
+					...(content.length > 0 ? { content } : {}),
+					presentation: { title: "Ready to code?" },
+				},
+				options,
+				signal,
+			);
+			if (outcome.outcome !== "selected") return "refine";
+			const chosen = options.find(option => option.optionId === outcome.optionId);
+			return chosen === PLAN_APPROVE_OPTION ? "approve" : chosen === PLAN_SAVE_OPTION ? "save" : "refine";
+		} catch (error) {
+			logger.warn("ACP plan prompt failed", { acpSessionId: record.protocolSessionId, error });
+			return "refine";
+		}
 	}
 
 	#buildModeState(session: AgentSession): SessionModeState {
