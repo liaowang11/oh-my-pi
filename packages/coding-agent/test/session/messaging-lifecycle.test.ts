@@ -237,6 +237,22 @@ describe("cross-session messaging lifecycle", () => {
 		return { reached, release };
 	}
 
+	it("keeps Chrome side panel chats out of cross-session messaging", async () => {
+		process.env.PI_SESSION_ORIGIN = "chrome";
+		let panel: Awaited<ReturnType<typeof makeSession>>;
+		try {
+			panel = await makeSession("panel");
+		} finally {
+			delete process.env.PI_SESSION_ORIGIN;
+		}
+		const terminal = await makeSession("terminal");
+
+		expect(panel.session.messaging).toBeUndefined();
+		expect(terminal.session.messaging).toBeDefined();
+		const peers = await terminal.session.messaging!.listSessions();
+		expect(peers.some(peer => peer.sessionId === panel.manager.getSessionId())).toBe(false);
+	});
+
 	it("keeps cutoff permanent when an in-flight settings reconcile recreates the service", async () => {
 		const owner = await makeSession("cutoff-owner");
 		const peer = await makeSession("cutoff-peer");
@@ -437,6 +453,7 @@ describe("cross-session messaging lifecycle", () => {
 			transcriptMessageComponents: new WeakMap(),
 			statusLine: {
 				setCollabStatus() {},
+				refresh() {},
 				invalidate() {},
 				markActivityStart() {},
 				markActivityEnd() {},
@@ -446,6 +463,9 @@ describe("cross-session messaging lifecycle", () => {
 			ui: { requestRender() {} },
 			chatContainer: { clear() {}, disposeChildren() {} },
 			resetObserverRegistry() {},
+			clearTransientSessionUi() {},
+			updatePendingMessagesDisplay() {},
+			clearWorking() {},
 			syncRunningSubagentBadge() {},
 			renderInitialMessages: async () => {},
 			reloadTodos: async () => {},

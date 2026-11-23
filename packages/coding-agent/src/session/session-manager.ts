@@ -1257,6 +1257,11 @@ export class SessionManager {
 	 * in a terminal never picks its sessions.
 	 */
 	readonly #origin: SessionOrigin | undefined;
+
+	/** Client this process serves (`PI_SESSION_ORIGIN`); undefined for the terminal's. */
+	get origin(): SessionOrigin | undefined {
+		return this.#origin;
+	}
 	/**
 	 * The last breadcrumb this manager wrote marked a lazy fresh session whose
 	 * JSONL is not yet on disk. Cleared (and the crumb re-stamped non-fresh) once

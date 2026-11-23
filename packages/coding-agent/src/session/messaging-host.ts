@@ -16,7 +16,9 @@ export async function bindSessionMessaging(
 		askApproval?: MessagingHost["askApproval"];
 	},
 ): Promise<{ ready(): void; stopReceiving(): void; dispose(): Promise<void> }> {
-	if (session.isSubagent) return { ready() {}, stopReceiving() {}, async dispose() {} };
+	// A Chrome side panel chat is private to its panel: it neither receives nor sends cross-session messages.
+	if (session.isSubagent || session.sessionManager.origin)
+		return { ready() {}, stopReceiving() {}, async dispose() {} };
 	let ready = false;
 	let disposed = false;
 	let receivingStopped = false;
